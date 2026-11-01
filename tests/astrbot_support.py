@@ -4,6 +4,7 @@ import sys
 from collections import deque
 from dataclasses import dataclass
 from types import ModuleType, SimpleNamespace
+from typing import ClassVar
 from unittest.mock import patch
 
 _DEFAULT_RAW_MESSAGE = object()
@@ -64,7 +65,7 @@ class AstrBotContext:
 
 
 class AstrBotStar:
-    registered = []
+    registered: ClassVar[list] = []
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -85,6 +86,16 @@ class AstrMessageEvent:
 
 
 class _Filter:
+    EventMessageType = SimpleNamespace(PRIVATE_MESSAGE="private")
+
+    @staticmethod
+    def event_message_type(message_type, *, priority=0):
+        def decorate(handler):
+            handler.__astrbot_listener__ = (message_type, priority)
+            return handler
+
+        return decorate
+
     @staticmethod
     def command(name, *, priority=0):
         def decorate(handler):
@@ -111,6 +122,7 @@ class FakeEvent(AstrMessageEvent):
         sender_id="10001",
         raw_message=_DEFAULT_RAW_MESSAGE,
         astrbot_admin=False,
+        text="",
     ):
         self._platform_name = platform_name
         self._platform_id = platform_id
@@ -122,12 +134,13 @@ class FakeEvent(AstrMessageEvent):
                 "sub_type": "friend",
                 "user_id": sender_id,
                 "sender": {"user_id": sender_id},
-                "message": [],
+                "message": [{"type": "text", "data": {"text": text}}] if text else [],
             }
             if raw_message is _DEFAULT_RAW_MESSAGE
             else raw_message
         )
         self.message_obj = SimpleNamespace(raw_message=raw)
+        self.unified_msg_origin = f"{platform_id}:FriendMessage:{sender_id}"
         self._astrbot_admin = astrbot_admin
         self.llm_enabled = True
         self.stopped = False

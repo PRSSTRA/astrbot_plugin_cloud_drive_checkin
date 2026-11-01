@@ -5,14 +5,19 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 
 from .config import PluginConfigError, parse_config
+from .credentials import CredentialError
+from .enrollment import Enrollment, raw_private_text
 from .permissions import authorize, get_private_identity
-from .storage import StateStore
+from .storage import StateStore, StateUnavailableError
 from .task_config import TaskConfig, next_run_times, parse_task_catalog
 
 _STATE_REGISTRY_ATTRIBUTE = "_cloud_drive_checkin_state_registry"
 _CONFIG_ERROR_MESSAGE = "插件配置无效，请联系管理员。"
 _PERMISSION_DENIED_MESSAGE = "无权使用签到功能。"
-_USAGE_MESSAGE = "用法：/签到 帮助\n用法：/签到 任务\n用法：/签到 任务 <task_id>"
+_USAGE_MESSAGE = (
+    "用法：/签到 帮助\n用法：/签到 任务 [任务ID]\n"
+    "用法：/签到 录入 <任务ID>\n用法：/签到 我的\n用法：/签到 状态 [任务ID]"
+)
 _TASK_NOT_FOUND_MESSAGE = "未找到该签到任务。"
 
 
@@ -69,6 +74,7 @@ class CloudDriveCheckin(Star):
         super().__init__(context)
         self.config = config
         self.state_store: StateStore | None = None
+        self.enrollment: Enrollment | None = None
 
     def _state_slot(self) -> dict:
         registry = getattr(self.context, _STATE_REGISTRY_ATTRIBUTE, None)
@@ -81,6 +87,48 @@ class CloudDriveCheckin(Star):
             slot = {"lock": asyncio.Lock(), "owner": None}
             registry[self.plugin_id] = slot
         return slot
+
+    def _enrollment_guard(self, event, task_id: str, version: str) -> None:
+        identity = get_private_identity(event)
+        try:
+            permissions = parse_config(self.config)
+            if (
+                identity is None
+                or authorize(
+                    identity, astrbot_admin=event.is_admin(), config=permissions
+                )
+                is None
+            ):
+                raise CredentialError("enrollment authorization changed")
+            catalog = parse_task_catalog(self.config)
+        except PluginConfigError:
+            raise CredentialError("enrollment configuration changed") from None
+        if not any(
+            task.task_id == task_id and task.version == version
+            for task in catalog.tasks
+        ):
+            raise CredentialError("enrollment task changed")
+
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=1000)
+    async def capture_enrollment(self, event: AstrMessageEvent) -> None:
+        identity = get_private_identity(event)
+        enrollment = self.enrollment
+        if identity is None or enrollment is None or enrollment.closed:
+            return
+        try:
+            active = enrollment.active(identity)
+        except StateUnavailableError:
+            return
+        if not active:
+            return
+        event.should_call_llm(False)
+        event.stop_event()
+        message = await enrollment.consume(
+            identity,
+            raw_private_text(event),
+            lambda task_id, version: self._enrollment_guard(event, task_id, version),
+        )
+        await event.send(event.plain_result(message))
 
     @filter.command("签到", priority=100)
     async def checkin(
@@ -124,6 +172,36 @@ class CloudDriveCheckin(Star):
 
         if extra:
             await event.send(event.plain_result(_USAGE_MESSAGE))
+            return
+        enrollment = self.enrollment
+        if subcommand in {"录入", "我的", "状态"}:
+            if enrollment is None or enrollment.closed:
+                await event.send(event.plain_result("状态存储未就绪。"))
+                return
+            if subcommand == "录入":
+                task = next(
+                    (task for task in task_catalog.tasks if task.task_id == task_id),
+                    None,
+                )
+                if task is None:
+                    await event.send(event.plain_result(_TASK_NOT_FOUND_MESSAGE))
+                    return
+                message = await enrollment.begin(
+                    identity,
+                    task,
+                    event.unified_msg_origin,
+                    lambda task_id, version: self._enrollment_guard(
+                        event, task_id, version
+                    ),
+                )
+            elif subcommand == "我的" and task_id:
+                message = _USAGE_MESSAGE
+            else:
+                try:
+                    message = enrollment.describe(identity, task_id)
+                except (CredentialError, StateUnavailableError):
+                    message = "绑定状态不可用，请联系管理员。"
+            await event.send(event.plain_result(message))
             return
 
         if subcommand == "任务":
@@ -182,6 +260,7 @@ class CloudDriveCheckin(Star):
             slot["owner"] = store
             try:
                 await store.initialize()
+                self.enrollment = Enrollment(store)
             except asyncio.CancelledError:
                 store.stop_accepting()
                 raise
@@ -193,6 +272,9 @@ class CloudDriveCheckin(Star):
         store = self.state_store
         if store is None:
             return
+        store.stop_accepting()
+        if self.enrollment is not None:
+            self.enrollment.close()
 
         slot = self._state_slot()
         async with slot["lock"]:
