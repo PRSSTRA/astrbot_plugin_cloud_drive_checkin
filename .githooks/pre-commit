@@ -1,19 +1,59 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ -f "$(git rev-parse --git-path MERGE_HEAD)" ]]; then
-  exit 0
+physical_dir() {
+  (CDPATH= cd -- "$1" 2>/dev/null && pwd -P)
+}
+
+if ! git_dir=$(git rev-parse --absolute-git-dir 2>/dev/null) ||
+  ! common_dir=$(git rev-parse --git-common-dir 2>/dev/null); then
+  printf '%s\n' '错误：当前目录不在 Git 工作树中，提交已阻止。' >&2
+  exit 1
 fi
 
-branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+if ! branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null); then
+  printf '%s\n' '错误：当前处于 detached HEAD 状态，提交已阻止。' >&2
+  exit 1
+fi
+
+if ! git_dir=$(physical_dir "$git_dir") || ! common_dir=$(physical_dir "$common_dir"); then
+  printf '%s\n' '错误：无法解析 Git 工作树目录，提交已阻止。' >&2
+  exit 1
+fi
+
+if [[ "$git_dir" == "$common_dir" ]]; then
+  printf '%s\n' '错误：禁止在主工作目录直接提交，请为任务创建 linked worktree。' >&2
+  exit 1
+fi
+
 case "$branch" in
   main|master|develop|dev/*)
-    printf '禁止直接在分支 %s 上提交，请先新建工作分支：\n' "$branch" >&2
-    printf '  git switch -c chore/123-description\n' >&2
+    printf '错误：禁止直接在保护分支 %s 上提交，请先新建工作分支。\n' "$branch" >&2
     exit 1
     ;;
 esac
 
-if [[ ! "$branch" =~ ^(feature|fix|hotfix|chore)/[0-9]+-[a-z0-9-]+$ ]]; then
-  printf '警告：分支名 "%s" 不符合 <类型>/<编号>-<描述> 格式，提交将继续。\n' "$branch" >&2
+blocked_agent_path=
+while IFS= read -r -d '' staged_path; do
+  case "$staged_path" in
+    .omp/agents/*)
+      blocked_agent_path=$staged_path
+      break
+      ;;
+  esac
+done < <(git diff --cached --name-only -z)
+
+if [[ -n "$blocked_agent_path" ]]; then
+  printf '错误：禁止提交 .omp/agents/ 下的文件：%s\n' "$blocked_agent_path" >&2
+  exit 1
 fi
+
+case "$branch" in
+  release/*)
+    ;;
+  *)
+    if [[ ! "$branch" =~ ^(feature|fix|hotfix|chore)/[0-9]+-[a-z0-9-]+$ ]]; then
+      printf '警告：分支名“%s”不符合 <类型>/<编号>-<描述> 格式，提交将继续。\n' "$branch" >&2
+    fi
+    ;;
+esac
