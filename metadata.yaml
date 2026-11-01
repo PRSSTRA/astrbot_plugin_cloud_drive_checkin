@@ -3,4 +3,4 @@ display_name: 云盘签到助手 # 用于展示的名字，可以是方便人类
 desc: 一个用于云盘签到的 AstrBot 插件，支持多种云盘服务的自动签到功能。 # 插件简短描述
 version: v0.0.1 # 插件版本号。格式：v1.1.1 或者 v1.1
 author: Prstra # 作者
-repo: https://github.com/Soulter/astrbot_plugin_cloud_drive_checkin # 插件的仓库地址
+repo: https://github.com/PRSSTRA/astrbot_plugin_cloud_drive_checkin # 插件的仓库地址
