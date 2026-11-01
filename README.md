@@ -16,3 +16,5 @@ AstrBot 插件模板 / A template plugin for AstrBot plugin feature
 ## 提交和 PR 标题
 
 提交标题和 PR 标题使用 `类型(scope): 描述`，例如 `构建(ci): 添加 PR 检测工作流`。括号和冒号须为半角，scope 不能为空。启用本地校验：`git config core.hooksPath .githooks`。
+
+PR 检查流程验证：标题与提交信息均通过校验后再合并。
