@@ -7,17 +7,65 @@ from astrbot.api.star import Context, Star
 from .config import PluginConfigError, parse_config
 from .permissions import authorize, get_private_identity
 from .storage import StateStore
-
+from .task_config import TaskConfig, next_run_times, parse_task_catalog
 
 _STATE_REGISTRY_ATTRIBUTE = "_cloud_drive_checkin_state_registry"
 _CONFIG_ERROR_MESSAGE = "插件配置无效，请联系管理员。"
-_PERMISSION_DENIED_MESSAGE = "无权使用签到帮助。"
-_USAGE_MESSAGE = "用法：/签到 帮助"
+_PERMISSION_DENIED_MESSAGE = "无权使用签到功能。"
+_USAGE_MESSAGE = "用法：/签到 帮助\n用法：/签到 任务\n用法：/签到 任务 <task_id>"
+_TASK_NOT_FOUND_MESSAGE = "未找到该签到任务。"
+
+
+def _task_status(task: TaskConfig) -> str:
+    if task.enabled:
+        return "配置启用（当前版本仅预览，不执行）"
+    return "配置禁用（仅预览，不执行）"
+
+
+def _render_task_list(tasks: tuple[TaskConfig, ...]) -> str:
+    if not tasks:
+        return "暂无配置的签到任务。\n当前版本仅提供预览，不执行任务。"
+
+    lines = ["签到任务（当前版本仅提供预览，不执行任务）："]
+    lines.extend(
+        f"- {task.task_id}｜{task.name}｜{_task_status(task)}" for task in tasks
+    )
+    return "\n".join(lines)
+
+
+def _render_task_detail(task: TaskConfig, timezone: str) -> str:
+    run_times = next_run_times(task, timezone)
+    lines = [
+        f"任务：{task.name}",
+        f"ID：{task.task_id}",
+        f"状态：{_task_status(task)}",
+        f"Cron：{task.cron}",
+        f"时区：{timezone}",
+        "字段要求：",
+    ]
+    if task.user_fields:
+        lines.extend(
+            "- "
+            f"{field.field_id}（{field.label}）：{field.value_type}，"
+            f"{'必填' if field.required else '可选'}，"
+            f"{'秘密字段' if field.secret else '非秘密字段'}"
+            for field in task.user_fields
+        )
+    else:
+        lines.append("- 无")
+
+    lines.append("未来 3 次计划时间：")
+    lines.extend(
+        f"- {run_time.isoformat(timespec='minutes')}" for run_time in run_times
+    )
+    lines.append(f"配置版本：{task.version}")
+    return "\n".join(lines)
 
 
 class CloudDriveCheckin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         parse_config(config)
+        parse_task_catalog(config)
         super().__init__(context)
         self.config = config
         self.state_store: StateStore | None = None
@@ -39,6 +87,8 @@ class CloudDriveCheckin(Star):
         self,
         event: AstrMessageEvent,
         subcommand: str = "帮助",
+        task_id: str = "",
+        extra: str = "",
     ) -> None:
         event.should_call_llm(False)
         event.stop_event()
@@ -66,7 +116,40 @@ class CloudDriveCheckin(Star):
             await event.send(event.plain_result(_PERMISSION_DENIED_MESSAGE))
             return
 
-        if subcommand != "帮助":
+        try:
+            task_catalog = parse_task_catalog(self.config)
+        except PluginConfigError:
+            await event.send(event.plain_result(_CONFIG_ERROR_MESSAGE))
+            return
+
+        if extra:
+            await event.send(event.plain_result(_USAGE_MESSAGE))
+            return
+
+        if subcommand == "任务":
+            if not task_id:
+                message = _render_task_list(task_catalog.tasks)
+            else:
+                task = next(
+                    (
+                        candidate
+                        for candidate in task_catalog.tasks
+                        if candidate.task_id == task_id
+                    ),
+                    None,
+                )
+                if task is None:
+                    await event.send(event.plain_result(_TASK_NOT_FOUND_MESSAGE))
+                    return
+                try:
+                    message = _render_task_detail(task, task_catalog.timezone)
+                except PluginConfigError:
+                    await event.send(event.plain_result(_CONFIG_ERROR_MESSAGE))
+                    return
+            await event.send(event.plain_result(message))
+            return
+
+        if subcommand != "帮助" or task_id:
             await event.send(event.plain_result(_USAGE_MESSAGE))
             return
 

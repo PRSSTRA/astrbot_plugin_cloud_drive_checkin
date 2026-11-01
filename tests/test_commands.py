@@ -10,7 +10,6 @@ from astrbot_support import (
 )
 from state_support import load_module
 
-
 _PLUGIN_ID = "author/cloud-drive-checkin"
 
 
@@ -56,6 +55,20 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(context._plugin_kv, {})
 
+    async def test_constructor_rejects_invalid_task_config_before_accessing_kv(self):
+        context = AstrBotContext()
+        config = AstrBotConfig(
+            enabled=True,
+            plugin_admin_qqs=[],
+            whitelist_qqs=["10001"],
+            tasks="TOP_SECRET",
+        )
+
+        with self.assertRaises(self.main.PluginConfigError):
+            self.make_plugin(config, context)
+
+        self.assertEqual(context._plugin_kv, {})
+
     async def test_default_help_for_whitelisted_user_is_read_only(self):
         config = AstrBotConfig(
             enabled=True,
@@ -74,6 +87,8 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(event.sent[0], PlainResult)
         self.assertEqual(backend.put_attempts, writes_before)
         self.assertEqual(config, original_config)
+        self.assertIn("/签到 任务", event.sent[0].text)
+        self.assertIn("/签到 任务 <task_id>", event.sent[0].text)
 
     async def test_disabled_service_still_shows_help_to_administrator(self):
         config = AstrBotConfig(
@@ -107,6 +122,26 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
 
         self.assert_intercepted(event)
         self.assertEqual(len(event.sent), 1)
+        self.assertNotIn("TOP_SECRET", event.sent[0].text)
+        self.assertEqual(backend.put_attempts, writes_before)
+
+    async def test_unauthorized_user_cannot_inspect_task_config(self):
+        config = AstrBotConfig(
+            enabled=True,
+            plugin_admin_qqs=[],
+            whitelist_qqs=[],
+        )
+        plugin, _, backend = await self.initialize_plugin(config)
+        writes_before = backend.put_attempts
+        config["tasks"] = [{"task_id": "TOP_SECRET"}]
+        event = FakeEvent(sender_id="10001")
+
+        await plugin.checkin(event, "任务", "tianyi_cloud")
+
+        self.assert_intercepted(event)
+        self.assertEqual(len(event.sent), 1)
+        self.assertNotIn("tianyi_cloud", event.sent[0].text)
+        self.assertEqual(event.sent[0].text, self.main._PERMISSION_DENIED_MESSAGE)
         self.assertNotIn("TOP_SECRET", event.sent[0].text)
         self.assertEqual(backend.put_attempts, writes_before)
 
@@ -172,6 +207,123 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("TOP_SECRET", event.sent[0].text)
         self.assertEqual(backend.put_attempts, writes_before)
         self.assertEqual(config["whitelist_qqs"], ["10001", "TOP_SECRET"])
+
+    async def test_runtime_invalid_task_config_returns_safe_fixed_error(self):
+        config = AstrBotConfig(
+            enabled=True,
+            plugin_admin_qqs=[],
+            whitelist_qqs=["10001"],
+        )
+        plugin, _, backend = await self.initialize_plugin(config)
+        writes_before = backend.put_attempts
+        config["tasks"] = [{"task_id": "TOP_SECRET"}]
+        event = FakeEvent(sender_id="10001")
+
+        await plugin.checkin(event, "任务")
+
+        self.assert_intercepted(event)
+        self.assertEqual(len(event.sent), 1)
+        self.assertNotIn("TOP_SECRET", event.sent[0].text)
+        self.assertEqual(event.sent[0].text, self.main._CONFIG_ERROR_MESSAGE)
+        self.assertEqual(backend.put_attempts, writes_before)
+
+    async def test_task_detail_does_not_expose_execution_config_values(self):
+        commit = "a" * 40
+        config = AstrBotConfig(
+            enabled=True,
+            plugin_admin_qqs=[],
+            whitelist_qqs=["10001"],
+            tasks=[
+                {
+                    "task_id": "metadata_only",
+                    "name": "元数据任务",
+                    "enabled": False,
+                    "runtime": "python",
+                    "script_url": (
+                        "https://raw.githubusercontent.com/example/repository/"
+                        f"{commit}/script.py"
+                    ),
+                    "source_commit": commit,
+                    "sha256": "b" * 64,
+                    "cron": "0 8 * * *",
+                    "user_fields": [
+                        {
+                            "field_id": "account",
+                            "label": "账号",
+                            "env_name": "ACCOUNT_EXECUTION_NAME",
+                            "value_type": "string",
+                            "required": True,
+                            "secret": True,
+                            "hint": "字段元数据",
+                        }
+                    ],
+                    "fixed_env": {"SAFE_OPTION": "FIXED_EXECUTION_VALUE"},
+                    "input_adapter": "direct_env",
+                    "result_adapter": "process_only",
+                    "dependency_bundle": "DEPENDENCY_EXECUTION_VALUE",
+                    "timeout_seconds": 0,
+                    "experimental": False,
+                }
+            ],
+        )
+        plugin, _, backend = await self.initialize_plugin(config)
+        writes_before = backend.put_attempts
+        event = FakeEvent(sender_id="10001")
+
+        await plugin.checkin(event, "任务", "metadata_only")
+
+        detail = event.sent[0].text
+        self.assertIn("account", detail)
+        self.assertNotIn("raw.githubusercontent.com", detail)
+        self.assertNotIn("ACCOUNT_EXECUTION_NAME", detail)
+        self.assertNotIn("FIXED_EXECUTION_VALUE", detail)
+        self.assertNotIn("DEPENDENCY_EXECUTION_VALUE", detail)
+        self.assertNotIn("b" * 64, detail)
+        self.assertEqual(backend.put_attempts, writes_before)
+
+    async def test_runtime_task_changes_and_explicit_empty_catalog_are_immediate(self):
+        config = AstrBotConfig(
+            enabled=True,
+            plugin_admin_qqs=[],
+            whitelist_qqs=["10001"],
+        )
+        plugin, _, backend = await self.initialize_plugin(config)
+        writes_before = backend.put_attempts
+        before = FakeEvent(sender_id="10001")
+
+        await plugin.checkin(before, "任务")
+        config["tasks"] = []
+        after = FakeEvent(sender_id="10001")
+        await plugin.checkin(after, "任务")
+
+        self.assertIn("tianyi_cloud", before.sent[0].text)
+        self.assertNotIn("tianyi_cloud", after.sent[0].text)
+        self.assertEqual(backend.put_attempts, writes_before)
+
+    async def test_task_query_does_not_echo_unknown_or_extra_input(self):
+        config = AstrBotConfig(
+            enabled=True,
+            plugin_admin_qqs=[],
+            whitelist_qqs=["10001"],
+        )
+        plugin, _, backend = await self.initialize_plugin(config)
+        writes_before = backend.put_attempts
+        unknown = FakeEvent(sender_id="10001")
+        extra = FakeEvent(sender_id="10001")
+
+        await plugin.checkin(unknown, "任务", "TOP_SECRET")
+        await plugin.checkin(
+            extra,
+            "任务",
+            "tianyi_cloud",
+            "TOP_SECRET",
+        )
+
+        self.assertEqual(unknown.sent[0].text, self.main._TASK_NOT_FOUND_MESSAGE)
+        self.assertEqual(extra.sent[0].text, self.main._USAGE_MESSAGE)
+        self.assertNotIn("TOP_SECRET", unknown.sent[0].text)
+        self.assertNotIn("TOP_SECRET", extra.sent[0].text)
+        self.assertEqual(backend.put_attempts, writes_before)
 
     async def test_invalid_platform_session_and_identity_are_silent(self):
         config = AstrBotConfig(

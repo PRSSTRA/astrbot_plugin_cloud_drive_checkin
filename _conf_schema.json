@@ -16,5 +16,167 @@
     "type": "list",
     "default": [],
     "hint": "空白名单不放行普通用户；框架管理员和附加管理员无需加入白名单；授权仅适用于普通 QQ 私聊。"
+  },
+  "timezone": {
+    "description": "签到计划时区",
+    "type": "string",
+    "default": "Asia/Shanghai",
+    "hint": "使用 IANA 时区名称，例如 Asia/Shanghai。"
+  },
+  "timeout_seconds": {
+    "description": "任务默认超时秒数",
+    "type": "int",
+    "default": 180,
+    "hint": "允许 1 到 240 秒；任务中的 0 表示继承此值。"
+  },
+  "tasks": {
+    "description": "签到任务模板",
+    "type": "template_list",
+    "hint": "当前版本仅校验并预览任务，不会下载或执行脚本。",
+    "templates": {
+      "task": {
+        "name": "签到任务",
+        "hint": "配置一个固定来源的签到任务。",
+        "display_item": "name",
+        "hide_hint_in_list": true,
+        "items": {
+          "task_id": {
+            "description": "稳定任务 ID",
+            "type": "string",
+            "default": ""
+          },
+          "name": {
+            "description": "任务名称",
+            "type": "string",
+            "default": ""
+          },
+          "enabled": {
+            "description": "配置启用状态",
+            "type": "bool",
+            "default": false,
+            "hint": "当前版本即使启用也不会执行任务。"
+          },
+          "runtime": {
+            "description": "脚本运行时",
+            "type": "string",
+            "default": "python",
+            "options": [
+              "python",
+              "node"
+            ]
+          },
+          "script_url": {
+            "description": "固定提交脚本 URL",
+            "type": "string",
+            "default": ""
+          },
+          "source_commit": {
+            "description": "固定来源提交",
+            "type": "string",
+            "default": ""
+          },
+          "sha256": {
+            "description": "脚本 SHA256",
+            "type": "string",
+            "default": ""
+          },
+          "cron": {
+            "description": "五段 Cron 计划",
+            "type": "string",
+            "default": "0 0 * * *"
+          },
+          "user_fields": {
+            "description": "用户字段要求",
+            "type": "text",
+            "default": "[]",
+            "editor_mode": true,
+            "editor_language": "json",
+            "hint": "填写用户字段元数据的 JSON 数组；不要填写实际凭据值。"
+          },
+          "fixed_env": {
+            "description": "固定非秘密环境变量",
+            "type": "dict",
+            "default": {},
+            "items": {}
+          },
+          "input_adapter": {
+            "description": "输入适配器",
+            "type": "string",
+            "default": "direct_env",
+            "options": [
+              "direct_env",
+              "tianyi_account",
+              "mobile_single_account"
+            ]
+          },
+          "result_adapter": {
+            "description": "结果适配器",
+            "type": "string",
+            "default": "json_protocol",
+            "options": [
+              "json_protocol",
+              "process_only",
+              "tianyi",
+              "mobile_unverified"
+            ]
+          },
+          "dependency_bundle": {
+            "description": "依赖包声明",
+            "type": "string",
+            "default": "",
+            "hint": "仅作静态声明；非空不表示依赖已准备完成。"
+          },
+          "timeout_seconds": {
+            "description": "任务超时秒数",
+            "type": "int",
+            "default": 0,
+            "hint": "0 表示继承全局超时；其他值允许 1 到 240。"
+          },
+          "experimental": {
+            "description": "实验任务",
+            "type": "bool",
+            "default": false
+          }
+        }
+      }
+    },
+    "default": [
+      {
+        "__template_key": "task",
+        "task_id": "tianyi_cloud",
+        "name": "天翼云盘",
+        "enabled": false,
+        "runtime": "python",
+        "script_url": "https://raw.githubusercontent.com/BlueSkyXN/189Cloud-Checkin/8e02d162ec6d1b5c00736afffb727d9dcfe8ba7b/index.py",
+        "source_commit": "8e02d162ec6d1b5c00736afffb727d9dcfe8ba7b",
+        "sha256": "27dbae4f75354963eaa87f5e39e60bdc8bca36e19195e5af7c48d9312852e9b3",
+        "cron": "10 7 * * *",
+        "user_fields": "[{\"field_id\":\"username\",\"label\":\"用户名\",\"env_name\":\"TY_USERNAME\",\"value_type\":\"string\",\"required\":true,\"secret\":true,\"hint\":\"天翼云盘登录用户名\"},{\"field_id\":\"password\",\"label\":\"密码\",\"env_name\":\"TY_PASSWORD\",\"value_type\":\"string\",\"required\":true,\"secret\":true,\"hint\":\"天翼云盘登录密码\"}]",
+        "fixed_env": {},
+        "input_adapter": "tianyi_account",
+        "result_adapter": "tianyi",
+        "dependency_bundle": "",
+        "timeout_seconds": 0,
+        "experimental": false
+      },
+      {
+        "__template_key": "task",
+        "task_id": "mobile_cloud_experimental",
+        "name": "移动云盘（实验）",
+        "enabled": false,
+        "runtime": "node",
+        "script_url": "https://raw.githubusercontent.com/smallfawn/QLScriptPublic/2d4c26fdc72c3206bb9cf9afc1fb4991d337f888/daily/ydyp.js",
+        "source_commit": "2d4c26fdc72c3206bb9cf9afc1fb4991d337f888",
+        "sha256": "7c2e9350a05e3a9db541986835e7bee5e12ae25852ec871d9f75e3ce61d72a9b",
+        "cron": "20 7 * * *",
+        "user_fields": "[{\"field_id\":\"authorization\",\"label\":\"Authorization\",\"env_name\":\"MOBILE_AUTHORIZATION\",\"value_type\":\"string\",\"required\":true,\"secret\":true,\"hint\":\"移动云盘 Authorization\"},{\"field_id\":\"phone\",\"label\":\"手机号\",\"env_name\":\"MOBILE_PHONE\",\"value_type\":\"string\",\"required\":true,\"secret\":true,\"hint\":\"移动云盘手机号\"},{\"field_id\":\"auth_token\",\"label\":\"认证令牌\",\"env_name\":\"MOBILE_AUTH_TOKEN\",\"value_type\":\"string\",\"required\":true,\"secret\":true,\"hint\":\"移动云盘认证令牌\"}]",
+        "fixed_env": {},
+        "input_adapter": "mobile_single_account",
+        "result_adapter": "mobile_unverified",
+        "dependency_bundle": "",
+        "timeout_seconds": 0,
+        "experimental": true
+      }
+    ]
   }
 }

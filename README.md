@@ -1,16 +1,18 @@
 # AstrBot 云盘签到插件
 
-业务状态通过 Star 异步 KV 保存。插件提供受权限控制的私聊帮助，加载时确认状态快照，卸载时停止写入；不接收凭据、不启动签到、定时任务或 Neo 资源。
+业务状态通过 Star 异步 KV 保存。插件提供受权限控制的私聊帮助、任务列表与计划预览，加载时确认状态快照，卸载时停止写入；不接收凭据、不启动签到、定时任务或 Neo 资源。
 
 ## 快速验证
 
-使用 Python 3.10 或更高版本，在仓库根目录执行：
+插件声明支持 AstrBot `>=4.29.4,<5`，接口按 v4.29.4 核验，该版本宿主要求 Python 3.12 或更高版本。离线插件测试支持 Python 3.10 或更高版本；以下命令只建立独立测试环境，不安装完整 AstrBot：
 
 ```bash
-python3 -m unittest discover -s tests
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m unittest discover -s tests
 ```
 
-测试使用标准库及受控的 KV、AstrBot 边界替身，不需要云盘账号。框架接口按 AstrBot v4.29.4 源码核对；实际部署仍需单独验证加载、重载和持久化行为。
+测试使用真实 croniter 及受控的 KV、AstrBot 边界替身，不需要云盘账号。宿主依赖锁定在 `requirements.txt`，不包含签到脚本依赖。框架接口按 AstrBot v4.29.4 源码核对；已执行其原始配置默认值函数及 CommandFilter 的离线 smoke，未验证完整 WebUI、真实 QQ、Neo 或账号签到。
 
 ## 私聊帮助与授权
 
@@ -22,11 +24,49 @@ python3 -m unittest discover -s tests
 | `plugin_admin_qqs` | `[]` | 附加插件管理员 QQ；AstrBot 管理员默认拥有管理员权限 |
 | `whitelist_qqs` | `[]` | 普通用户白名单；空列表不放行普通用户，管理员无需重复加入 |
 
-按 AstrBot 当前唤醒前缀发送指令。例如前缀为 `/` 时，使用 `/签到 帮助`，或直接 `/签到`。授权用户可查看自己的权限类别、服务开关及状态存储是否就绪；其他子命令仅返回固定用法，不回显输入。
+按 AstrBot 当前唤醒前缀发送指令。例如前缀为 `/` 时，使用 `/签到 帮助`，或直接 `/签到`。授权用户可查看自己的权限类别、服务开关及状态存储是否就绪；`/签到 任务` 查看任务列表，`/签到 任务 tianyi_cloud` 查看字段要求、时区和未来三次计划时间。未知指令、未知任务或多余参数不回显输入。
 
 仅接受 `aiocqhttp` 的普通 QQ 私聊。群聊、临时会话、其他平台及身份字段矛盾的事件一律静默拒绝，管理员也不豁免；合法私聊中的未授权用户会收到无权限提示。命中指令后关闭默认 LLM 并停止后续事件传播，帮助和拒绝均不写 KV、不修改配置。
 
 每次处理指令都重新读取权限配置，撤销白名单立即生效；运行时配置损坏时拒绝处理并返回安全提示。授权 QQ 列表适用于各合法 OneBot 实例，但用户身份始终保留平台实例 ID，不将不同实例的数据合并。
+
+## 任务配置与计划预览
+
+管理员在配置页维护 `tasks`，普通用户只有查询权限。顶层任务使用 AstrBot `template_list`；v4.29.4 的条目渲染器不支持嵌套 `template_list`，因此 `user_fields` 使用 JSON 文本编辑器，内容是字段定义数组。程序传入配置时也可直接使用数组，两种表示产生相同配置版本。此处只填字段元数据，不能填实际账号凭据。
+
+| 配置 | 规则 |
+| --- | --- |
+| `timezone` | IANA 时区，默认 `Asia/Shanghai`；预览时间带 UTC 偏移 |
+| `timeout_seconds` | 全局默认 180 秒，范围 1–240；每任务的 0 或缺省值继承全局 |
+| `task_id` | 小写字母开头，可含数字与下划线，最长 64 字符；不可重复，改名不改变 ID |
+| `runtime` | `python` 或 `node`；不接受任意 shell |
+| `script_url/source_commit/sha256` | 固定 HTTPS GitHub 来源、40 位提交及 64 位预期内容摘要 |
+| `cron` | 五段常规表达式，支持数字、月份/星期简称、列表、正向范围和步长；周日 0/7，日与星期同时受限时为 OR |
+| `user_fields` | 每项含 `field_id/label/env_name/value_type/required/secret/hint`；类型为 `string/int/bool`，`hint` 可省略 |
+| `fixed_env` | 仅声明非秘密字符串常量；不在私聊查询中返回名称或值 |
+| `input_adapter/result_adapter` | 通用 `direct_env` 配 `json_protocol/process_only`；天翼和移动使用对应专用组合 |
+| `dependency_bundle` | 制品声明，不表示依赖已准备或经过验证 |
+
+最多 32 个任务、每任务 32 个字段；字段 JSON 文本上限 64 KiB。环境变量名必须为合法 ASCII 名称，保留声明大小写，但禁止仅大小写不同的重名；用户字段与固定环境变量不得重叠。`PATH/HOME/SHELL/ENV/BASH_ENV/IFS` 及 `PYTHON*/NODE_*/LD_*/DYLD_*` 均不可声明，判禁不区分大小写。
+
+来源暂限 `github.com/.../blob/<commit>/...` 和 `raw.githubusercontent.com/.../<commit>/...`，前者规范化为后者。拒绝用户信息、查询参数、片段、非标准端口与路径穿越，URL 中的提交必须匹配 `source_commit`。当前只做静态校验，不下载脚本，也不把填写的 SHA256 当成内容已经验证的证据。
+
+配置版本是规范化任务内容的 SHA256 指纹，不写 KV。名称、字段顺序、脚本声明、时区或有效超时等业务配置变化会改变版本；WebUI 的 `__template_key`、字典键序及等价 JSON 表示不影响版本。指纹与脚本内容摘要是不同字段。
+
+插件在加载和处理指令时校验配置；无效时拒绝使用并返回固定安全错误，未提供 WebUI 保存前拦截。未来三次时间通过私聊详情查询；禁用任务同样可以预览，但预览不代表已有定时器或任务已准备。无法产生未来日期的 cron 被拒绝；`0 9 31 2 MON` 仍有效，因为二月的周一满足 OR 条件。`@daily`、秒/年字段、随机 H/R 及 L/W/# 扩展不支持。
+
+### 两个禁用模板
+
+默认任务只在未配置 `tasks` 时提供；显式设置 `tasks=[]` 不会补回模板。默认值统一维护在 `_conf_schema.json`。
+
+| ID | 计划 | 必填秘密字段 |
+| --- | --- | --- |
+| `tianyi_cloud` | 每日 07:10 | `username/password` |
+| `mobile_cloud_experimental` | 每日 07:20 | `authorization/phone/auth_token` |
+
+天翼模板引用 [BlueSkyXN/189Cloud-Checkin 的固定提交](https://github.com/BlueSkyXN/189Cloud-Checkin/tree/8e02d162ec6d1b5c00736afffb727d9dcfe8ba7b)，移动模板引用 [smallfawn/QLScriptPublic 的固定提交](https://github.com/smallfawn/QLScriptPublic/tree/2d4c26fdc72c3206bb9cf9afc1fb4991d337f888)。本仓库仅记录来源及预期摘要，未移植脚本；准备或启用前仍须核实许可、依赖和实际行为。
+
+移动模板及其适配器必须保持 `experimental=true`、`enabled=false`。当前所有任务均不执行，开启其他任务的配置开关也不会绕过管理员准备、来源校验或执行层验收。
 
 ## 状态存储
 
@@ -56,6 +96,8 @@ python3 -m unittest discover -s tests
 
 - [AstrBot 仓库](https://github.com/AstrBotDevs/AstrBot)
 - [插件开发文档](https://docs.astrbot.app/dev/star/plugin-new.html)
+- 接口与离线核验来源：[AstrBot v4.29.4](https://github.com/AstrBotDevs/AstrBot/tree/v4.29.4)，[AGPLv3 许可证](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.4/LICENSE)；原始配置及指令解析代码未复制进插件运行代码。
+- Cron 计算依赖：[croniter 6.2.4](https://pypi.org/project/croniter/6.2.4/)，MIT 许可证；源码由安装依赖提供，本仓库不内置其副本。
 
 ## 提交与 PR 协作
 
