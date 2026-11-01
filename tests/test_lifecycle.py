@@ -1,99 +1,19 @@
 import asyncio
-import copy
-import sys
 import unittest
-from collections import deque
-from types import ModuleType
-from unittest.mock import patch
 
+from astrbot_support import (
+    AstrBotConfig,
+    AstrBotContext,
+    AstrBotStar,
+    patch_astrbot_modules,
+)
 from state_support import load_module
-
-
-class _PutGate:
-    def __init__(self):
-        self.started = asyncio.Event()
-        self.release = asyncio.Event()
-
-
-class _FakeKV:
-    def __init__(self):
-        self.values = {}
-        self.put_actions = deque()
-        self.put_attempts = 0
-        self.committed = []
-
-    def fail_next_put(self):
-        self.put_actions.append(OSError("simulated write failure"))
-
-    def block_next_put(self):
-        gate = _PutGate()
-        self.put_actions.append(gate)
-        return gate
-
-    async def get_kv_data(self, key, default):
-        if key not in self.values:
-            return default
-        return copy.deepcopy(self.values[key])
-
-    async def put_kv_data(self, key, value):
-        self.put_attempts += 1
-        action = self.put_actions.popleft() if self.put_actions else None
-        if isinstance(action, BaseException):
-            raise action
-        if isinstance(action, _PutGate):
-            action.started.set()
-            await action.release.wait()
-
-        detached = copy.deepcopy(value)
-        self.values[key] = detached
-        self.committed.append(copy.deepcopy(detached))
-
-
-class _AstrBotContext:
-    def __init__(self):
-        self._plugin_kv = {}
-
-    def kv_for(self, plugin_id):
-        return self._plugin_kv.setdefault(plugin_id, _FakeKV())
-
-
-class _AstrBotStar:
-    registered = []
-
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-        _AstrBotStar.registered.append(cls)
-
-    def __init__(self, context):
-        self.context = context
-
-    async def get_kv_data(self, key, default):
-        return await self.context.kv_for(self.plugin_id).get_kv_data(key, default)
-
-    async def put_kv_data(self, key, value):
-        await self.context.kv_for(self.plugin_id).put_kv_data(key, value)
 
 
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
-        astrbot = ModuleType("astrbot")
-        astrbot.__path__ = []
-        api = ModuleType("astrbot.api")
-        api.__path__ = []
-        star = ModuleType("astrbot.api.star")
-        star.Context = _AstrBotContext
-        star.Star = _AstrBotStar
-        api.star = star
-        astrbot.api = api
-        cls._astrbot_patch = patch.dict(
-            sys.modules,
-            {
-                "astrbot": astrbot,
-                "astrbot.api": api,
-                "astrbot.api.star": star,
-            },
-        )
+        cls._astrbot_patch = patch_astrbot_modules()
         cls._astrbot_patch.start()
 
     @classmethod
@@ -105,18 +25,18 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         return load_module("main", package), load_module("storage", package)
 
     def make_plugin(self, module, context, plugin_id="author/cloud-drive-checkin"):
-        plugin = module.CloudDriveCheckin(context)
+        plugin = module.CloudDriveCheckin(context, AstrBotConfig())
         plugin.plugin_id = plugin_id
         return plugin
 
     async def test_star_registers_subclass_without_explicit_registration(self):
         main, _ = self.load_generation("registration")
-        self.assertIn(main.CloudDriveCheckin, _AstrBotStar.registered)
+        self.assertIn(main.CloudDriveCheckin, AstrBotStar.registered)
 
     async def test_active_owner_rejects_reload(self):
         first_main, _ = self.load_generation("active_first")
         second_main, _ = self.load_generation("active_second")
-        context = _AstrBotContext()
+        context = AstrBotContext()
         first = self.make_plugin(first_main, context)
         second = self.make_plugin(second_main, context)
 
@@ -133,7 +53,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         first_main, first_storage = self.load_generation("failure_first")
         blocked_main, _ = self.load_generation("failure_blocked")
         recovered_main, _ = self.load_generation("failure_recovered")
-        context = _AstrBotContext()
+        context = AstrBotContext()
         backend = context.kv_for("author/cloud-drive-checkin")
         first = self.make_plugin(first_main, context)
         blocked = self.make_plugin(blocked_main, context)
@@ -174,7 +94,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_different_plugin_ids_have_independent_owners(self):
         first_main, _ = self.load_generation("isolated_first")
         second_main, _ = self.load_generation("isolated_second")
-        context = _AstrBotContext()
+        context = AstrBotContext()
         first = self.make_plugin(first_main, context, "author/first")
         second = self.make_plugin(second_main, context, "author/second")
 
@@ -190,7 +110,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancelled_initialization_is_closed_and_recovered_by_reload(self):
         first_main, _ = self.load_generation("cancel_first")
         recovered_main, _ = self.load_generation("cancel_recovered")
-        context = _AstrBotContext()
+        context = AstrBotContext()
         backend = context.kv_for("author/cloud-drive-checkin")
         first = self.make_plugin(first_main, context)
         recovered = self.make_plugin(recovered_main, context)
