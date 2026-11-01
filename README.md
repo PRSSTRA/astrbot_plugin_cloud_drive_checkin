@@ -1,17 +1,45 @@
-# astrbot-plugin-helloworld
+# AstrBot 云盘签到插件
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+业务状态通过 Star 异步 KV 保存。插件加载时确认状态快照，卸载时停止写入；当前入口不启动签到、定时任务或 Neo 资源，也不接收凭据。
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+## 快速验证
 
-# Supports
+使用 Python 3.10 或更高版本，在仓库根目录执行：
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+```bash
+python3 -m unittest discover -s tests
+```
+
+测试使用标准库及受控的 KV、AstrBot 边界替身，不需要云盘账号。框架接口按 AstrBot v4.29.4 源码核对；实际部署仍需单独验证加载、重载和持久化行为。
+
+## 状态存储
+
+`state.py` 定义快照格式，`storage.py` 通过 `get_kv_data` 和 `put_kv_data` 操作唯一业务键 `checkin_state`，不创建数据库或状态文件。
+
+- 快照含 `schema_version`、`revision`，以及 `users`、`bindings`、`credentials`、`batches`、`runs`、`outbox`、`cleanup_jobs`、`cooldowns`、`dedupe` 集合。
+- 只接受版本 1 和合法 JSON 数据，默认 UTF-8 序列化上限为 8 MiB。未知版本、结构损坏或超限均报错，不重置、不裁剪记录。
+- 集合内业务记录由对应业务操作定义；本层不执行入队、历史保留策略或凭据加密。调用方不得写入明文凭据。
+- `metadata.yaml` 的 author/name 决定框架 KV 命名空间，开始保存业务数据后应保持稳定。
+
+插件通过 `state_store` 暴露以下接口：
+
+| 接口 | 行为 |
+| --- | --- |
+| `await initialize()` | 键不存在才创建新快照；读取、校验并重新保存完整快照后才能使用；已有待确认值时只重试原值 |
+| `await mutate(callback)` | 在单锁内复制成功快照，运行同步修改函数，校验后提交；成功才更新内存并增加 revision |
+| `snapshot()` | 返回最后已确认快照的深拷贝；尚无成功提交时拒绝读取 |
+| `await retry_pending()` | 原样重试待确认快照，不读回确认、不增加 revision、不写旧快照回滚 |
+| `stop_accepting()` | 立即拒绝新操作，已开始的提交仍需完成 |
+| `await close()` | 停止接单并等待当前操作；有待确认写入时重试原值，成功后才关闭 |
+
+写入默认超时为 30 秒。异常、超时或取消都保留待确认快照，`ready` 变为 false；新修改被拒绝，旧成功快照仍可读取。取消不保证框架队列中的写入没有完成，因此读取缓存不能替代写入确认。修改函数不得改动 `schema_version` 或 `revision`，也不得执行异步操作、网络请求或脚本。
+
+同一 Context 上按 `plugin_id` 保存进程内写者登记，避免模块重载后丢失交接信息。活跃旧写者会阻止新实例；关闭失败则保留原写者与待确认快照，确认关闭后才允许接管。登记只保存运行时锁和对象引用，业务持久化仍只有 KV。仅支持单进程、单实例写入。
+
+## 开发资料
+
+- [AstrBot 仓库](https://github.com/AstrBotDevs/AstrBot)
+- [插件开发文档](https://docs.astrbot.app/dev/star/plugin-new.html)
 
 ## 提交与 PR 协作
 
