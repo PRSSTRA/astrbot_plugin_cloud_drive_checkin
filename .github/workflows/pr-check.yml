@@ -43,6 +43,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: 安装插件宿主依赖
+        run: python3 -m pip install -r requirements.txt
       - name: 运行策略回归测试
         run: python3 -m unittest discover -s tests -p 'test_*.py'
       - name: 逐个校验
