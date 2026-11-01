@@ -303,7 +303,15 @@ class Enrollment:
             if task_id and task_id != bound_task:
                 continue
             configured = key in snapshot["credentials"]
-            lines.append(f"- {bound_task}：凭据{'已配置' if configured else '未配置'}")
+            paused = record.get("paused", False)
+            notify_all = record.get("notify_all", False)
+            if type(paused) is not bool or type(notify_all) is not bool:
+                raise CredentialError("invalid binding preferences")
+            lines.append(
+                f"- {bound_task}：凭据{'已配置' if configured else '未配置'}；"
+                f"订阅{'已暂停' if paused else '未暂停'}；"
+                f"自动通知{'每次结果' if notify_all else '仅失败'}"
+            )
         result = (
             "本人绑定：\n" + "\n".join(lines) if lines else "没有符合条件的本人绑定。"
         )

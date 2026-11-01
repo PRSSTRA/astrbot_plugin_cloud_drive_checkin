@@ -24,6 +24,7 @@ python3 -m venv .venv
 - `task_config.py`：任务目录校验、Cron 计算和配置版本。
 - `enrollment.py`：5 分钟私聊录入会话、原始文本读取、超时和待录入意图。
 - `credentials.py`：主密钥读取、认证加密、绑定键和凭据原子保存。
+- `bindings.py`：本人绑定偏好更新、删除确认指纹和绑定与凭据的原子删除。
 - `state.py`：快照结构和 JSON 校验。
 - `storage.py`：基于 Star 异步 KV 的事务写入。
 
