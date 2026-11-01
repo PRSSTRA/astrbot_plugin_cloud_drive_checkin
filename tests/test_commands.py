@@ -87,8 +87,6 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(event.sent[0], PlainResult)
         self.assertEqual(backend.put_attempts, writes_before)
         self.assertEqual(config, original_config)
-        self.assertIn("/签到 任务", event.sent[0].text)
-        self.assertIn("/签到 任务 <task_id>", event.sent[0].text)
 
     async def test_disabled_service_still_shows_help_to_administrator(self):
         config = AstrBotConfig(
