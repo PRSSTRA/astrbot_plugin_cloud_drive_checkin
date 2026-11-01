@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+IFS= read -r subject < "$1" || [[ -n "$subject" ]]
+pattern='^(功能|修复|文档|样式|重构|性能|测试|构建|持续集成|杂项|回滚|feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)\([a-z0-9][a-z0-9._/-]*\): [^[:space:]].*$'
+if [[ ! "$subject" =~ $pattern ]]; then
+  printf '%s\n' '提交标题须为 类型(scope): 描述，使用半角括号和冒号，scope 不能为空。' >&2
+  exit 1
+fi
