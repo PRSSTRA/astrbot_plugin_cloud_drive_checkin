@@ -83,6 +83,15 @@ class CommitMessageTests(unittest.TestCase):
         self.assert_rejected(self.full_message("修复(api): 修"))
         self.assert_rejected(self.full_message(f"修复(api): {'修' * 51}"))
 
+    def test_pr_reference_is_not_counted_in_summary_length(self):
+        self.assert_accepted(self.full_message(f"构建(hooks): {'修' * 50} (#13)"))
+        self.assert_rejected(self.full_message(f"构建(hooks): {'修' * 51} (#13)"))
+        self.assert_rejected(self.full_message("构建(hooks): 修 (#13)"))
+
+    def test_pr_reference_does_not_hide_invalid_summary_edges(self):
+        self.assert_rejected(self.full_message("构建(hooks): 修复。 (#13)"))
+        self.assert_rejected(self.full_message("构建(hooks): 修复  (#13)"))
+
     def test_subject_requires_chinese_but_allows_technical_english(self):
         self.assert_accepted(self.full_message("构建(hooks): 更新 API2 hook 校验"))
         self.assert_rejected(self.full_message("构建(hooks): Update API hook"))
