@@ -6,6 +6,7 @@ print_error() {
     '错误：提交信息不符合规范。' \
     "原因：$1" \
     '格式：类型(scope): 2–50 字符的摘要' \
+    '合并提交可追加 (#12)，PR 编号不计入摘要长度。' \
     '示例：' \
     '构建(hooks): 完善工作树与提交校验' \
     '' \
@@ -48,6 +49,7 @@ ALLOWED_TYPES = {
     "feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore", "revert",
 }
 TITLE_PATTERN = re.compile(r"([^()\s]+)\(([a-z0-9][a-z0-9._/-]*)\): (.*)")
+PR_SUFFIX_PATTERN = re.compile(r" \(#[1-9][0-9]*\)$")
 SENTENCE_ENDINGS = "。！？"
 
 
@@ -78,7 +80,7 @@ match = TITLE_PATTERN.fullmatch(lines[0])
 if not match or match.group(1) not in ALLOWED_TYPES:
     reject("标题须使用允许的类型和半角“类型(scope): 摘要”格式。")
 
-subject = match.group(3)
+subject = PR_SUFFIX_PATTERN.sub("", match.group(3))
 if not 2 <= len(subject) <= 50:
     reject("标题摘要须为 2–50 个字符。")
 if subject[0].isspace() or unicodedata.category(subject[0]).startswith("P"):
