@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -f "$(git rev-parse --git-path MERGE_HEAD)" ]]; then
+  exit 0
+fi
+
+branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+case "$branch" in
+  main|master|develop|dev/*)
+    printf '禁止直接在分支 %s 上提交，请先新建工作分支：\n' "$branch" >&2
+    printf '  git switch -c chore/123-description\n' >&2
+    exit 1
+    ;;
+esac
+
+if [[ ! "$branch" =~ ^(feature|fix|hotfix|chore)/[0-9]+-[a-z0-9-]+$ ]]; then
+  printf '警告：分支名 "%s" 不符合 <类型>/<编号>-<描述> 格式，提交将继续。\n' "$branch" >&2
+fi
