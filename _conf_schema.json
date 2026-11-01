@@ -1,0 +1,20 @@
+{
+  "enabled": {
+    "description": "签到服务开关",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭时仍可查看帮助；当前版本即使开启也不会运行签到脚本。"
+  },
+  "plugin_admin_qqs": {
+    "description": "插件附加管理员 QQ 列表",
+    "type": "list",
+    "default": [],
+    "hint": "附加管理员无需加入白名单；授权仅适用于普通 QQ 私聊。"
+  },
+  "whitelist_qqs": {
+    "description": "普通用户 QQ 白名单",
+    "type": "list",
+    "default": [],
+    "hint": "空白名单不放行普通用户；框架管理员和附加管理员无需加入白名单；授权仅适用于普通 QQ 私聊。"
+  }
+}
