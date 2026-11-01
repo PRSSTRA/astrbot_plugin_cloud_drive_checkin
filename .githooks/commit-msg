@@ -1,20 +1,124 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+print_error() {
+  printf '%s\n' \
+    '错误：提交信息不符合规范。' \
+    "原因：$1" \
+    '格式：类型(scope): 2–50 字符的摘要' \
+    '示例：' \
+    '构建(hooks): 完善工作树与提交校验' \
+    '' \
+    '增强提交钩子校验，并补充技术 API 的安装说明。' >&2
+}
+
 if ! command -v python3 >/dev/null 2>&1; then
-  printf '%s\n' '错误：未找到 python3，无法校验提交描述；提交已阻止。请安装 Python 3 并确保 python3 在 PATH 中。' >&2
+  printf '%s\n' '错误：未找到 python3，无法校验提交信息；提交已阻止。请安装 Python 3 并确保 python3 在 PATH 中。' >&2
   exit 1
 fi
 
-IFS= read -r subject < "$1" || [[ -n "$subject" ]]
-pattern='^(功能|修复|文档|样式|重构|性能|测试|构建|持续集成|杂项|回滚|feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)\([a-z0-9][a-z0-9._/-]*\): [^[:space:]].*$'
-if [[ ! "$subject" =~ $pattern ]]; then
-  printf '%s\n' '提交标题须为 类型(scope): 描述，使用半角括号和冒号，scope 不能为空。' >&2
+mode=full
+case "$#:${1-}" in
+  1:*)
+    message_file=$1
+    ;;
+  2:--title-only)
+    mode=title-only
+    message_file=$2
+    ;;
+  *)
+    print_error '调用方式应为 commit-msg [--title-only] MESSAGE_FILE。'
+    exit 1
+    ;;
+esac
+
+if [[ ! -f "$message_file" ]]; then
+  print_error '提交信息文件不存在或不是普通文件。'
   exit 1
 fi
 
-description=${subject#*: }
-if ! printf '%s' "$description" | python3 -c 'import sys; text = sys.stdin.buffer.read().decode("utf-8"); sys.exit(not any("\u4e00" <= char <= "\u9fff" for char in text))'; then
-  printf '%s\n' '提交描述须至少包含一个中文汉字。' >&2
+if ! reason=$(python3 - "$mode" "$message_file" <<'PY'
+import re
+import sys
+import unicodedata
+
+
+ALLOWED_TYPES = {
+    "功能", "修复", "文档", "样式", "重构", "性能", "测试", "构建", "持续集成", "杂项", "回滚",
+    "feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore", "revert",
+}
+TITLE_PATTERN = re.compile(r"([^()\s]+)\(([a-z0-9][a-z0-9._/-]*)\): (.*)")
+SENTENCE_ENDINGS = "。！？"
+
+
+def is_han(character):
+    name = unicodedata.name(character, "")
+    return name.startswith("CJK UNIFIED IDEOGRAPH-") or name.startswith(
+        "CJK COMPATIBILITY IDEOGRAPH-"
+    )
+
+
+
+def reject(reason):
+    print(reason)
+    raise SystemExit(1)
+
+
+mode, message_path = sys.argv[1:]
+try:
+    message = open(message_path, encoding="utf-8").read()
+except (OSError, UnicodeError):
+    reject("无法以 UTF-8 读取提交信息。")
+
+lines = message.splitlines()
+if not lines:
+    reject("提交标题不能为空。")
+
+match = TITLE_PATTERN.fullmatch(lines[0])
+if not match or match.group(1) not in ALLOWED_TYPES:
+    reject("标题须使用允许的类型和半角“类型(scope): 摘要”格式。")
+
+subject = match.group(3)
+if not 2 <= len(subject) <= 50:
+    reject("标题摘要须为 2–50 个字符。")
+if subject[0].isspace() or unicodedata.category(subject[0]).startswith("P"):
+    reject("标题摘要不能以空白或标点开头。")
+if subject[-1].isspace() or subject[-1] in {"。", ".", "．"}:
+    reject("标题摘要不能以空白或句号结尾。")
+if not any(is_han(character) for character in subject):
+    reject("标题摘要须至少包含一个中文汉字。")
+
+if mode == "title-only":
+    raise SystemExit(0)
+
+if len(lines) < 3 or lines[1] != "":
+    reject("完整提交须在标题后空一行，再填写正文。")
+
+body = "\n".join(lines[2:]).strip()
+if not body:
+    reject("提交正文不能为空。")
+if body[-1] not in SENTENCE_ENDINGS:
+    reject("提交正文须以中文句号、问号或感叹号结句。")
+
+sentences = []
+sentence_start = 0
+for index, character in enumerate(body):
+    if character not in SENTENCE_ENDINGS:
+        continue
+    sentence = body[sentence_start:index].strip()
+    if not sentence:
+        reject("提交正文不能包含空句。")
+    sentences.append(sentence)
+    sentence_start = index + 1
+
+if body[sentence_start:].strip():
+    reject("提交正文每句话都须以中文句号、问号或感叹号结句。")
+if not 1 <= len(sentences) <= 2:
+    reject("提交正文须为 1–2 句。")
+if any(not any(is_han(character) for character in sentence) for sentence in sentences):
+    reject("提交正文的每句话都须包含中文汉字。")
+PY
+); then
+  print_error "$reason"
   exit 1
 fi
