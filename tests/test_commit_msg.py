@@ -1,3 +1,4 @@
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -24,6 +25,18 @@ class CommitMessageTests(unittest.TestCase):
         result = self.check_message("构建(ci): Update hook")
         self.assertEqual(result.returncode, 1)
         self.assertIn("提交描述须至少包含一个中文汉字", result.stderr)
+
+    def test_missing_python_reports_prerequisite_and_blocks_commit(self):
+        with tempfile.TemporaryDirectory() as path:
+            result = subprocess.run(
+                [shutil.which("bash"), str(HOOK), "unused"],
+                env={"PATH": path},
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("未找到 python3", result.stderr)
+        self.assertIn("提交已阻止", result.stderr)
 
     def test_scope_and_delimiters_remain_restricted(self):
         for message in ("构建(本地): 更新钩子", "构建(): 更新钩子", "构建（ci）: 更新钩子"):
