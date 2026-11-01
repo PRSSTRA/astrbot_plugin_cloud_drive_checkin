@@ -7,3 +7,9 @@ if [[ ! "$subject" =~ $pattern ]]; then
   printf '%s\n' '提交标题须为 类型(scope): 描述，使用半角括号和冒号，scope 不能为空。' >&2
   exit 1
 fi
+
+description=${subject#*: }
+if ! printf '%s' "$description" | python3 -c 'import sys; text = sys.stdin.buffer.read().decode("utf-8"); sys.exit(not any("\u4e00" <= char <= "\u9fff" for char in text))'; then
+  printf '%s\n' '提交描述须至少包含一个中文汉字。' >&2
+  exit 1
+fi
