@@ -40,10 +40,10 @@
         "default": false
       },
       "docker_cleanup_confirmed": {
-        "description": "已确认固定 Docker 部署的清理语义",
+        "description": "已独立验证 Docker Cargo 物理清理",
         "type": "bool",
         "default": false,
-        "hint": "须核对文档中的 Neo 版本及 Docker 清理条件；不支持以 Cargo 404 验收 Kubernetes PVC 清理。"
+        "hint": "须核对版本、bind 路径映射并独立验证宿主资源删除；仅凭 API 404 不足以确认，不支持用它验收 Kubernetes PVC 清理。"
       },
       "endpoint": {
         "description": "备用 Bay API 地址",

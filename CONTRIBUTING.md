@@ -62,11 +62,11 @@ python3 -m venv .venv
 
 `NeoExecutor.execute(PreparedExecution(...), guard=...)` 接收已经准备好的脚本字节、SHA256、固定来源 commit、任务版本、身份和本次环境变量。调用方负责脚本来源及依赖制品验收，并在同步 `guard(snapshot)` 中重新检查权限和版本；拒绝时抛异常，放行时返回 `None`。执行器本身不下载脚本、不安装依赖、不提供 shell 聊天入口。天翼输入/结果适配、管理员准备入口、队列和通知还没有接入。
 
-执行器在 `checkin_state.runs` 和 `cleanup_jobs` 中记录 `kind=neo_execution` 的状态。创建前提交意图，取得资源 ID 后再次提交，发送业务执行请求前再确认状态。每个运行预留 8 KiB 的快照空间用于资源 ID 和终态，最多保留 1000 个运行条目，容量不足拒绝新增；自动历史裁剪尚未接入。记录不保存脚本内容、环境变量或原始输出。
+执行器在 `checkin_state.runs` 和 `cleanup_jobs` 中记录 `kind=neo_execution` 的状态。先持久化 `phase=admitted` 表示尚未尝试分配，再单独确认 `phase=creating` 的创建意图，之后才能调用 Neo；创建和执行意图的写入返回后均再次同步检查授权。恢复时仅对结构合法、没有资源 ID 的 `admitted` 记录确定取消并解除阻断；`creating` 或之后的阶段不能凭缺少 ID 推断未创建。这样，即使无分配证明的终态写入被另一笔未确认提交阻挡，精确重试后仍可从持久化阶段恢复。每个运行预留 8 KiB 的快照空间用于资源 ID 和终态，最多保留 1000 个运行条目，容量不足拒绝新增；自动历史裁剪尚未接入。记录不保存脚本内容、环境变量或原始输出。
 
 脚本只在独立 Sandbox 中执行。固定命令先建立执行用户拥有的 0700 目录和 0600 文件，再经文件 API 覆写；Ship 的上传实现使用 `wb`，保留已有文件的 owner/mode。wrapper 读出凭据后立即解除文件链接，校验脚本 hash，以 `shell=False` 和独立进程组启动 Python 或 Node。stdout 有界收集，stderr 只排空；两者均不透传到 Bay。子进程退出后也清理其残留进程组，Linux 下使用 subreaper 回收已脱离直接父进程的后代。
 
-`json_protocol` 只接受完整 JSON 对象中已知的 `status`；自由文本原因和其他字段不会返回。退出码与业务状态分别保存，`process_only` 或无有效证据均为 `unknown`。安全信封包含 `protocol/process_status/exit_code/business_status/reason_code/duration_ms`，字段和范围由 `validate_result` 验证。超时、取消和重启中断分别记录，不根据退出 0 推断成功。
+`json_protocol` 只接受完整 JSON 对象中已知的 `status`；自由文本原因和其他字段不会返回。退出码与业务状态分别保存，`process_only` 或无有效证据均为 `unknown`。安全信封包含 `protocol/process_status/exit_code/business_status/reason_code/duration_ms`，字段和范围由 `validate_result` 验证。业务请求可能已经发出后的本地取消记为 `interrupted/unknown`，不把取消 HTTP 等待或成功清理资源当作业务未发生的证据；未发送请求或取得明确 wrapper 取消信封时才能记录确定取消。
 
 终止插件时先停止入口，再取消并等待执行及受管清理，最后关闭 StateStore。旧执行器未退出时新实例不能接管写者。待确认 KV 写入期间只进行已知资源清理，不另写快照；下一次恢复仍先确认原待写快照，再处理清理记录。清理不能确认时保留记录，不放行新执行。
 
@@ -75,7 +75,7 @@ python3 -m venv .venv
 Neo 接口按 [Shipyard Neo `f4d248b4274c1a2f05402f75a3b39e5c19be9ff5`](https://github.com/AstrBotDevs/shipyard-neo/tree/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5) 核验，该项目使用 AGPLv3；本插件客户端和 wrapper 为独立实现，没有移植上游代码。相关依据：
 
 - [Bay API v1](https://github.com/AstrBotDevs/shipyard-neo/blob/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5/doc/bay_api_v1.md)：请求、响应与文件路径。
-- [CargoManager](https://github.com/AstrBotDevs/shipyard-neo/blob/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5/pkgs/bay/app/managers/cargo/cargo.py) 与 [Docker driver](https://github.com/AstrBotDevs/shipyard-neo/blob/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5/pkgs/bay/app/drivers/docker/docker.py)：先删卷后删记录、非 404 错误保留重试条件。
+- [CargoManager](https://github.com/AstrBotDevs/shipyard-neo/blob/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5/pkgs/bay/app/managers/cargo/cargo.py) 与 [Docker driver](https://github.com/AstrBotDevs/shipyard-neo/blob/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5/pkgs/bay/app/drivers/docker/docker.py)：删除引用指向的数据后才删 Cargo 记录；bind 模式必须保证该宿主路径在 Bay 内仍指向真实 Cargo，不能只检查 API 404。
 - [K8s driver](https://github.com/AstrBotDevs/shipyard-neo/blob/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5/pkgs/bay/app/drivers/k8s/k8s.py)：PVC 删除受理不等于清理完成，因此当前执行层仅接受已确认的固定 Docker 部署。
 - [AstrBot v4.29.4 Context](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.4/astrbot/core/star/context.py)：通过 `get_config()` 读取框架配置，不访问框架私有存储或借用聊天资源。
 
@@ -87,7 +87,28 @@ PR 的“提交信息规范”任务会在 Python 3.12 上安装 `requirements.t
 
 执行层回归位于 `tests/test_neo_client.py`、`tests/test_neo_executor.py`、`tests/test_neo_lifecycle.py` 和 `tests/test_bootstrap.py`。`tests/neo_support.py` 是受控 Bay 替身，会在临时目录运行本仓库 wrapper 与假脚本；这不是产品的宿主回退路径。Node 测试需要本机 Node，未安装时会明确跳过；macOS 测试只将 Node 的可执行路径映射到本机安装位置，实际运行 Node 子进程。
 
-本轮另以真实 loopback HTTP 连接受控 Bay，跑通两用户隔离、非零退出码的显式业务结果、超时、清理阻断及恢复不重跑；未连接真实 Neo、Docker、QQ 或云盘账号。部署后的真实 Neo 假凭据测试和真实账号测试必须分别报告。
+离线 smoke 通过真实 loopback HTTP 连接受控 Bay，覆盖两用户隔离、非零退出码的显式业务结果、超时、清理阻断及恢复不重跑。真实 Neo 假凭据测试与真实账号测试分别记录如下。
+
+### 真实 Neo 假凭据验收
+
+目标为 Docker Bay 0.4.2，revision `f4d248b4274c1a2f05402f75a3b39e5c19be9ff5`，镜像 digest `sha256:b8920aed5bcc098242aa989c8b1eb5420c393e9a0f3dff5207979aba4a88403b`；Ship digest 为 `sha256:4a50b8290ce9f20cd615af3ded31613a89e61a2b0197a9b7a7c551a5ac3bc774`，profile 为 `python-default`，匿名访问关闭。只运行生成的假脚本和假凭据；执行器使用真实 Bay REST，Star/KV 边界使用受控内存适配器。
+
+首次验收的 API 场景通过，但独立宿主检查发现 5 个 Cargo bind 目录残留，因此整体判为失败。原因是 Bay 内宿主绝对路径指向容器层 shadow 目录，实际 Cargo 通过另一条路径挂载。仅清理了这 5 个已记录的自有测试目录，并确认无卷或容器残留。随后经操作者授权，在没有其他 Sandbox 或 Neo runtime 运行时，为 Bay 增加宿主 Cargo 根目录的同路径挂载并仅重建 Bay；镜像、端口、网络、环境和其他服务未修改。
+
+路径对齐后复验创建 6 组独立 Sandbox/Cargo，发送 5 次业务 wrapper 请求，另 1 次在凭据上传后、wrapper 启动前拒绝授权：
+
+| 场景 | 已观察结果 |
+| --- | --- |
+| 两身份同时请求 Python / Node 假脚本 | Sandbox、Cargo 和输入隔离；最大并行业务请求数为 1 |
+| 业务结果与退出码 | Python 退出 0 返回 `needs_auth`；Node 退出 3 返回 `already_signed` |
+| 文件与输出 | 6 次上传后确认目录 0700、凭据文件 0600 且归执行用户所有；4 次完整返回的 wrapper 确认凭据文件已解除链接；6 个自有 Sandbox 历史中未出现假凭据标记 |
+| 超时 | `timeout`，并在沙箱内确认后代进程已不存在 |
+| 请求已发送后取消 | `interrupted/unknown`，不重发业务请求 |
+| 清理失败恢复 | 对真实自有资源注入客户端清理失败，保留阻断；恢复后只清理、不重跑业务。未破坏 Docker daemon 来模拟故障 |
+| wrapper 前撤权 | 确认凭据文件仍在后拒绝执行；该目录随清理删除，未发送业务 wrapper 请求 |
+| 独立清理证明 | 每组同时确认 Sandbox/Cargo API 不存在、对应宿主 bind 目录不存在、无同名卷和关联容器；6 组全部通过 |
+
+该结果仅覆盖上述固定版本和路径对齐后的 bind 拓扑。未验证 Docker named volume、Kubernetes、完整 AstrBot/QQ 入站流水线、跨进程崩溃或真实账号签到；没有运行真实云盘脚本。新增回归测试另外覆盖了 KV 等待期间撤权和远端副作用后取消的边界。
 
 ## Git hooks
 
