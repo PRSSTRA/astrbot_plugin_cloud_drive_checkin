@@ -206,5 +206,32 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# 本地智能体配置
-/.omp/agents/
+# Local agent runtime data
+/.omp/
+
+# Script artifacts and downloaded dependency archives
+*.whl
+*.pyz
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+node_modules/
+.venv*/
+
+# Deployment secrets and runtime state; sanitized examples remain source files
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+master-key.env
+credentials.json
+cookies.json
+cookies.txt
+checkin_state.json
+*.db
+*.sqlite
+*.sqlite3
+.DS_Store

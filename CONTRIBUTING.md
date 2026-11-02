@@ -158,7 +158,18 @@ cd ../astrbot_plugin_cloud_drive_checkin-git-policy
 
 普通任务分支使用 `feature|fix|hotfix|chore/<编号>-<小写描述>`，完整正则为 `^(feature|fix|hotfix|chore)/[0-9]+-[a-z0-9-]+$`。`release/*` 不检查这一格式。普通任务分支不符合规范时，钩子和 PR 检查只警告，不阻断。
 
-`.omp/agents/` 仅供本地使用，不得入库。PR 检查会拒绝新增历史中跟踪该目录内容的提交。
+### 入库边界
+
+根 `.gitignore` 集中定义路径规则：本地 `.omp/` 资料、虚拟环境、缓存、日志、下载的 wheel、生成的 zipapp/压缩包、已知凭据文件和运行状态文件不入库。源码、必要测试、许可证、固定版本与 SHA256 依赖锁、脱敏后的验收结论需要保留；不要按“第三方文件”或“长随机串”一概删除。`.env.example`、`.env.sample`、`.env.template` 仅允许无真实值的示例，其他必要测试资源须通过精确忽略例外和用途说明审核，不能用 `git add -f` 绕过。
+
+本地 pre-commit 与 PR 历史检查共用 `scripts/check-repository-content.py`：本地检查暂存树及暂存的根 `.gitignore`，不读取未跟踪文件；CI 用当前策略检查 PR 新增的每个提交树，先加入再删除的制品也会被拒绝。检查不使用个人全局忽略文件或 `.git/info/exclude`，不会修改真实索引或工作区。天翼源码的 `accounts`、`TG_BOT_TOKEN`、`TG_CHAT_ID` 顶层声明必须为空，检查只解析 AST、不执行源码、不输出值。
+
+```bash
+python3 scripts/check-repository-content.py index
+python3 scripts/check-repository-content.py tree COMMIT_SHA
+```
+
+这些检查不是通用秘密扫描器。允许路径中的真实凭据、原始私聊/验收记录、动态写入配置等仍须内容审查；测试假值不得连接真实服务，也不能对整个 `tests/` 目录豁免。
 
 ## 提交信息
 

@@ -6,7 +6,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 HOOKS = REPOSITORY_ROOT / ".githooks"
 PRE_COMMIT = HOOKS / "pre-commit"
@@ -43,9 +42,14 @@ class GitHookTests(unittest.TestCase):
             }
         )
 
-        self.run_git(self.root, "init", "--initial-branch=master", str(self.main_worktree))
+        self.run_git(
+            self.root, "init", "--initial-branch=master", str(self.main_worktree)
+        )
         (self.main_worktree / "seed.txt").write_text("seed\n", encoding="utf-8")
-        self.run_git(self.main_worktree, "add", "seed.txt")
+        shutil.copyfile(
+            REPOSITORY_ROOT / ".gitignore", self.main_worktree / ".gitignore"
+        )
+        self.run_git(self.main_worktree, "add", "seed.txt", ".gitignore")
         self.run_git(self.main_worktree, "commit", "--no-verify", "-m", "initial")
         self.run_git(
             self.main_worktree,
@@ -56,9 +60,7 @@ class GitHookTests(unittest.TestCase):
             str(self.linked_worktree),
             "HEAD",
         )
-        self.run_git(
-            self.main_worktree, "switch", "-c", "chore/14-main-worktree"
-        )
+        self.run_git(self.main_worktree, "switch", "-c", "chore/14-main-worktree")
         self.run_git(
             self.main_worktree,
             "config",
@@ -157,15 +159,19 @@ class GitHookTests(unittest.TestCase):
         self.assertEqual(release_result.returncode, 0, release_result.stderr)
         self.assertNotIn("警告", release_result.stderr)
 
-    def test_only_staged_agent_directory_is_rejected(self):
-        self.stage_file(self.linked_worktree, Path(".omp/session.txt"))
+    def test_untracked_local_files_do_not_block_but_forced_tracking_does(self):
+        local_file = self.linked_worktree / ".omp" / "session.txt"
+        local_file.parent.mkdir()
+        local_file.write_text("local only\n", encoding="utf-8")
         allowed_result = self.run_pre_commit(self.linked_worktree)
         self.assertEqual(allowed_result.returncode, 0, allowed_result.stderr)
 
-        self.stage_file(self.linked_worktree, Path(".omp/agents/private.txt"))
+        self.run_git(self.linked_worktree, "add", "-f", ".omp/session.txt")
         blocked_result = self.run_pre_commit(self.linked_worktree)
         self.assertNotEqual(blocked_result.returncode, 0)
-        self.assertIn(".omp/agents/", blocked_result.stderr)
+        self.assertIn(".omp/", blocked_result.stderr)
+        self.run_git(self.linked_worktree, "rm", "--cached", ".omp/session.txt")
+        self.assertEqual(self.run_pre_commit(self.linked_worktree).returncode, 0)
 
     def test_installer_is_cwd_independent_idempotent_and_repository_local(self):
         fixture_hooks = self.main_worktree / ".githooks"
@@ -174,6 +180,10 @@ class GitHookTests(unittest.TestCase):
         fixture_scripts.mkdir()
         fixture_installer = fixture_scripts / INSTALLER.name
         shutil.copyfile(INSTALLER, fixture_installer)
+        shutil.copyfile(
+            REPOSITORY_ROOT / "scripts" / "check-repository-content.py",
+            fixture_scripts / "check-repository-content.py",
+        )
         copied_hooks = []
         for source in HOOKS.iterdir():
             destination = fixture_hooks / source.name

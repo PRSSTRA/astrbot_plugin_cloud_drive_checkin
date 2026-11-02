@@ -33,20 +33,8 @@ case "$branch" in
     ;;
 esac
 
-blocked_agent_path=
-while IFS= read -r -d '' staged_path; do
-  case "$staged_path" in
-    .omp/agents/*)
-      blocked_agent_path=$staged_path
-      break
-      ;;
-  esac
-done < <(git diff --cached --name-only -z)
-
-if [[ -n "$blocked_agent_path" ]]; then
-  printf '错误：禁止提交 .omp/agents/ 下的文件：%s\n' "$blocked_agent_path" >&2
-  exit 1
-fi
+hook_root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+python3 "$hook_root/scripts/check-repository-content.py" index
 
 case "$branch" in
   release/*)
