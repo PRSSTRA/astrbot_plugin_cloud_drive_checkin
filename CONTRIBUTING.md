@@ -280,13 +280,24 @@ PR 的“离线测试”任务分别在 Python 3.12、3.13、3.14 上安装宿�
 - 框架既有入站 INFO 日志保留假密码，与 README 已披露的入站记录风险一致。本次只断言状态和重载回复不回显假密码，不声明所有日志不含敏感值。
 - 范围限于上述 AstrBot 4.29.4、真实 `aiocqhttp==1.4.4` 和受控 loopback OneBot 客户端；不是真实 QQ、真实 Neo 或真实账号签到验收，也不改变此前真实 Neo 假凭据验收的结论。
 
-### 冷启动平台就绪本地验收
+### 通用任务原生框架与冷启动验收
 
-- Python 3.14 下离线全量 506 项测试通过，耗时 21.281 秒；本轮修改的源码和相关测试通过 scoped Ruff 检查，不声明全仓 Ruff 全绿。
+在独立临时 venv 中安装 AstrBot 4.29.4 和本插件 `requirements.txt`，把集成后的插件源码打成 ZIP，然后在仓库根目录执行：
+
+```bash
+python scripts/verify-native.py --archive /tmp/plugin.zip
+```
+
+- 前提：当前环境能导入 `AstrBot==4.29.4`；`node` 在 `PATH` 中；未使用 `-O` 或 `PYTHONOPTIMIZE`，验收依赖断言。源码 ZIP 由执行者准备，仓库不提供打包脚本。
+- harness 用真实 `PluginManager.install_plugin_from_file` 安装源码 ZIP（1 次），启动真实 `AstrBotCoreLifecycle` 并使用原生 Star KV；两个真实 `aiocqhttp` 客户端通过受控 loopback 连接，不是真实 QQ。
+- Cold 本地阶段：Python 3.14 下离线全量 506 项测试通过，耗时 21.281 秒；本轮修改的源码和相关测试通过 scoped Ruff 检查，不声明全仓 Ruff 全绿。
 - 新增初始化/关闭竞态回归：队列、通知和调度器在最后一次 `initialize` 等待期间被关闭后不再创建 worker；主实例在初始化接管等待或恢复期间被终止后，不再构造通知、队列和调度器。
 - 回归覆盖空平台和部分平台加载期间的未过期队列、关闭对账的过期取消（过期判定不依赖平台就绪）、通知尝试次数与重试截止时间、调度未来基线重建、同 Context 重载后的就绪标记，以及终止期间忽略加载完成钩子。worker 就绪前不调用 `guard`、不执行、不认领通知；WebChat 标记缓存后即使平台列表清空仍视为就绪，但目标平台实例实际缺失时未过期批次按 `permission_revoked` 取消；就绪后错过的计划分钟不补跑。
 - 原生冷恢复验收通过：AstrBot 4.29.4 通过原生 `PluginManager` 安装集成后的源码 ZIP 一次，使用原生 KV 和两个受控 loopback `aiocqhttp` 对端。两次实际进程 SIGKILL 后，加密绑定保留，已开始业务不重放，未过期排队请求继续，过期请求取消，结果不明通知不重发，本人计划查询只读；该轮发出 77 次 HTTP 请求、4 次业务执行，最大并发 1，无残留资源，出站检查未发现 canary。
-- 该验收的制品来源为受控固定版本 HTTP，Neo 使用 loopback FakeBay、实际 wrapper 与假 Python/Node 程序；Node PATH 仅在该测试中调整，不代表真实 QQ、NapCat、生产 Neo 或完整生产部署，也没有真实账号参与。
+- 合并 Generic、Cold 和 native helper 后，全量离线测试 531 项通过，耗时 29.120 秒。`main.py`、`execution_queue.py`、`notifications.py`、`scheduler.py`、`preparation.py`、`scripts/verify-native.py`、`tests/neo_support.py`、`tests/test_fake_bay_lifecycle.py`、`tests/test_manual_execution.py`、`tests/test_neo_executor.py`、`tests/test_neo_lifecycle.py` 和 `tests/test_preparation.py` 通过 scoped Ruff 检查。不声明全仓 Ruff 全绿：全仓运行另有 19 个既有 I001/SIM117/B023/UP017 发现，位于未触及的旧段落，本轮不纳入清理范围。
+- 原生实际回放仍对应同一生产代码；最终发布包使用合并后源码。
+- 该验收的制品来源为受控固定版本 HTTP，Neo 使用 loopback FakeBay、实际 wrapper 与假 Python/Node 程序，不连接真实云盘；FakeBay 不是操作系统或网络沙箱，只应运行受信插件归档。Node PATH 仅在该测试中调整，不代表真实 QQ、NapCat、生产 Neo 或完整生产部署，也没有真实账号参与。
+- 本轮没有声明公网 GitHub 下载成功：一次在 Mac 上的公开 GitHub 下载尝试在公共 DNS 后以直接连接错误失败，未因此改变验收条件或放宽校验。真实 Neo 的 3 组验收是独立记录，不能与本条互相替代。
 
 ### 制品准备本地验收
 

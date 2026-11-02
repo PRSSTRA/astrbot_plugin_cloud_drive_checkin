@@ -75,7 +75,7 @@ class NeoLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.clients.stop()
         self.env.stop()
         self.modules.stop()
-        self.bay.close()
+        await self.bay.close()
 
     async def test_reload_recovers_recorded_resources_without_replaying_script(self):
         first = self.plugin()
