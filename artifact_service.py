@@ -1,4 +1,4 @@
-"""Asynchronous preparation and verified caching for the fixed Tianyi artifact."""
+"""Asynchronous preparation and verified caching for locked task artifacts."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import stat
 import tempfile
 from collections.abc import Callable, Mapping
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -20,21 +21,25 @@ from urllib.parse import urlsplit
 import httpcore
 import httpx
 
+from .config import PluginConfigError
 from .preparation import (
     PreparationError,
     PreparedArtifact,
     TianyiPreparationInputs,
     TianyiRequirement,
     TianyiUserField,
+    build_generic,
     build_tianyi,
+    generic_inputs_sha256,
     load_tianyi_inputs,
 )
 from .storage import CommitUnconfirmedError, StateStore, StateUnavailableError
-from .task_config import TaskConfig
+from .task_config import TaskConfig, dependency_bundle_reference
 
 _METADATA_HOST = "pypi.org"
 _FILES_HOST = "files.pythonhosted.org"
-_ALLOWED_HOSTS = frozenset({_METADATA_HOST, _FILES_HOST})
+_SOURCE_HOST = "raw.githubusercontent.com"
+_ALLOWED_HOSTS = frozenset({_METADATA_HOST, _FILES_HOST, _SOURCE_HOST})
 _MAX_METADATA_BYTES = 1024 * 1024
 _MAX_WHEEL_BYTES = 2 * 1024 * 1024
 _MAX_ARTIFACT_BYTES = 1024 * 1024
@@ -55,6 +60,14 @@ _RECORD_FIELDS = frozenset(
         "inputs_sha256",
     }
 )
+
+
+@dataclass(frozen=True)
+class _PreparationIdentity:
+    source_commit: str
+    source_sha256: str
+    inputs_sha256: str
+    artifact_format: str
 
 
 class PreparationBusy(PreparationError):
@@ -105,7 +118,7 @@ class _PublicIPNetworkBackend(httpcore.AsyncNetworkBackend):
 
 
 class PreparationService:
-    """Download locked wheels and publish verified, content-addressed zipapps."""
+    """Prepare and cache locked Tianyi or generic task artifacts."""
 
     def __init__(
         self,
@@ -132,7 +145,7 @@ class PreparationService:
     async def prepare(
         self, task: TaskConfig, *, guard: Callable[[], None]
     ) -> PreparedArtifact:
-        """Prepare or repair the fixed Tianyi artifact for one configured task."""
+        """Prepare or repair one configured task's locked artifact."""
 
         if not callable(guard):
             raise TypeError("guard must be callable")
@@ -193,15 +206,61 @@ class PreparationService:
         if self._closing or self._closed:
             raise PreparationError("preparation service is closed")
 
+    async def _task_inputs(
+        self, task: TaskConfig
+    ) -> tuple[_PreparationIdentity, TianyiPreparationInputs | None]:
+        if not isinstance(task, TaskConfig):
+            raise PreparationError("task is not a parsed task configuration")
+        if task.input_adapter == "tianyi_account":
+            inputs = await _run_in_thread(load_tianyi_inputs)
+            _validate_tianyi_task(task, inputs)
+            return (
+                _PreparationIdentity(
+                    source_commit=inputs.task.source_commit,
+                    source_sha256=inputs.task.source_sha256,
+                    inputs_sha256=inputs.inputs_sha256,
+                    artifact_format="script",
+                ),
+                inputs,
+            )
+        if (
+            task.input_adapter != "direct_env"
+            or task.runtime not in {"python", "node"}
+            or task.result_adapter not in {"json_protocol", "process_only"}
+        ):
+            raise PreparationError("task preparation mode is not supported")
+        try:
+            reference = dependency_bundle_reference(task.dependency_bundle)
+        except PluginConfigError:
+            raise PreparationError(
+                "generic dependency declaration is invalid"
+            ) from None
+        dependency_sha256 = None if reference is None else reference.sha256
+        inputs_sha256 = generic_inputs_sha256(
+            runtime=task.runtime,
+            source_commit=task.source_commit,
+            source_sha256=task.sha256,
+            dependency_bundle=task.dependency_bundle,
+            dependency_sha256=dependency_sha256,
+        )
+        return (
+            _PreparationIdentity(
+                source_commit=task.source_commit,
+                source_sha256=task.sha256,
+                inputs_sha256=inputs_sha256,
+                artifact_format="script" if reference is None else "bundle",
+            ),
+            None,
+        )
+
     async def _prepare(
         self, task: TaskConfig, guard: Callable[[], None]
     ) -> PreparedArtifact:
-        inputs = await _run_in_thread(load_tianyi_inputs)
+        identity, tianyi_inputs = await self._task_inputs(task)
         guard()
-        _validate_task(task, inputs)
 
         snapshot = self._ready_snapshot()
-        record = _current_record(snapshot, task, inputs)
+        record = _current_record(snapshot, task, identity)
         if record is not None:
             script = await _run_in_thread(
                 _read_artifact_file,
@@ -212,41 +271,25 @@ class PreparationService:
             guard()
             if script is not None:
                 await self._reclaim_ready_cache()
-                if _current_record(self._ready_snapshot(), task, inputs) != record:
+                if _current_record(self._ready_snapshot(), task, identity) != record:
                     raise PreparationError("prepared artifact cache changed")
                 guard()
-                return _artifact_from_record(script, record)
+                return _artifact_from_record(script, record, identity.artifact_format)
 
-        try:
-            with tempfile.TemporaryDirectory(prefix="checkin-tianyi-") as temporary:
-                wheelhouse = Path(temporary)
-                await self._download_wheels(inputs.requirements, wheelhouse, guard)
-                guard()
-                artifact = await _run_in_thread(build_tianyi, wheelhouse)
-                guard()
-                current_inputs = await _run_in_thread(load_tianyi_inputs)
-                guard()
-                if current_inputs != inputs:
-                    raise PreparationError(
-                        "Tianyi preparation inputs changed during preparation"
-                    )
-        except asyncio.CancelledError:
-            raise
-        except PreparationError:
-            raise
-        except (OSError, RuntimeError):
-            raise PreparationError("Tianyi artifact preparation failed") from None
+        if tianyi_inputs is None:
+            artifact = await self._prepare_generic(task, guard)
+        else:
+            artifact = await self._prepare_tianyi(tianyi_inputs, guard)
 
         if (
-            artifact.source_commit != inputs.task.source_commit
-            or artifact.source_sha256 != inputs.task.source_sha256
-            or artifact.inputs_sha256 != inputs.inputs_sha256
+            artifact.source_commit != identity.source_commit
+            or artifact.source_sha256 != identity.source_sha256
+            or artifact.inputs_sha256 != identity.inputs_sha256
+            or artifact.artifact_format != identity.artifact_format
             or len(artifact.script) > _MAX_ARTIFACT_BYTES
             or hashlib.sha256(artifact.script).hexdigest() != artifact.sha256
         ):
-            raise PreparationError(
-                "Tianyi preparation inputs changed during preparation"
-            )
+            raise PreparationError("prepared artifact does not match its locked inputs")
 
         metadata = {
             "task_version": task.version,
@@ -281,15 +324,91 @@ class PreparationService:
         await self._store.mutate(publish)
         guard()
         await self._reclaim_ready_cache()
-        if _current_record(self._ready_snapshot(), task, inputs) != metadata:
+        if _current_record(self._ready_snapshot(), task, identity) != metadata:
             raise PreparationError("prepared artifact state changed")
         guard()
         return artifact
 
+    async def _prepare_tianyi(
+        self,
+        inputs: TianyiPreparationInputs,
+        guard: Callable[[], None],
+    ) -> PreparedArtifact:
+        try:
+            with tempfile.TemporaryDirectory(prefix="checkin-tianyi-") as temporary:
+                wheelhouse = Path(temporary)
+                await self._download_wheels(inputs.requirements, wheelhouse, guard)
+                guard()
+                artifact = await _run_in_thread(build_tianyi, wheelhouse)
+                guard()
+                current_inputs = await _run_in_thread(load_tianyi_inputs)
+                guard()
+                if current_inputs != inputs:
+                    raise PreparationError(
+                        "Tianyi preparation inputs changed during preparation"
+                    )
+                return artifact
+        except asyncio.CancelledError:
+            raise
+        except PreparationError:
+            raise
+        except (OSError, RuntimeError):
+            raise PreparationError("Tianyi artifact preparation failed") from None
+
+    async def _prepare_generic(
+        self, task: TaskConfig, guard: Callable[[], None]
+    ) -> PreparedArtifact:
+        try:
+            async with asyncio.timeout(_DOWNLOAD_TOTAL_SECONDS):
+                source = await self._download_bytes(
+                    task.script_url, _MAX_ARTIFACT_BYTES, "generic task source"
+                )
+                guard()
+                if hashlib.sha256(source).hexdigest() != task.sha256:
+                    raise PreparationError(
+                        "generic source hash does not match the lock"
+                    )
+                reference = dependency_bundle_reference(task.dependency_bundle)
+                bundle = None
+                if reference is not None:
+                    bundle = await self._download_bytes(
+                        reference.url,
+                        _MAX_ARTIFACT_BYTES,
+                        "generic dependency bundle",
+                    )
+                    guard()
+                    if hashlib.sha256(bundle).hexdigest() != reference.sha256:
+                        raise PreparationError(
+                            "dependency bundle hash does not match the lock"
+                        )
+                artifact = await _run_in_thread(
+                    build_generic,
+                    runtime=task.runtime,
+                    source=source,
+                    source_commit=task.source_commit,
+                    source_sha256=task.sha256,
+                    dependency_bundle=task.dependency_bundle,
+                    bundle=bundle,
+                    dependency_sha256=(None if reference is None else reference.sha256),
+                )
+                guard()
+                return artifact
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            raise PreparationError("generic artifact download timed out") from None
+        except PluginConfigError:
+            raise PreparationError(
+                "generic dependency declaration is invalid"
+            ) from None
+        except PreparationError:
+            raise
+        except (OSError, RuntimeError):
+            raise PreparationError("generic artifact preparation failed") from None
+
     async def _load(self, task: TaskConfig) -> PreparedArtifact:
-        inputs = await _run_in_thread(load_tianyi_inputs)
-        _validate_task(task, inputs)
-        record = _current_record(self._ready_snapshot(), task, inputs)
+        identity, _tianyi_inputs = await self._task_inputs(task)
+        record = _current_record(self._ready_snapshot(), task, identity)
         if record is None:
             raise PreparationError("prepared artifact cache is not current")
         script = await _run_in_thread(
@@ -300,9 +419,9 @@ class PreparationService:
         )
         if script is None:
             raise PreparationError("prepared artifact cache is invalid")
-        if _current_record(self._ready_snapshot(), task, inputs) != record:
+        if _current_record(self._ready_snapshot(), task, identity) != record:
             raise PreparationError("prepared artifact cache changed")
-        return _artifact_from_record(script, record)
+        return _artifact_from_record(script, record, identity.artifact_format)
 
     async def _download_wheels(
         self,
@@ -437,7 +556,7 @@ class PreparationService:
         await _run_in_thread(_reclaim_cache_files, self._cache_dir, set(references))
 
 
-def _validate_task(task: TaskConfig, inputs: TianyiPreparationInputs) -> None:
+def _validate_tianyi_task(task: TaskConfig, inputs: TianyiPreparationInputs) -> None:
     if not isinstance(task, TaskConfig):
         raise PreparationError("task is not a parsed task configuration")
     expected = inputs.task
@@ -527,7 +646,7 @@ def _prospective_cache_references(
 def _current_record(
     snapshot: Mapping[str, object],
     task: TaskConfig,
-    inputs: TianyiPreparationInputs,
+    identity: _PreparationIdentity,
 ) -> dict[str, Any] | None:
     records = snapshot.get("prepared_artifacts")
     if type(records) is not dict:
@@ -539,9 +658,9 @@ def _current_record(
     sha256 = value.get("sha256")
     if (
         value.get("task_version") != task.version
-        or value.get("source_commit") != inputs.task.source_commit
-        or value.get("source_sha256") != inputs.task.source_sha256
-        or value.get("inputs_sha256") != inputs.inputs_sha256
+        or value.get("source_commit") != identity.source_commit
+        or value.get("source_sha256") != identity.source_sha256
+        or value.get("inputs_sha256") != identity.inputs_sha256
         or not isinstance(sha256, str)
         or _HEX_64.fullmatch(sha256) is None
         or type(size) is not int
@@ -552,13 +671,16 @@ def _current_record(
     return value
 
 
-def _artifact_from_record(script: bytes, record: Mapping[str, Any]) -> PreparedArtifact:
+def _artifact_from_record(
+    script: bytes, record: Mapping[str, Any], artifact_format: str
+) -> PreparedArtifact:
     return PreparedArtifact(
         script=script,
         sha256=record["sha256"],
         source_commit=record["source_commit"],
         source_sha256=record["source_sha256"],
         inputs_sha256=record["inputs_sha256"],
+        artifact_format=artifact_format,
     )
 
 
@@ -826,8 +948,10 @@ def _reject_json_constant(_value: str) -> None:
     raise ValueError
 
 
-async def _run_in_thread(function: Callable[..., Any], *args: Any) -> Any:
-    thread_task = asyncio.create_task(asyncio.to_thread(function, *args))
+async def _run_in_thread(
+    function: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
+    thread_task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
     try:
         return await asyncio.shield(thread_task)
     except asyncio.CancelledError:

@@ -155,7 +155,7 @@ class ExecutionQueueTests(unittest.IsolatedAsyncioTestCase):
             fixed_env=(),
             input_adapter="direct_env",
             result_adapter="json_protocol",
-            dependency_bundle="",
+            dependency_bundle="none",
             timeout_seconds=30,
             experimental=False,
             version="3" * 64,
@@ -170,7 +170,7 @@ class ExecutionQueueTests(unittest.IsolatedAsyncioTestCase):
             await self.store.retry_pending()
         await self.store.close()
 
-    async def make_queue(self, execute=None, guard=None):
+    async def make_queue(self, execute=None, guard=None, startup_ready=None):
         if execute is None:
 
             async def execute(item):
@@ -197,10 +197,45 @@ class ExecutionQueueTests(unittest.IsolatedAsyncioTestCase):
             blocked=lambda: self.blocked,
             reserve=notifications.reserve_terminal,
             terminal=notifications.enqueue_terminal,
+            startup_ready=startup_ready or (lambda: True),
         )
         await queue.initialize()
         self.queues.append(queue)
         return queue
+
+    async def test_close_during_last_initialize_await_cannot_start_worker(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def execute(item):
+            raise AssertionError("closed queue must not execute")
+
+        async def gated_recovery():
+            entered.set()
+            await release.wait()
+
+        queue = execution_queue.ExecutionQueue(
+            self.store,
+            execute=execute,
+            guard=self.guard,
+            config=lambda: self.raw_config,
+            blocked=lambda: self.blocked,
+            reserve=notifications.reserve_terminal,
+            terminal=notifications.enqueue_terminal,
+        )
+        queue._recover_before_start = gated_recovery
+        self.queues.append(queue)
+
+        initialization = asyncio.create_task(queue.initialize())
+        await asyncio.wait_for(entered.wait(), 1)
+        await queue.close()
+        release.set()
+        outcome = (await asyncio.gather(initialization, return_exceptions=True))[0]
+
+        self.assertIsInstance(outcome, execution_queue.ExecutionBlocked)
+        self.assertTrue(queue.closed)
+        self.assertFalse(queue._accepting)
+        self.assertIsNone(queue._worker)
 
     async def enqueue(self, queue, *, identity=None, task=None):
         return await queue.enqueue(
@@ -310,6 +345,72 @@ class ExecutionQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(second_identity.qq_id, guarded)
         self.assertEqual(self.execute_calls, [])
 
+    async def test_startup_gate_precedes_guard_but_not_executor_blocking(self):
+        self.blocked = True
+        startup = {"ready": False}
+        guarded = []
+
+        def guard(item, snapshot):
+            guarded.append(item["run_id"])
+            raise execution_queue.QueueRejected("permission_revoked")
+
+        queue = await self.make_queue(
+            guard=guard, startup_ready=lambda: startup["ready"]
+        )
+        run_id = await self.enqueue(queue)
+        queue.wake()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(self.batch(run_id)["status"], "queued")
+        self.assertEqual(guarded, [])
+        self.assertEqual(self.execute_calls, [])
+
+        startup["ready"] = True
+        queue.wake()
+        await wait_until(lambda: self.batch(run_id)["status"] == "finished")
+
+        self.assertEqual(
+            self.batch(run_id)["result"]["queue_reason"], "permission_revoked"
+        )
+        self.assertEqual(guarded, [run_id])
+        self.assertEqual(self.execute_calls, [])
+
+    async def test_persisted_queue_survives_cold_restart_until_platforms_complete(self):
+        startup = {"ready": False}
+        platforms = set()
+        guarded = []
+
+        def guard(item, snapshot):
+            guarded.append(item["run_id"])
+            if item["platform_id"] not in platforms:
+                raise execution_queue.QueueRejected("permission_revoked")
+
+        first = await self.make_queue(
+            guard=guard, startup_ready=lambda: startup["ready"]
+        )
+        run_id = await self.enqueue(first)
+        await first.close()
+
+        successor = await self.make_queue(
+            guard=guard, startup_ready=lambda: startup["ready"]
+        )
+        platforms.add("other-platform")
+        successor.wake()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(self.batch(run_id)["status"], "queued")
+        self.assertEqual(guarded, [])
+        self.assertEqual(self.execute_calls, [])
+
+        platforms.add(self.identity.platform_id)
+        startup["ready"] = True
+        successor.wake()
+        await wait_until(lambda: self.batch(run_id)["status"] == "finished")
+
+        self.assertEqual(self.batch(run_id)["result"]["business_status"], "success")
+        self.assertEqual(guarded, [run_id])
+        self.assertEqual(self.execute_calls, [run_id])
+
     async def test_expiry_is_terminal_and_never_executes(self):
         self.blocked = True
         self.raw_config["queue_expiry_seconds"] = 10
@@ -324,6 +425,33 @@ class ExecutionQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["queue_reason"], "queue_expired")
         self.assertEqual(self.execute_calls, [])
         self.assertEqual(self.store.snapshot()["outbox"][run_id]["phase"], "pending")
+
+    async def test_cold_start_expires_only_expired_item_without_notice_attempt(self):
+        startup = {"ready": False}
+        self.raw_config["queue_expiry_seconds"] = 10
+        queue = await self.make_queue(startup_ready=lambda: startup["ready"])
+        expired = await self.enqueue(queue)
+        self.raw_config["queue_expiry_seconds"] = 900
+        unexpired = await self.enqueue(
+            queue, identity=permissions.Identity("qq-bot", "10002")
+        )
+
+        self.clock.advance(11)
+        await queue.close()
+        await self.make_queue(startup_ready=lambda: startup["ready"])
+
+        snapshot = self.store.snapshot()
+        self.assertEqual(snapshot["batches"][expired]["status"], "finished")
+        self.assertEqual(
+            snapshot["batches"][expired]["result"]["queue_reason"],
+            "queue_expired",
+        )
+        self.assertEqual(snapshot["outbox"][expired]["phase"], "pending")
+        self.assertEqual(snapshot["outbox"][expired]["attempts"], 0)
+        self.assertEqual(snapshot["batches"][unexpired]["status"], "queued")
+        self.assertEqual(snapshot["outbox"][unexpired]["phase"], "reserved")
+        self.assertEqual(snapshot["outbox"][unexpired]["attempts"], 0)
+        self.assertEqual(self.execute_calls, [])
 
     async def test_live_guard_cancels_owned_execute_and_finishes_safely(self):
         started = asyncio.Event()

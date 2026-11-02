@@ -26,6 +26,8 @@ _FAKE_PASSWORD = 'FAKE quote" semicolon; spaces  \nsecond line'
 
 
 class ExecutionFixture(unittest.IsolatedAsyncioTestCase):
+    host_platforms_ready = True
+
     @classmethod
     def setUpClass(cls):
         cls.astrbot = patch_astrbot_modules()
@@ -91,11 +93,14 @@ class ExecutionFixture(unittest.IsolatedAsyncioTestCase):
         )
         self.context = AstrBotContext()
         self.context.config["admins_id"] = ["90001"]
-        self.context.platforms.append(
-            SimpleNamespace(
-                meta=lambda: SimpleNamespace(id="other-bot", name="aiocqhttp")
+        if self.host_platforms_ready:
+            self.context.platforms.append(
+                SimpleNamespace(
+                    meta=lambda: SimpleNamespace(id="other-bot", name="aiocqhttp")
+                )
             )
-        )
+        else:
+            self.context.platforms.clear()
         client_type = self.main.NeoClient
         client_patch = mock.patch.object(
             self.main,
@@ -178,6 +183,134 @@ class ExecutionFixture(unittest.IsolatedAsyncioTestCase):
             )
         )
         return self.snapshot()["batches"][run_id]
+
+
+class ColdStartReadinessTests(ExecutionFixture):
+    host_platforms_ready = False
+
+    async def test_queued_identity_waits_through_empty_and_partial_platforms(self):
+        self.context.platforms.append(
+            SimpleNamespace(
+                meta=lambda: SimpleNamespace(id="bot-instance", name="aiocqhttp")
+            )
+        )
+        await self.bind()
+        run_id, _ = await self.submit()
+        self.context.platforms.clear()
+        self.plugin.queue.wake()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(self.snapshot()["batches"][run_id]["status"], "queued")
+        self.assertEqual(self.snapshot()["outbox"][run_id]["phase"], "reserved")
+        self.assertEqual(self.bay.execution_calls, 0)
+
+        self.context.platforms.append(
+            SimpleNamespace(
+                meta=lambda: SimpleNamespace(id="bot-instance", name="aiocqhttp")
+            )
+        )
+        self.plugin.queue.wake()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(self.snapshot()["batches"][run_id]["status"], "queued")
+        self.assertEqual(self.bay.execution_calls, 0)
+
+        await self.plugin.on_astrbot_loaded()
+        result = await self.finished(run_id)
+        self.assertEqual(result["result"]["business_status"], "success")
+        self.assertEqual(self.bay.execution_calls, 1)
+
+    async def test_late_webchat_marker_is_cached_without_authorizing_qq(self):
+        self.context.platforms.append(
+            SimpleNamespace(
+                meta=lambda: SimpleNamespace(id="bot-instance", name="aiocqhttp")
+            )
+        )
+        await self.bind()
+        run_id, _ = await self.submit()
+        workers = (
+            self.plugin.notifications._worker,
+            self.plugin.queue._worker,
+            self.plugin.scheduler._worker,
+        )
+        self.context.platforms.append(
+            SimpleNamespace(meta=lambda: SimpleNamespace(id="webchat", name="webchat"))
+        )
+        self.assertTrue(self.plugin._startup_ready())
+        self.context.platforms.clear()
+        self.assertTrue(self.plugin._startup_ready())
+
+        await self.plugin.on_astrbot_loaded()
+        await self.plugin.on_astrbot_loaded()
+        self.assertEqual(
+            workers,
+            (
+                self.plugin.notifications._worker,
+                self.plugin.queue._worker,
+                self.plugin.scheduler._worker,
+            ),
+        )
+
+        await self.until(
+            lambda: self.snapshot()["batches"][run_id]["status"] == "finished"
+        )
+        self.assertEqual(
+            self.snapshot()["batches"][run_id]["result"]["queue_reason"],
+            "permission_revoked",
+        )
+        self.assertEqual(self.bay.execution_calls, 0)
+
+    async def test_global_disablement_still_settles_after_startup_ready(self):
+        self.context.platforms.append(
+            SimpleNamespace(
+                meta=lambda: SimpleNamespace(id="bot-instance", name="aiocqhttp")
+            )
+        )
+        await self.bind()
+        run_id, _ = await self.submit()
+        self.config["enabled"] = False
+
+        await self.plugin.on_astrbot_loaded()
+        await self.until(
+            lambda: self.snapshot()["batches"][run_id]["status"] == "finished"
+        )
+
+        self.assertEqual(
+            self.snapshot()["batches"][run_id]["result"]["queue_reason"],
+            "service_disabled",
+        )
+        self.assertEqual(self.bay.execution_calls, 0)
+
+    async def test_ready_marker_survives_same_context_reload(self):
+        await self.plugin.on_astrbot_loaded()
+        await self.plugin.terminate()
+        successor = self.main.CloudDriveCheckin(self.context, self.config)
+        successor.plugin_id = self.plugin.plugin_id
+        await successor.initialize()
+        self.addAsyncCleanup(successor.terminate)
+
+        self.assertTrue(successor._startup_ready())
+        self.assertIsNotNone(successor.notifications._worker)
+        self.assertIsNotNone(successor.queue._worker)
+        self.assertIsNotNone(successor.scheduler._worker)
+
+    async def test_loaded_hook_during_shutdown_cannot_start_cold_work(self):
+        self.context.platforms.append(
+            SimpleNamespace(
+                meta=lambda: SimpleNamespace(id="bot-instance", name="aiocqhttp")
+            )
+        )
+        await self.bind()
+        run_id, _ = await self.submit()
+
+        stopping = asyncio.create_task(self.plugin.terminate())
+        await asyncio.sleep(0)
+        self.assertTrue(self.plugin._terminating)
+        await self.plugin.on_astrbot_loaded()
+        await stopping
+
+        self.assertEqual(self.bay.execution_calls, 0)
+        self.assertNotEqual(self.snapshot()["batches"][run_id]["status"], "running")
 
 
 class ManualExecutionTests(ExecutionFixture):

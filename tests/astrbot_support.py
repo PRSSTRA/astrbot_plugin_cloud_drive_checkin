@@ -85,7 +85,8 @@ class AstrBotContext:
         self.platforms = [
             SimpleNamespace(
                 meta=lambda: SimpleNamespace(id="bot-instance", name="aiocqhttp")
-            )
+            ),
+            SimpleNamespace(meta=lambda: SimpleNamespace(id="webchat", name="webchat")),
         ]
         self.platform_manager = SimpleNamespace(get_insts=lambda: self.platforms)
 
@@ -166,6 +167,14 @@ class _Filter:
     def command(name, *, priority=0):
         def decorate(handler):
             handler.__astrbot_command__ = (name, priority)
+            return handler
+
+        return decorate
+
+    @staticmethod
+    def on_astrbot_loaded(**kwargs):
+        def decorate(handler):
+            handler.__astrbot_loaded__ = kwargs
             return handler
 
         return decorate

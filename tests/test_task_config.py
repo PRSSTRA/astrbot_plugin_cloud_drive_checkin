@@ -42,7 +42,7 @@ def _task(**updates):
         "fixed_env": {"CHECKIN_MODE": "safe"},
         "input_adapter": "direct_env",
         "result_adapter": "json_protocol",
-        "dependency_bundle": "",
+        "dependency_bundle": "none",
         "timeout_seconds": 0,
         "experimental": False,
     }
@@ -244,6 +244,7 @@ class TaskConfigTests(unittest.TestCase):
                 input_adapter="mobile_single_account",
                 result_adapter="mobile_unverified",
                 user_fields=_mobile_fields(),
+                dependency_bundle="",
                 experimental=True,
             ),
         )
@@ -263,6 +264,7 @@ class TaskConfigTests(unittest.TestCase):
                 input_adapter="mobile_single_account",
                 result_adapter="mobile_unverified",
                 user_fields=_mobile_fields(),
+                dependency_bundle="",
                 experimental=False,
             ),
         )
@@ -278,6 +280,7 @@ class TaskConfigTests(unittest.TestCase):
         tianyi = _task(
             input_adapter="tianyi_account",
             result_adapter="tianyi",
+            dependency_bundle="",
             user_fields=[
                 _field("username", "TY_USERNAME"),
                 _field("password", "TY_PASSWORD", secret=False),
@@ -287,6 +290,7 @@ class TaskConfigTests(unittest.TestCase):
             runtime="node",
             input_adapter="mobile_single_account",
             result_adapter="mobile_unverified",
+            dependency_bundle="",
             user_fields=_mobile_fields()[:-1],
             experimental=True,
         )
@@ -319,6 +323,69 @@ class TaskConfigTests(unittest.TestCase):
         )
         self.assertEqual(task.source_commit, _COMMIT)
         self.assertEqual(task.sha256, _SHA256)
+
+    def test_dependency_bundle_is_fixed_and_canonical_in_task_version(self):
+        bundle_commit = "2" * 40
+        bundle_sha256 = "ABCDEF0123456789" * 4
+        blob_url = (
+            "https://github.com/example/dependencies/blob/"
+            f"{bundle_commit.upper()}/bundles/python.zip"
+        )
+        raw_url = (
+            "https://raw.githubusercontent.com/example/dependencies/"
+            f"{bundle_commit}/bundles/python.zip"
+        )
+        first_declaration = json.dumps(
+            {"sha256": bundle_sha256, "url": blob_url, "format": "zip-v1"},
+            indent=2,
+        )
+        second_declaration = json.dumps(
+            {"format": "zip-v1", "url": raw_url, "sha256": bundle_sha256.lower()},
+            separators=(",", ":"),
+        )
+
+        first = self.parse_one(_task(dependency_bundle=first_declaration))
+        second = self.parse_one(_task(dependency_bundle=second_declaration))
+
+        expected = json.dumps(
+            {"format": "zip-v1", "sha256": bundle_sha256.lower(), "url": raw_url},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self.assertEqual(first.dependency_bundle, expected)
+        self.assertEqual(first.version, second.version)
+
+    def test_generic_dependency_mode_is_explicit_and_strict(self):
+        bundle_commit = "2" * 40
+        url = (
+            "https://raw.githubusercontent.com/example/dependencies/"
+            f"{bundle_commit}/bundle.zip"
+        )
+        valid = {"format": "zip-v1", "url": url, "sha256": "3" * 64}
+        invalid_declarations = (
+            "",
+            "requests",
+            json.dumps({**valid, "format": "zip-v2"}),
+            json.dumps({**valid, "url": url.replace(bundle_commit, "main")}),
+            json.dumps({**valid, "url": url + "?token=private"}),
+            json.dumps({**valid, "url": url.replace("https://", "http://")}),
+            json.dumps({**valid, "sha256": "3" * 63}),
+            '{"format":"zip-v1","format":"zip-v1","url":"'
+            + url
+            + '","sha256":"'
+            + "3" * 64
+            + '"}',
+        )
+
+        self.assertEqual(
+            self.parse_one(_task(dependency_bundle="none")).dependency_bundle, "none"
+        )
+        for declaration in invalid_declarations:
+            with (
+                self.subTest(declaration=declaration),
+                self.assertRaises(self.config.PluginConfigError),
+            ):
+                self.parse_one(_task(dependency_bundle=declaration))
 
     def test_unsafe_or_unpinned_sources_are_rejected_without_echoing_them(self):
         raw_path = f"example/project/{_COMMIT}/scripts/checkin.py"
@@ -470,6 +537,56 @@ class TaskConfigTests(unittest.TestCase):
         self.assertNotEqual(task.version, uppercase.version)
         with self.assertRaises(self.config.PluginConfigError):
             self.parse_one(_task(user_fields=[_field(env_name="paß")]))
+
+    def test_environment_declaration_matches_runner_capacity(self):
+        required_fields = [
+            _field("token", "TOKEN"),
+            _field("count", "COUNT", value_type="int"),
+            _field("enabled", "ENABLED", value_type="bool"),
+        ]
+        fixed_at_combined_limit = {
+            "FIXED_0": "x" * (16 * 1024),
+            "FIXED_1": "x" * (16 * 1024),
+            "FIXED_2": "x" * (16 * 1024),
+            "FIXED_3": "x" * (16 * 1024 - 6),
+        }
+        parsed = self.parse_one(
+            _task(user_fields=required_fields, fixed_env=fixed_at_combined_limit)
+        )
+        self.assertEqual(len(parsed.fixed_env), 4)
+
+        over_combined_limit = dict(fixed_at_combined_limit)
+        over_combined_limit["FIXED_3"] += "x"
+        invalid_tasks = (
+            _task(user_fields=required_fields, fixed_env=over_combined_limit),
+            _task(fixed_env={"FIXED": "x" * (16 * 1024 + 1)}),
+            _task(fixed_env={"FIXED": "contains\0nul"}),
+            _task(fixed_env={"FIXED": "汉" * 5462}),
+            _task(user_fields=[_field(env_name="A" * (16 * 1024 + 1))]),
+            _task(
+                user_fields=[
+                    _field(f"field_{index}", f"USER_{index}") for index in range(32)
+                ],
+                fixed_env={f"FIXED_{index}": "" for index in range(33)},
+            ),
+        )
+        for task in invalid_tasks:
+            with (
+                self.subTest(names=tuple(task.get("fixed_env", {}))),
+                self.assertRaises(self.config.PluginConfigError),
+            ):
+                self.parse_one(task)
+
+        longest_name = "A" * (16 * 1024)
+        unicode_value = "汉" * 5461
+        bounded = self.parse_one(
+            _task(
+                user_fields=[_field(env_name=longest_name)],
+                fixed_env={"FIXED": unicode_value},
+            )
+        )
+        self.assertEqual(bounded.user_fields[0].env_name, longest_name)
+        self.assertEqual(dict(bounded.fixed_env)["FIXED"], unicode_value)
 
     def test_invalid_unicode_is_rejected_at_configuration_boundary(self):
         for change in (

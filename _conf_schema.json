@@ -164,11 +164,11 @@
   "tasks": {
     "description": "签到任务模板",
     "type": "template_list",
-    "hint": "启用服务与任务后按 Cron 自动入队；手动与自动共用串行队列和已准备的固定天翼制品。",
+    "hint": "启用服务与任务后按 Cron 自动入队；手动与自动共用串行队列和已准备的锁定制品。",
     "templates": {
       "task": {
         "name": "签到任务",
-        "hint": "配置一个固定来源的签到任务。",
+        "hint": "配置一个固定提交、固定哈希来源的签到任务。",
         "display_item": "name",
         "hide_hint_in_list": true,
         "items": {
@@ -255,8 +255,8 @@
           "dependency_bundle": {
             "description": "依赖包声明",
             "type": "string",
-            "default": "",
-            "hint": "仅作静态声明；非空不表示依赖已准备完成。"
+            "default": "none",
+            "hint": "使用 none 表示无依赖；或填写固定提交 HTTPS URL 与 SHA256 的 zip-v1 JSON 声明。ZIP 仅支持预构建纯 Python/JavaScript 依赖与辅助文件，不运行安装器。"
           },
           "timeout_seconds": {
             "description": "任务超时秒数",

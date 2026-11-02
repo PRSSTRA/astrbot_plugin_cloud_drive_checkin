@@ -36,8 +36,8 @@ python3 -m venv .venv
 - `scheduler.py`：未来计划的 Cron 观察与准入，只调用队列，不执行脚本或读取凭据。
 - `execution_bridge.py`：把队列请求绑定到最新凭据、已准备制品和 Neo 执行器，并生成本人状态摘要。
 - `notifications.py`：终态通知 outbox、按来源和偏好决定发送、有界重试和投递状态。
-- `preparation.py`：从本地源码、许可和锁定 wheel 离线构建天翼 zipapp，校验输入与制品。
-- `artifact_service.py`：下载锁定 wheel、校验缓存、构建制品，并把准备记录写入 KV。
+- `preparation.py`：从本地源码、许可和锁定 wheel 离线构建天翼 zipapp，或构建通用任务的源码或依赖 zip 制品。
+- `artifact_service.py`：按任务类型下载锁定 wheel 或固定提交源码/依赖包、校验缓存、构建制品，并把准备记录写入 KV。
 - `scripts/prepare-tianyi.py`：使用本地 wheelhouse 生成制品的开发命令。
 - `runners/tianyi_entry.py`：制品内的单账号入口，核对结果后只输出安全状态。
 - `runners/bootstrap.py`：上传到 Neo 的独立 wrapper；消费凭据文件，以 argv 启动子进程并只返回安全结果信封。
@@ -73,7 +73,7 @@ python3 -m venv .venv
 
 ## 内部执行接口
 
-`NeoExecutor.execute(PreparedExecution(...), guard=..., run_id=None)` 接收已经准备好的脚本字节、SHA256、固定来源 commit、任务版本、身份和本次环境变量。调用方负责脚本来源及依赖制品验收，并在同步 `guard(snapshot)` 中重新检查权限和版本；拒绝时抛异常，放行时返回 `None`。传入 `run_id` 时执行器使用该稳定编号；省略时保持原有每次调用生成 UUID 的行为。执行器本身不下载脚本、不安装依赖、不提供 shell 聊天入口。天翼离线制品及其单账号结果入口、管理员准备指令和持久制品缓存已接入；手动和自动签到通过同一队列使用同一执行器。
+`NeoExecutor.execute(PreparedExecution(...), guard=..., run_id=None)` 接收已经准备好的脚本或制品字节、SHA256、固定来源 commit、任务版本、身份、本次环境变量和制品形态（`script` 或 `bundle`）。调用方负责脚本来源及依赖制品验收，并在同步 `guard(snapshot)` 中重新检查权限和版本；拒绝时抛异常，放行时返回 `None`。传入 `run_id` 时执行器使用该稳定编号；省略时保持原有每次调用生成 UUID 的行为。执行器本身不下载脚本、不安装依赖、不提供 shell 聊天入口。天翼与通用（`direct_env`）离线制品、管理员准备指令和持久制品缓存已接入；手动和自动签到通过同一队列使用同一执行器。
 
 执行器在 `checkin_state.runs` 和 `cleanup_jobs` 中记录 `kind=neo_execution` 的状态。先持久化 `phase=admitted` 表示尚未尝试分配，再单独确认 `phase=creating` 的创建意图，之后才能调用 Neo；创建和执行意图的写入返回后均再次同步检查授权。恢复时仅对结构合法、没有资源 ID 的 `admitted` 记录确定取消并解除阻断；`creating` 或之后的阶段不能凭缺少 ID 推断未创建。这样，即使无分配证明的终态写入被另一笔未确认提交阻挡，精确重试后仍可从持久化阶段恢复。每个运行预留 8 KiB 的快照空间用于资源 ID 和终态，最多保留 1000 个运行条目，容量不足拒绝新增；签到已结算批次会连同同 run_id 的已结束运行和 outbox 按 `history_retention_days` 裁剪，独立 Neo 运行只受 1000 条上限约束。记录不保存脚本内容、环境变量或原始输出。
 
@@ -106,7 +106,7 @@ python3 -m venv .venv
 
 管理员取消通过 `request_cancel(run_id, guard=...)` 完成，只接受 32 位小写十六进制 run_id。请求在 `mutate` 写入确认后才生效；已结束、已请求或不存在的 run_id 返回对应状态，不重写批次、不补发通知，也不重跑业务。worker 在准入、认领、凭据上传边界、执行回调和轮询守卫中检查 `cancel_requested`：尚未发送业务请求时以 `cancelled/admin_cancelled` 结算，不执行脚本；凭据尚未上传时也不会继续上传，且不写冷却或全局间隔。业务可能已开始且没有明确结果时以 `unknown` 结算，已有可靠结果保持原值，只附加 `queue_reason=admin_cancelled`。取消不修改任务、Cron、绑定或后续计划，终态通知仍按现有规则发给运行所属用户。`tests/test_admin_cancellation.py` 覆盖权限、排队与运行阶段、已知结果保留、未确认写入和重载恢复。
 
-执行回调加载已准备制品，解密最新已确认凭据，生成 `TY_ACCOUNTS`，并以同一 run_id 调用 `NeoExecutor.execute`。凭据明文不写入批次记录，也不进入日志。
+执行回调加载已准备制品，解密最新已确认凭据，按任务声明生成环境变量：天翼声明生成 `TY_ACCOUNTS`，`direct_env` 把用户字段按类型序列化为环境变量并合并 `fixed_env`，然后以同一 run_id 调用 `NeoExecutor.execute`。任务配置校验 `user_fields` 与 `fixed_env` 合计不超过 64 项；变量名和值各不超过 16 KiB，值拒绝 NUL；`fixed_env` 值合计及其与必填字段最小预算之和不超过 64 KiB。保存凭据时，实际序列化用户值与 `fixed_env` 值合计同样不超过 64 KiB。凭据明文不写入批次记录，也不进入日志。
 
 ### 管理员停用
 
@@ -133,6 +133,12 @@ python3 -m venv .venv
 `MAX_OUTBOX_ITEMS` 为 1000；`terminal_capacity(snapshot)` 供队列在入队时检查槽位。
 
 `NotificationService(store, send)` 在外部发送前先持久化 `phase=sending`：`send` 返回 `True` 记为 `sent`，返回 `False` 记为 `pending` 并在上限内重试，重试用尽后记为 `failed`，异常或取消记为 `unknown`，不盲目重发。默认最多 3 次尝试，重试窗口 30 秒。KV 写入失败时停止发送，但不重跑签到。通知发送失败不改变批次中的业务终态，`/签到 状态` 仍可查询，抑制状态显示为“按偏好静默”。
+
+### 框架启动就绪
+
+AstrBot 4.29.4 在插件初始化之后才完成平台适配器加载。插件把“框架平台已加载”与业务授权分开：每个 `Context` 的 `_cloud_drive_checkin_state_registry` 状态槽按 `plugin_id` 保存 `platforms_ready`，`CloudDriveCheckin._startup_ready()` 先读取该标记，再查询公共平台入口 `context.platform_manager.get_insts()`。4.29.4 在所有已配置适配器初始化后才追加 `webchat` 实例，因此看到该实例可以作为加载完成信号；AstrBot 的 `filter.on_astrbot_loaded()` 钩子同样置位标记。二者只是框架就绪标记，不参与身份授权；权限仍由普通 QQ 私聊、事件中的平台与 QQ、`aiocqhttp` 平台实例和权限配置判定。
+
+就绪前，队列 worker 的 `_step` 在到期检查、`guard` 和认领前返回，尚未过期的 `queued` 批次保持原状；队列初始化恢复和关闭对账不等待平台就绪，仍按入队时间把已过期批次记为 `queue_expired`。通知 `_claim` 在认领前返回，`pending` 记录的 `attempts` 与 `retry_deadline_at` 不变；调度器 `tick` 清空计划，`binding_plan_views` 返回 `UNREADY`。空平台列表或只加载了部分适配器不会使未过期批次被误判为 `permission_revoked`。`on_astrbot_loaded()` 置位后唤醒通知、队列和调度器；标记在同一 Context 的插件重载后保留。就绪后仍执行原有 `guard`：平台实例实际缺失、撤权、绑定暂停或删除会取消尚未发送业务请求的批次；通知发送仍要求目标 `aiocqhttp` 实例存在。调度器在就绪后重建未来计划基线，等待期间错过的计划不补跑。终止过程中到达的 `on_astrbot_loaded()` 不置位标记，也不唤醒执行组件。
 
 ### 管理员重载
 
@@ -186,25 +192,27 @@ python3 -m pip download --require-hashes --only-binary=:all: --dest "$WORKDIR/wh
 python3 scripts/prepare-tianyi.py --wheelhouse "$WORKDIR/wheels" --output "$WORKDIR/tianyi.pyz"
 ```
 
-CLI 拒绝覆盖已有输出，成功后只打印包含 `source_commit`、`source_sha256`、制品 `sha256` 和 `size` 的 JSON。源码摘要与制品摘要不同：调用内部执行器时使用 `PreparedArtifact.script` 及其 `sha256`，运行时为 `python`、传输结果适配为 `json_protocol`；制品上传成 `script.py` 后仍由原有 wrapper 校验并启动，不需要更改 Neo 执行器。
+CLI 拒绝覆盖已有输出，成功后只打印包含 `source_commit`、`source_sha256`、制品 `sha256` 和 `size` 的 JSON。源码摘要与制品摘要不同：调用内部执行器时使用 `PreparedArtifact.script` 及其 `sha256`，运行时为 `python`、传输结果适配为 `json_protocol`；该 CLI 生成的制品上传成 `script.py` 后仍由原有 wrapper 校验并启动，不需要更改 Neo 执行器。
+
+通用任务不使用本地 wheelhouse CLI。运行期由同一条管理员准备路径准备：按任务配置下载固定提交的源码，按声明再下载 `zip-v1` 依赖包，校验 SHA256 后调用 `preparation.build_generic` 构建。`dependency_bundle` 为 `none` 时制品就是源码本身；否则打包 `task.py`/`task.js` 与依赖文件。`script` 形态上传源码文件，`bundle` 形态上传 `artifact.zip`，由 wrapper 校验摘要后解包到运行时目录。Python 依赖是制品根目录下可直接导入的纯 Python 模块或包，Node 依赖位于 `node_modules/`。依赖包的构建和展开都拒绝符号链接、加密成员、路径穿越、重复或仅大小写不同的路径、保留顶层名称、原生扩展，以及文件内容为 ELF、WASM、Mach-O、fat/universal 或真实 PE 的成员，即使改名为 `.bin`。普通 JSON、PEM 和非原生二进制辅助数据允许随包；包内 0755 文本等权限位不保留，运行时统一按 0600 提取。源码、依赖包和制品各不超过 1 MiB，依赖解压后合计不超过 8 MiB；依赖 zip 最多 4096 个成员（含目录项），其中实际依赖文件最多 4095 个，生成的制品最多 4096 个文件（含 `task.py`/`task.js` 入口）。构建过程不执行下载内容，也不在宿主机安装依赖。这些是支持格式限制，不宣称阻止受信管理员脚本在 sandbox 内构造原生代码。
 
 运行期由 `artifact_service.PreparationService(store, data_dir, *, client=None)` 提供准备和读取：
 
 | 接口 | 行为 |
 | --- | --- |
-| `await prepare(task, *, guard)` | 先检查有效缓存，命中时不访问网络；否则下载锁定 wheel、构建制品、写入内容寻址缓存和 KV 记录 |
+| `await prepare(task, *, guard)` | 先检查有效缓存，命中时不访问网络；否则按任务类型下载锁定 wheel 或固定提交源码/依赖包、构建制品、写入内容寻址缓存和 KV 记录 |
 | `await load(task)` | 只读取并校验任务版本、输入指纹、记录和文件摘要，不下载、不构建、不执行 |
 | `await close()` | 取消未完成的准备和读取操作，等待自身操作与线程退出，再关闭自有客户端 |
 
-`PreparedArtifact` 包含 `script`、`sha256`、`source_commit`、`source_sha256` 和 `inputs_sha256`；`script` 不出现在 `repr` 中。
+`PreparedArtifact` 包含 `script`、`sha256`、`source_commit`、`source_sha256`、`inputs_sha256` 和 `artifact_format`（`script` 或 `bundle`）；`script` 不出现在 `repr` 中。
 
-`guard` 在耗时阶段结束后、同步 KV 修改函数内和返回前重新检查，撤权或任务变化会中止准备。文件与网络操作不放在 KV 锁内。`PreparationError` 表示任务声明不匹配、输入、下载或缓存校验拒绝；`PreparationBusy` 继承 `PreparationError`，表示已有准备在进行；`StateUnavailableError` 和 `CommitUnconfirmedError` 按存储规则上抛。注入的 `client` 归调用方管理；生产路径使用服务自建客户端，禁用环境代理，只通过 HTTPS 连接 PyPI 与 `files.pythonhosted.org`，并校验目标解析为公网地址。只有自建客户端会在 `close()` 时关闭。
+`guard` 在耗时阶段结束后、同步 KV 修改函数内和返回前重新检查，撤权或任务变化会中止准备。文件与网络操作不放在 KV 锁内。`PreparationError` 表示任务声明不匹配、输入、下载或缓存校验拒绝；`PreparationBusy` 继承 `PreparationError`，表示已有准备在进行；`StateUnavailableError` 和 `CommitUnconfirmedError` 按存储规则上抛。注入的 `client` 归调用方管理；生产路径使用服务自建客户端，禁用环境代理，只通过 HTTPS 连接 PyPI、`files.pythonhosted.org` 和 `raw.githubusercontent.com`，并校验目标解析为公网地址。只有自建客户端会在 `close()` 时关闭。
 
-制品入口只接受单账号 `TY_ACCOUNTS` JSON，保留用户名/密码原值，强制禁用上游 Telegram，并且只调用一次 `main_handler`。它丢弃上游输出，严格核对单条结果、计数、`ok` 和 `reason_code`，只输出安全 `status`；验证码/设备验证为 `needs_auth`，接口明确拒绝为 `failed`，矛盾或缺失证据为 `unknown`，不自动重跑。不要在宿主向制品注入真实凭据运行签到。
+天翼制品入口只接受单账号 `TY_ACCOUNTS` JSON，保留用户名/密码原值，强制禁用上游 Telegram，并且只调用一次 `main_handler`。它丢弃上游输出，严格核对单条结果、计数、`ok` 和 `reason_code`，只输出安全 `status`；验证码/设备验证为 `needs_auth`，接口明确拒绝为 `failed`，矛盾或缺失证据为 `unknown`，不自动重跑。不要在宿主向制品注入真实凭据运行签到。
 
-已用实际锁定 wheel 构建制品并完成九个禁网 HTTP 替身场景；另经现有 `NeoExecutor`、受控 Bay 和真实 wrapper 上传/执行 zipapp，观察到缺少凭据的 `config_error` 终态和资源清理。这里的 Bay 是测试替身，不是真实 Neo 部署。CI 在三个 Python 版本构建真实制品，并用有效假字段和网络审计钩子验证请求在联网前被阻止、只尝试一次、输出 `unknown` 且无 stderr。
+天翼制品方面，已用实际锁定 wheel 构建并完成九个禁网 HTTP 替身场景；另经现有 `NeoExecutor`、受控 Bay 和真实 wrapper 上传/执行 zipapp，观察到缺少凭据的 `config_error` 终态和资源清理。这里的 Bay 是测试替身，不是真实 Neo 部署。CI 在三个 Python 版本构建真实制品，并用有效假字段和网络审计钩子验证请求在联网前被阻止、只尝试一次、输出 `unknown` 且无 stderr。
 
-两个模板保持默认禁用；目前没有真实账号或真实 Neo 制品验收结果。
+两个模板保持默认禁用；天翼制品构建验收未覆盖真实账号。
 
 
 ## 测试与验证
@@ -213,7 +221,7 @@ CLI 拒绝覆盖已有输出，成功后只打印包含 `source_commit`、`sourc
 
 PR 的“离线测试”任务分别在 Python 3.12、3.13、3.14 上安装宿主 `requirements.txt`，显式安装 Node 22，并运行 `unittest discover -s tests -p 'test_*.py' -v`；“天翼脚本离线测试”在相同 Python 矩阵的独立虚拟环境中校验脚本依赖哈希并运行脚本测试。既有必需检查“提交信息规范”等待两组矩阵，仅在全部成功后校验提交历史；任一失败、取消或跳过都不能通过，无需修改现有必需检查名称。普通 PR CI 不连接真实 QQ、Neo 或云盘服务。
 
-执行层回归位于 `tests/test_neo_client.py`、`tests/test_neo_executor.py`、`tests/test_neo_lifecycle.py` 和 `tests/test_bootstrap.py`。制品构建与准备服务回归位于 `tests/test_preparation.py` 和 `tests/test_artifact_service.py`；管理员准备指令位于 `tests/test_admin_preparation.py`，schema 迁移与写入确认位于 `tests/test_state.py`、`tests/test_storage.py`。签到队列、恢复和容量位于 `tests/test_execution_queue.py`，自动计划准入、去重、生命周期和本人计划观察位于 `tests/test_automatic_execution.py`，终态通知位于 `tests/test_notifications.py`，聊天入口和集成位于 `tests/test_manual_execution.py`，管理员取消位于 `tests/test_admin_cancellation.py`，管理员停用位于 `tests/test_admin_disablement.py` 和 `tests/test_task_control.py`，管理员重载入口与生命周期位于 `tests/test_admin_reload.py` 和 `tests/test_reload_control.py`。`tests/neo_support.py` 是受控 Bay 替身，会在临时目录运行本仓库 wrapper 与假脚本；这不是产品的宿主回退路径。本地未安装 Node 时对应测试会明确跳过；CI 显式安装并检查 Node，不依赖 runner 预装。macOS 测试只将 Node 的可执行路径映射到本机安装位置，实际运行 Node 子进程。
+执行层回归位于 `tests/test_neo_client.py`、`tests/test_neo_executor.py`、`tests/test_neo_lifecycle.py` 和 `tests/test_bootstrap.py`。制品构建与准备服务回归位于 `tests/test_preparation.py` 和 `tests/test_artifact_service.py`；管理员准备指令位于 `tests/test_admin_preparation.py`，通用 `direct_env` 的制品准备、`script`/`bundle` 执行和类型化环境变量位于 `tests/test_generic_execution.py`，schema 迁移与写入确认位于 `tests/test_state.py`、`tests/test_storage.py`。签到队列、恢复和容量位于 `tests/test_execution_queue.py`，自动计划准入、去重、生命周期和本人计划观察位于 `tests/test_automatic_execution.py`，终态通知位于 `tests/test_notifications.py`，聊天入口和集成位于 `tests/test_manual_execution.py`，管理员取消位于 `tests/test_admin_cancellation.py`，管理员停用位于 `tests/test_admin_disablement.py` 和 `tests/test_task_control.py`，管理员重载入口与生命周期位于 `tests/test_admin_reload.py` 和 `tests/test_reload_control.py`。`tests/neo_support.py` 是受控 Bay 替身，会在临时目录运行本仓库 wrapper 与假脚本；这不是产品的宿主回退路径。本地未安装 Node 时对应测试会明确跳过；CI 显式安装并检查 Node，不依赖 runner 预装。macOS 测试只将 Node 的可执行路径映射到本机安装位置，实际运行 Node 子进程。
 
 离线 smoke 通过真实 loopback HTTP 连接受控 Bay，覆盖两用户隔离、非零退出码的显式业务结果、超时、清理阻断及恢复不重跑。真实 Neo 假凭据测试与真实账号测试分别记录如下。
 
@@ -282,9 +290,14 @@ python scripts/verify-native.py --archive /tmp/plugin.zip
 
 - 前提：当前环境能导入 `AstrBot==4.29.4`；`node` 在 `PATH` 中；未使用 `-O` 或 `PYTHONOPTIMIZE`，验收依赖断言。源码 ZIP 由执行者准备，仓库不提供打包脚本。
 - harness 用真实 `PluginManager.install_plugin_from_file` 安装源码 ZIP（1 次），启动真实 `AstrBotCoreLifecycle` 并使用原生 Star KV；两个真实 `aiocqhttp` 客户端通过受控 loopback 连接，不是真实 QQ。
-- 制品来源为受控的固定提交 HTTP 传输，Neo 为 loopback FakeBay；运行真实 wrapper 和假 Python/Node 程序，不连接真实云盘。FakeBay 不是操作系统或网络沙箱，只应运行受信插件归档。
-- 结果为 77 次 HTTP 请求、4 次业务请求，最大并发 1，Sandbox/Cargo 与临时目录残留 0，出站消息未出现 canary。两次真实 SIGKILL 后，凭据密文保留；已开始的业务不重放，排队请求继续，过期请求取消，发送结果不明的通知不重发；本人计划只读。Node 程序的 PATH 仅在测试 wrapper 中按宿主机位置调整，不是产品行为。
-- 边界：本轮没有真实 QQ、真实账号或真实 Neo，也没有声明公网 GitHub 下载成功。一次在 Mac 上的公开 GitHub 下载尝试在公共 DNS 后以直接连接错误失败，未因此改变验收条件或放宽校验。真实 Neo 的 3 组验收是独立记录，不能与本条互相替代。
+- Cold 本地阶段：Python 3.14 下离线全量 506 项测试通过，耗时 21.281 秒；本轮修改的源码和相关测试通过 scoped Ruff 检查，不声明全仓 Ruff 全绿。
+- 新增初始化/关闭竞态回归：队列、通知和调度器在最后一次 `initialize` 等待期间被关闭后不再创建 worker；主实例在初始化接管等待或恢复期间被终止后，不再构造通知、队列和调度器。
+- 回归覆盖空平台和部分平台加载期间的未过期队列、关闭对账的过期取消（过期判定不依赖平台就绪）、通知尝试次数与重试截止时间、调度未来基线重建、同 Context 重载后的就绪标记，以及终止期间忽略加载完成钩子。worker 就绪前不调用 `guard`、不执行、不认领通知；WebChat 标记缓存后即使平台列表清空仍视为就绪，但目标平台实例实际缺失时未过期批次按 `permission_revoked` 取消；就绪后错过的计划分钟不补跑。
+- 原生冷恢复验收通过：AstrBot 4.29.4 通过原生 `PluginManager` 安装集成后的源码 ZIP 一次，使用原生 KV 和两个受控 loopback `aiocqhttp` 对端。两次实际进程 SIGKILL 后，加密绑定保留，已开始业务不重放，未过期排队请求继续，过期请求取消，结果不明通知不重发，本人计划查询只读；该轮发出 77 次 HTTP 请求、4 次业务执行，最大并发 1，无残留资源，出站检查未发现 canary。
+- 合并 Generic、Cold 和 native helper 后，全量离线测试 531 项通过，耗时 29.120 秒。`main.py`、`execution_queue.py`、`notifications.py`、`scheduler.py`、`preparation.py`、`scripts/verify-native.py`、`tests/neo_support.py`、`tests/test_fake_bay_lifecycle.py`、`tests/test_manual_execution.py`、`tests/test_neo_executor.py`、`tests/test_neo_lifecycle.py` 和 `tests/test_preparation.py` 通过 scoped Ruff 检查。不声明全仓 Ruff 全绿：全仓运行另有 19 个既有 I001/SIM117/B023/UP017 发现，位于未触及的旧段落，本轮不纳入清理范围。
+- 原生实际回放仍对应同一生产代码；最终发布包使用合并后源码。
+- 该验收的制品来源为受控固定版本 HTTP，Neo 使用 loopback FakeBay、实际 wrapper 与假 Python/Node 程序，不连接真实云盘；FakeBay 不是操作系统或网络沙箱，只应运行受信插件归档。Node PATH 仅在该测试中调整，不代表真实 QQ、NapCat、生产 Neo 或完整生产部署，也没有真实账号参与。
+- 本轮没有声明公网 GitHub 下载成功：一次在 Mac 上的公开 GitHub 下载尝试在公共 DNS 后以直接连接错误失败，未因此改变验收条件或放宽校验。真实 Neo 的 3 组验收是独立记录，不能与本条互相替代。
 
 ### 制品准备本地验收
 
@@ -314,6 +327,14 @@ python scripts/verify-native.py --archive /tmp/plugin.zip
 | 独立清理证明 | 每组同时确认 Sandbox/Cargo API 不存在、对应宿主 bind 目录不存在、无同名卷和关联容器；6 组全部通过 |
 
 该结果仅覆盖上述固定版本和路径对齐后的 bind 拓扑。未验证 Docker named volume、Kubernetes、完整 AstrBot/QQ 入站流水线、跨进程崩溃或真实账号签到；没有运行真实云盘脚本。新增回归测试另外覆盖了 KV 等待期间撤权和远端副作用后取消的边界。
+
+### 通用依赖包真实 Neo 假凭据验收
+
+- 目标为同一 Docker Bay 0.4.2 版本，镜像 digest 与上文记录相同；Cargo 双路径挂载已在现场确认保持。本轮未修改部署配置、未重启服务，只使用本次创建的 3 组独立 Sandbox/Cargo 和假凭据、假程序。
+- Python 任务使用真实依赖模块，Node 任务使用真实 `node_modules` 模块。两组业务结果分别为 `success`/退出码 7 和 `already_signed`/退出码 3；第三组在客户端注入清理失败后阻断新执行，恢复后只清理、不重跑业务。业务请求共 3 次，最大并发 1。
+- 3 组均确认上传凭据目录为 0700、文件为 0600 且归执行用户所有；runtime 展开后的目录为 0700、文件为 0600、owner 正确，凭据文件已解除链接。3 组 Bay history 均未出现假凭据 canary 或 API key。
+- 3 组均确认 Sandbox/Cargo API 已不存在，并通过独立 SSH 确认宿主 bind 目录、同名 volume 和关联容器均不存在。SSH 临时隧道已关闭，内存中的密钥引用已清空。
+- 原始证据保存在仓库外，未入库。Star/KV 边界仍为受控内存适配器，不是真实 AstrBot + Neo 全链路；未连接真实 QQ 或真实账号。冷启动真实 AstrBot 进程恢复缺陷正在另一分支修复，本轮不声明该场景通过。
 
 ## Git hooks
 

@@ -451,10 +451,14 @@ class NotificationServiceTests(unittest.IsolatedAsyncioTestCase):
         await self._write()
         return terminal
 
-    def _service(self, outcomes, *, sleep=asyncio.sleep):
+    def _service(self, outcomes, *, sleep=asyncio.sleep, startup_ready=lambda: True):
         sender = GatedSender(outcomes)
         service = notifications.NotificationService(
-            self.store, sender, clock=self.clock, sleep=sleep
+            self.store,
+            sender,
+            clock=self.clock,
+            sleep=sleep,
+            startup_ready=startup_ready,
         )
         self.senders.append(sender)
         self.services.append(service)
@@ -622,6 +626,36 @@ class NotificationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recovered["outbox"][item["run_id"]]["phase"], "unknown")
         self.assertEqual(sender.calls, [])
 
+    async def test_close_during_last_initialize_await_cannot_start_worker(self):
+        item = await self._terminal()
+
+        def interrupted(snapshot):
+            snapshot["outbox"][item["run_id"]].update(
+                phase="sending",
+                attempts=1,
+                next_attempt_at=None,
+                retry_deadline_at=self.clock.value + 30,
+            )
+
+        await self.store.mutate(interrupted)
+        await self._write()
+        gate = WriteGate()
+        self.kv.next_gate = gate
+        service, sender = self._service([True])
+
+        initialization = asyncio.create_task(service.initialize())
+        await asyncio.wait_for(gate.started.wait(), 1)
+        await service.close()
+        gate.release.set()
+        outcome = (await asyncio.gather(initialization, return_exceptions=True))[0]
+        recovered = await self._write()
+
+        self.assertIsInstance(outcome, RuntimeError)
+        self.assertTrue(service._closed)
+        self.assertIsNone(service._worker)
+        self.assertEqual(recovered["outbox"][item["run_id"]]["phase"], "unknown")
+        self.assertEqual(sender.calls, [])
+
     async def test_reserved_placeholder_is_never_sent(self):
         item = _item()
         await self.store.mutate(
@@ -675,6 +709,49 @@ class NotificationServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(service.frozen)
         self.assertTrue(self.store.has_pending)
+        self.assertEqual(sender.calls, [])
+
+    async def test_cold_pending_notice_keeps_attempt_and_deadline_until_ready(self):
+        item = await self._terminal()
+        startup = {"ready": False}
+        service, sender = self._service([True], startup_ready=lambda: startup["ready"])
+
+        await service.initialize()
+        self.clock.advance(notifications.RETRY_DEADLINE_SECONDS * 2)
+        service.wake()
+        await asyncio.sleep(0)
+
+        pending = self.store.snapshot()["outbox"][item["run_id"]]
+        self.assertEqual(pending["phase"], "pending")
+        self.assertEqual(pending["attempts"], 0)
+        self.assertIsNone(pending["retry_deadline_at"])
+        self.assertEqual(sender.calls, [])
+
+        startup["ready"] = True
+        service.wake()
+        call, sending = await self._started(sender)
+        record = sending["outbox"][item["run_id"]]
+        self.assertEqual(record["attempts"], 1)
+        self.assertEqual(
+            record["retry_deadline_at"],
+            self.clock.value + notifications.RETRY_DEADLINE_SECONDS,
+        )
+        call.release.set()
+        sent = await self._write()
+        self.assertEqual(sent["outbox"][item["run_id"]]["phase"], "sent")
+
+    async def test_drain_close_while_cold_leaves_pending_notice_untouched(self):
+        item = await self._terminal()
+        service, sender = self._service([True], startup_ready=lambda: False)
+
+        await service.initialize()
+        self.clock.advance(notifications.RETRY_DEADLINE_SECONDS * 2)
+        await service.close(drain=True)
+
+        pending = self.store.snapshot()["outbox"][item["run_id"]]
+        self.assertEqual(pending["phase"], "pending")
+        self.assertEqual(pending["attempts"], 0)
+        self.assertIsNone(pending["retry_deadline_at"])
         self.assertEqual(sender.calls, [])
 
     async def test_drain_close_sends_unclaimed_immediately_due_notice(self):

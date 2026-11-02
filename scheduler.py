@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -64,11 +65,19 @@ class CronScheduler:
         config: Callable[[], Mapping],
         *,
         clock: Callable[[], datetime] | None = None,
+        startup_ready: Callable[[], bool] = lambda: True,
     ) -> None:
+        if (
+            not callable(startup_ready)
+            or inspect.iscoroutinefunction(startup_ready)
+            or inspect.isasyncgenfunction(startup_ready)
+        ):
+            raise TypeError("scheduler startup readiness callback must be synchronous")
         self.store = store
         self.queue = queue
         self._config = config
         self._clock = clock or _utc_now
+        self._startup_ready = startup_ready
         self._plans: dict[str, tuple[str, datetime]] = {}
         self._errors: dict[str, Exception] = {}
         self._last_error: Exception | None = None
@@ -85,6 +94,23 @@ class CronScheduler:
     @property
     def last_error(self) -> Exception | None:
         return self._last_error or next(iter(self._errors.values()), None)
+
+    def wake(self) -> None:
+        if not self._closed:
+            self._wake.set()
+
+    def _startup_is_ready(self) -> bool:
+        ready = self._startup_ready()
+        if inspect.iscoroutine(ready):
+            ready.close()
+            raise ExecutionBlocked(
+                "scheduler startup readiness callback must be synchronous"
+            )
+        if type(ready) is not bool:
+            raise ExecutionBlocked(
+                "scheduler startup readiness callback must return a boolean"
+            )
+        return ready
 
     def binding_plan_views(
         self, identity: Identity, task_id: str = ""
@@ -119,6 +145,8 @@ class CronScheduler:
             )
 
         if not self.store.ready:
+            return uniform(BindingPlanState.UNREADY)
+        if not self._startup_is_ready():
             return uniform(BindingPlanState.UNREADY)
         if self._closing or self._closed:
             return uniform(BindingPlanState.STOPPED)
@@ -197,6 +225,8 @@ class CronScheduler:
             return
         # Establish the future baseline before returning control to the caller.
         await self.tick()
+        if self._closing or self._closed:
+            raise ExecutionBlocked("cron scheduler is closed")
         self._worker = asyncio.create_task(self._loop(), name="checkin-cron-admission")
         self._worker.add_done_callback(self._worker_done)
 
@@ -226,6 +256,12 @@ class CronScheduler:
     async def tick(self) -> None:
         """Observe current configuration and admit only the currently due minute."""
         if self._closing or self._closed:
+            return
+        if not self._startup_is_ready():
+            self._plans.clear()
+            self._errors.clear()
+            self._last_error = None
+            self._last_observed = None
             return
         now = self._clock().astimezone(UTC)
         if not self.store.ready:
@@ -284,7 +320,7 @@ class CronScheduler:
         for scheduled_at, task in sorted(
             due, key=lambda pair: (pair[0], pair[1].task_id)
         ):
-            if self._closing or not self.store.ready:
+            if self._closing or not self.store.ready or not self._startup_is_ready():
                 self._plans.clear()
                 return
             try:
@@ -349,7 +385,7 @@ class CronScheduler:
 
     async def close(self) -> None:
         self._closing = True
-        self._wake.set()
+        self.wake()
         worker = self._worker
         if worker is not None:
             worker.cancel()

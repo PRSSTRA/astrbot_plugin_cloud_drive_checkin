@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import math
 import re
 import time
@@ -400,6 +401,7 @@ class NotificationService:
         *,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        startup_ready: Callable[[], bool] = lambda: True,
     ) -> None:
         if not callable(send):
             raise TypeError("send must be callable")
@@ -407,10 +409,19 @@ class NotificationService:
             raise TypeError("clock must be callable")
         if not callable(sleep):
             raise TypeError("sleep must be callable")
+        if (
+            not callable(startup_ready)
+            or inspect.iscoroutinefunction(startup_ready)
+            or inspect.isasyncgenfunction(startup_ready)
+        ):
+            raise TypeError(
+                "notification startup readiness callback must be synchronous"
+            )
         self._store = store
         self._send = send
         self._clock = clock
         self._sleep = sleep
+        self._startup_ready = startup_ready
         self._wake_event = asyncio.Event()
         self._worker: asyncio.Task[None] | None = None
         self._stopping = False
@@ -429,6 +440,19 @@ class NotificationService:
         if now is None:
             raise RuntimeError("notification clock is invalid")
         return now
+
+    def _startup_is_ready(self) -> bool:
+        ready = self._startup_ready()
+        if inspect.iscoroutine(ready):
+            ready.close()
+            raise RuntimeError(
+                "notification startup readiness callback must be synchronous"
+            )
+        if type(ready) is not bool:
+            raise RuntimeError(
+                "notification startup readiness callback must return a boolean"
+            )
+        return ready
 
     async def initialize(self) -> None:
         """Resolve crash-ambiguous sends, then start the outbox worker."""
@@ -466,6 +490,8 @@ class NotificationService:
                         )
 
             await self._store.mutate(recover)
+        if self._closed or self._stopping:
+            raise RuntimeError("notification service is closed")
         self._worker = asyncio.create_task(self._run())
 
     def wake(self) -> None:
@@ -525,6 +551,8 @@ class NotificationService:
     async def _claim(self) -> tuple[dict[str, Any] | None, float | None]:
         if not self._store.ready:
             return None, OUTBOX_RECHECK_SECONDS
+        if not self._startup_is_ready():
+            return None, OUTBOX_RECHECK_SECONDS
         now = self._now()
         snapshot = self._store.snapshot()
         pending: list[tuple[str, dict[str, Any]]] = []
@@ -579,6 +607,7 @@ class NotificationService:
                         and current.get("kind") == _KIND
                         and current.get("phase") == "pending"
                         and current.get("attempts") == claim_attempts
+                        and self._startup_is_ready()
                     ):
                         current.update(
                             phase="sending",
@@ -692,6 +721,7 @@ class NotificationService:
             and not worker.done()
             and not self._frozen
             and self._store.ready
+            and self._startup_is_ready()
         )
         if not self._draining:
             self._stopping = True

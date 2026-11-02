@@ -23,6 +23,24 @@ from .task_config import parse_task_catalog
 from .task_control import task_is_disabling
 
 
+def _direct_environment(task, values):
+    environment = dict(task.fixed_env)
+    for field in task.user_fields:
+        if field.field_id not in values:
+            continue
+        value = values[field.field_id]
+        if type(value) is str:
+            serialized = value
+        elif type(value) is bool:
+            serialized = "true" if value else "false"
+        elif type(value) is int:
+            serialized = str(value)
+        else:
+            raise QueueRejected("credentials_missing", business_status="config_error")
+        environment[field.env_name] = serialized
+    return environment
+
+
 class ExecutionBridge:
     def __init__(self, plugin):
         self.plugin = plugin
@@ -217,13 +235,27 @@ class ExecutionBridge:
         self.guard(item, snapshot)
         values = self._values(item, snapshot)
         credential = copy.deepcopy(snapshot["credentials"][item["binding_key"]])
-        environment = {
-            "TY_ACCOUNTS": json.dumps(
-                [{"username": values["username"], "password": values["password"]}],
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        }
+        if task.input_adapter == "tianyi_account":
+            environment = {
+                "TY_ACCOUNTS": json.dumps(
+                    [
+                        {
+                            "username": values["username"],
+                            "password": values["password"],
+                        }
+                    ],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            }
+            runtime = "python"
+            result_adapter = "json_protocol"
+        elif task.input_adapter == "direct_env":
+            environment = _direct_environment(task, values)
+            runtime = task.runtime
+            result_adapter = task.result_adapter
+        else:
+            raise QueueRejected("task_changed", business_status="config_error")
 
         def execution_guard(current):
             self.guard(item, current)
@@ -236,10 +268,11 @@ class ExecutionBridge:
             task_version=task.version,
             source_commit=artifact.source_commit,
             sha256=artifact.sha256,
-            runtime="python",
+            runtime=runtime,
             script=artifact.script,
             environment=environment,
-            result_adapter="json_protocol",
+            artifact_format=artifact.artifact_format,
+            result_adapter=result_adapter,
             timeout_seconds=task.timeout_seconds,
         )
         return await executor.execute(

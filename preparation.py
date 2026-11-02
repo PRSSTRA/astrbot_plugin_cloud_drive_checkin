@@ -1,4 +1,4 @@
-"""Offline, deterministic Tianyi zipapp preparation."""
+"""Offline deterministic builders for locked Tianyi and generic artifacts."""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ _MAX_MEMBER_BYTES = 2 * 1024 * 1024
 _MAX_UNCOMPRESSED_BYTES = 8 * 1024 * 1024
 _MAX_MEMBERS = 4096
 _MAX_REPOSITORY_FILE_BYTES = 512 * 1024
+_MAX_DEPENDENCY_BUNDLE_BYTES = 1024 * 1024
 _REQUIRED_DISTRIBUTIONS = frozenset(
     {
         "certifi",
@@ -46,8 +47,42 @@ _REQUIREMENT = re.compile(
 )
 _HEX_40 = re.compile(r"[0-9a-f]{40}\Z", re.ASCII)
 _HEX_64 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
-_NATIVE_SUFFIXES = (".so", ".pyd", ".dll", ".dylib")
+_NATIVE_SUFFIXES = (".so", ".pyd", ".dll", ".dylib", ".node")
+_NATIVE_MAGICS = (
+    b"\x7fELF",
+    b"\x00asm",
+    b"\xfe\xed\xfa\xce",
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf",
+    b"\xcf\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe",
+    b"\xbe\xba\xfe\xca",
+    b"\xca\xfe\xba\xbf",
+    b"\xbf\xba\xfe\xca",
+)
 _RESERVED_TOP_LEVEL = frozenset({"__main__.py", "tianyi_source.py", "licenses"})
+_GENERIC_RESERVED_TOP_LEVEL = frozenset(
+    {
+        "artifact.zip",
+        "bootstrap.py",
+        "credentials.json",
+        "job.json",
+        "payload",
+        "script.js",
+        "script.py",
+        "task.js",
+        "task.py",
+    }
+)
+
+
+def _has_native_signature(data: bytes) -> bool:
+    if data.startswith(_NATIVE_MAGICS):
+        return True
+    if len(data) < 64 or not data.startswith(b"MZ"):
+        return False
+    pe_offset = int.from_bytes(data[60:64], "little")
+    return pe_offset <= len(data) - 4 and data[pe_offset : pe_offset + 4] == b"PE\0\0"
 
 
 class PreparationError(ValueError):
@@ -61,6 +96,7 @@ class PreparedArtifact:
     source_commit: str
     source_sha256: str
     inputs_sha256: str
+    artifact_format: str = "script"
 
 
 @dataclass(frozen=True)
@@ -625,6 +661,122 @@ def _read_wheel(candidate: _WheelCandidate) -> dict[str, bytes]:
     return files
 
 
+def generic_inputs_sha256(
+    *,
+    runtime: str,
+    source_commit: str,
+    source_sha256: str,
+    dependency_bundle: str,
+    dependency_sha256: str | None,
+) -> str:
+    """Identify already-validated locked inputs for one generic artifact."""
+
+    if (
+        runtime not in {"python", "node"}
+        or not isinstance(source_commit, str)
+        or _HEX_40.fullmatch(source_commit) is None
+        or not isinstance(source_sha256, str)
+        or _HEX_64.fullmatch(source_sha256) is None
+        or not isinstance(dependency_bundle, str)
+        or not dependency_bundle
+        or (dependency_bundle == "none") != (dependency_sha256 is None)
+        or (
+            dependency_sha256 is not None
+            and (
+                not isinstance(dependency_sha256, str)
+                or _HEX_64.fullmatch(dependency_sha256) is None
+            )
+        )
+    ):
+        raise PreparationError("generic task identity is invalid")
+    digest = hashlib.sha256(b"astrbot-generic-packaging-inputs-v1\0")
+    for label, value in (
+        ("runtime", runtime),
+        ("source-commit", source_commit),
+        ("source-sha256", source_sha256),
+        ("dependency-bundle", dependency_bundle),
+        ("dependency-sha256", dependency_sha256 or ""),
+    ):
+        encoded_label = label.encode("ascii")
+        encoded_value = value.encode("utf-8")
+        digest.update(len(encoded_label).to_bytes(2, "big"))
+        digest.update(encoded_label)
+        digest.update(len(encoded_value).to_bytes(8, "big"))
+        digest.update(encoded_value)
+    return digest.hexdigest()
+
+
+def _dependency_bundle_files(raw: bytes) -> dict[str, bytes]:
+    if not raw or len(raw) > _MAX_DEPENDENCY_BUNDLE_BYTES:
+        raise PreparationError("dependency bundle exceeds the size limit")
+    files: dict[str, bytes] = {}
+    seen_paths: set[str] = set()
+    seen_casefolded: set[str] = set()
+    uncompressed = 0
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw), "r") as bundle:
+            members = bundle.infolist()
+            if not members or len(members) > _MAX_MEMBERS:
+                raise PreparationError("dependency bundle member count is invalid")
+            for member in members:
+                path, is_directory = _member_path(member.filename)
+                folded = path.casefold()
+                if path in seen_paths or folded in seen_casefolded:
+                    raise PreparationError("dependency bundle has duplicate members")
+                seen_paths.add(path)
+                seen_casefolded.add(folded)
+
+                mode = (member.external_attr >> 16) & 0xFFFF
+                kind = stat.S_IFMT(mode)
+                if kind == stat.S_IFLNK:
+                    raise PreparationError("dependency bundle contains a symlink")
+                if kind not in {0, stat.S_IFREG, stat.S_IFDIR}:
+                    raise PreparationError("dependency bundle contains a special file")
+                if (kind == stat.S_IFDIR) != is_directory and kind != 0:
+                    raise PreparationError("dependency bundle member type is invalid")
+                if member.flag_bits & 0x1:
+                    raise PreparationError("dependency bundle contains encryption")
+                if member.compress_type not in {
+                    zipfile.ZIP_STORED,
+                    zipfile.ZIP_DEFLATED,
+                }:
+                    raise PreparationError("dependency bundle compression is invalid")
+                if is_directory:
+                    if member.file_size != 0:
+                        raise PreparationError(
+                            "dependency bundle directory member is invalid"
+                        )
+                    continue
+
+                first = path.split("/", 1)[0].casefold()
+                if first in _GENERIC_RESERVED_TOP_LEVEL:
+                    raise PreparationError(
+                        "dependency bundle overwrites a reserved entry"
+                    )
+                if folded.endswith(_NATIVE_SUFFIXES):
+                    raise PreparationError("dependency bundle contains native code")
+                if member.file_size < 0 or member.file_size > _MAX_MEMBER_BYTES:
+                    raise PreparationError("dependency bundle member is too large")
+                uncompressed += member.file_size
+                if uncompressed > _MAX_UNCOMPRESSED_BYTES:
+                    raise PreparationError("dependency bundle expands too large")
+                data = bundle.read(member)
+                if len(data) != member.file_size:
+                    raise PreparationError("dependency bundle is truncated")
+                if _has_native_signature(data):
+                    raise PreparationError(
+                        "dependency bundle contains a native executable format"
+                    )
+                files[path] = data
+    except PreparationError:
+        raise
+    except (OSError, RuntimeError, zipfile.BadZipFile, NotImplementedError):
+        raise PreparationError("dependency bundle is not a valid archive") from None
+    if not files:
+        raise PreparationError("dependency bundle contains no files")
+    return files
+
+
 class _Entries:
     def __init__(self) -> None:
         self.files: dict[str, bytes] = {}
@@ -648,7 +800,7 @@ class _Entries:
         self._parents.update(parent_keys)
 
 
-def _archive(entries: dict[str, bytes]) -> bytes:
+def _archive(entries: dict[str, bytes], label: str) -> bytes:
     output = io.BytesIO()
     with zipfile.ZipFile(
         output,
@@ -667,8 +819,72 @@ def _archive(entries: dict[str, bytes]) -> bytes:
             archive.writestr(info, entries[path], compresslevel=9)
     artifact = output.getvalue()
     if not artifact or len(artifact) > _MAX_ARTIFACT_BYTES:
-        raise PreparationError("prepared Tianyi artifact exceeds the 1 MiB limit")
+        raise PreparationError(f"{label} exceeds the 1 MiB limit")
     return artifact
+
+
+def build_generic(
+    *,
+    runtime: str,
+    source: bytes,
+    source_commit: str,
+    source_sha256: str,
+    dependency_bundle: str,
+    dependency_sha256: str | None,
+    bundle: bytes | None,
+) -> PreparedArtifact:
+    """Build a generic raw script or validated prebuilt dependency artifact."""
+
+    inputs_sha256 = generic_inputs_sha256(
+        runtime=runtime,
+        source_commit=source_commit,
+        source_sha256=source_sha256,
+        dependency_bundle=dependency_bundle,
+        dependency_sha256=dependency_sha256,
+    )
+    if (
+        type(source) is not bytes
+        or not source
+        or len(source) > _MAX_ARTIFACT_BYTES
+        or hashlib.sha256(source).hexdigest() != source_sha256
+        or _has_native_signature(source)
+    ):
+        raise PreparationError("generic source does not match its lock")
+    artifact_format = "script"
+    script = source
+    if dependency_sha256 is None:
+        if dependency_bundle != "none" or bundle is not None:
+            raise PreparationError("generic dependency input is invalid")
+    else:
+        if (
+            type(bundle) is not bytes
+            or hashlib.sha256(bundle).hexdigest() != dependency_sha256
+        ):
+            raise PreparationError("dependency bundle does not match its lock")
+        entries = _Entries()
+        task_name = "task.py" if runtime == "python" else "task.js"
+        entries.add(task_name, source, "generic source")
+        dependency_files = _dependency_bundle_files(bundle)
+        if len(dependency_files) + 1 > _MAX_MEMBERS:
+            raise PreparationError("generic prepared inputs contain too many files")
+        if (
+            len(source) + sum(map(len, dependency_files.values()))
+            > _MAX_UNCOMPRESSED_BYTES
+        ):
+            raise PreparationError("generic prepared inputs expand too large")
+        for path, data in dependency_files.items():
+            entries.add(path, data, "dependency bundle")
+        script = _archive(entries.files, "prepared generic artifact")
+        artifact_format = "bundle"
+
+    return PreparedArtifact(
+        script=script,
+        sha256=hashlib.sha256(script).hexdigest(),
+        source_commit=source_commit,
+        source_sha256=source_sha256,
+        inputs_sha256=inputs_sha256,
+        artifact_format=artifact_format,
+    )
 
 
 def build_tianyi(wheelhouse: Path) -> PreparedArtifact:
@@ -712,7 +928,7 @@ def build_tianyi(wheelhouse: Path) -> PreparedArtifact:
         for path, data in wheel_files.items():
             entries.add(path, data, f"wheel {candidate.requirement.name}")
 
-    script = _archive(entries.files)
+    script = _archive(entries.files, "prepared Tianyi artifact")
     inputs_sha256 = _packaging_inputs_sha256(
         source=source,
         entry=entry,
