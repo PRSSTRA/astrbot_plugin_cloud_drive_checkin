@@ -32,7 +32,7 @@ class NeoExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.executor.close()
         await self.store.close()
-        self.bay.close()
+        await self.bay.close()
 
     def request(self, script=None, token=" FAKE_COOKIE;'\"\nsecond line "):
         if script is None:
