@@ -13,7 +13,7 @@ from .credentials import (
     user_key,
     validate_values,
 )
-from .execution_queue import QueueRejected
+from .execution_queue import QueueRejected, guard_cancellation
 from .executors.client import resolve_connection
 from .executors.neo import PreparedExecution
 from .permissions import Identity, authorize
@@ -45,6 +45,7 @@ class ExecutionBridge:
         return identity
 
     def guard(self, item: dict, snapshot: dict) -> None:
+        guard_cancellation(item, snapshot)
         plugin = self.plugin
         if plugin._terminating:
             raise QueueRejected("service_disabled")

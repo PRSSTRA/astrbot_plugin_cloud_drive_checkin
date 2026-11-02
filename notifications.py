@@ -42,6 +42,7 @@ _QUEUE_REASONS = frozenset(
         "queue_expired",
         "interrupted",
         "execution_error",
+        "admin_cancelled",
     }
 )
 _STATUS_LABELS = {
@@ -79,6 +80,7 @@ _QUEUE_REASON_LABELS = {
     "queue_expired": "排队等待已超时",
     "interrupted": "执行被中断",
     "execution_error": "执行服务发生错误",
+    "admin_cancelled": "管理员已请求取消",
 }
 _DEFAULT_RESULT = {
     "protocol": 1,
@@ -246,6 +248,8 @@ def _safe_result(result: object) -> dict[str, Any]:
 
 def _guidance(result: Mapping[str, Any], task_id: str) -> str:
     queue_reason = result.get("queue_reason")
+    if queue_reason == "admin_cancelled":
+        return "请查询 /签到 状态 并联系管理员；结果未知时不要重复执行。"
     if queue_reason in {"binding_missing", "credentials_missing"}:
         return f"请使用 /签到 录入 {task_id} 保存本人凭据后再执行。"
     if queue_reason == "binding_paused":

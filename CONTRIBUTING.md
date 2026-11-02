@@ -18,7 +18,7 @@ python3 -m venv .venv
 
 ## 代码结构
 
-- `main.py`：Star 生命周期、指令入口、帮助、任务查询、本人状态回复、手动签到入口、调度器生命周期和管理员准备入口。
+- `main.py`：Star 生命周期、指令入口、帮助、任务查询、本人状态回复、手动签到入口、调度器生命周期和管理员准备与取消入口。
 - `permissions.py`：私聊事件校验、身份提取和权限判定。
 - `config.py`：权限配置的解析和 QQ 号规范化。
 - `task_config.py`：任务目录校验、Cron 计算和配置版本。
@@ -30,7 +30,7 @@ python3 -m venv .venv
 - `executors/client.py`：完整来源的 Neo 连接解析、异步 REST、鉴权检查和有界响应。
 - `executors/neo.py`：持久化执行意图、串行执行、资源归属检查、清理阻断与恢复。
 - `execution_config.py`：解析签到冷却、排队有效期、保留天数和执行间隔。
-- `execution_queue.py`：持久化手动与自动签到 FIFO 队列、计划去重、冷却、间隔、权限复核和终态记录。
+- `execution_queue.py`：持久化手动与自动签到 FIFO 队列、计划去重、冷却、间隔、权限复核、管理员取消和终态记录。
 - `scheduler.py`：未来计划的 Cron 观察与准入，只调用队列，不执行脚本或读取凭据。
 - `execution_bridge.py`：把队列请求绑定到最新凭据、已准备制品和 Neo 执行器，并生成本人状态摘要。
 - `notifications.py`：终态通知 outbox、按来源和偏好决定发送、有界重试和投递状态。
@@ -48,7 +48,7 @@ python3 -m venv .venv
 
 `state.py` 定义快照格式，`storage.py` 通过 `get_kv_data` 和 `put_kv_data` 操作唯一业务键 `checkin_state`。插件不创建数据库或状态文件。
 
-快照包含 `schema_version`、`revision`，以及 `users`、`bindings`、`credentials`、`batches`、`runs`、`outbox`、`cleanup_jobs`、`cooldowns`、`dedupe`、`prepared_artifacts` 集合。当前 schema 版本为 3。读取版本 1 时补充空的 `prepared_artifacts`；读取版本 2 时把旧手动批次、通知、冷却和索引改为 `checkin`、`terminal_notification`、`checkin_cooldown` 和 `checkin` 索引，旧批次补 `source="manual"`、`manual_requested=true`、空的 `scheduled_at` 和 `batch_id`，旧通知按手动来源处理。迁移保留原有业务记录，结果作为完整快照重新保存并确认后才能使用。未知版本、结构损坏或超限都会报错，不会重置或裁剪记录。默认序列化上限为 8 MiB。
+快照包含 `schema_version`、`revision`，以及 `users`、`bindings`、`credentials`、`batches`、`runs`、`outbox`、`cleanup_jobs`、`cooldowns`、`dedupe`、`prepared_artifacts` 集合。当前 schema 版本为 3。签到批次可以带有可选的 `cancel_requested` 布尔字段记录管理员取消意图；该字段不改变 schema 版本，也不新增集合或迁移。读取版本 1 时补充空的 `prepared_artifacts`；读取版本 2 时把旧手动批次、通知、冷却和索引改为 `checkin`、`terminal_notification`、`checkin_cooldown` 和 `checkin` 索引，旧批次补 `source="manual"`、`manual_requested=true`、空的 `scheduled_at` 和 `batch_id`，旧通知按手动来源处理。迁移保留原有业务记录，结果作为完整快照重新保存并确认后才能使用。未知版本、结构损坏或超限都会报错，不会重置或裁剪记录。默认序列化上限为 8 MiB。
 
 `prepared_artifacts[task_id]` 保存 `task_version`、`source_commit`、`source_sha256`、`sha256`、`size` 和 `inputs_sha256`，不保存脚本字节、凭据或制品文件。制品文件按内容摘要存放在插件数据目录；state 层只校验快照结构，不读取或重建文件。
 
@@ -98,9 +98,11 @@ python3 -m venv .venv
 
 计划记录上限为 1000，任务游标上限为 256；清理只移除已结算、没有活动 run 且没有未结算通知关联的计划，游标保留最近水位。自动准入不检查手动冷却，自动和手动实际执行都会更新同一条全局执行间隔。自动用户与手动请求共用单 worker FIFO，没有优先级插入或独立 worker。
 
-队列是单 worker FIFO，同一时间只执行一个签到。`MAX_ACTIVE_ITEMS=256`、`MAX_BATCH_ITEMS=1000`、`MAX_OUTBOX_ITEMS=1000`；入队时预留终态和通知容量，达到上限时拒绝新请求，不为新记录删除活动记录。手动冷却按用户和任务绑定分别记录，只对来源为手动或已标记手动参与的批次写入；用户间隔和任务间隔不分别计时，队列只保留一条最近全局执行与清理完成记录。只有 Neo 运行的 `business_attempted` 为真时才推进全局记录，手动冷却仅在手动参与时写入；未发送业务请求的取消或失败不产生间隔。下一条切换任务时使用 `task_interval` 且不叠加 `user_interval`；任务不变但用户变化时使用 `user_interval`；同一用户同一任务的手动请求还受手动冷却限制。跳过、取消或未执行的请求不改变这条全局记录。排队超过 `queue_expiry_seconds` 时记为取消。
+队列是单 worker FIFO，同一时间只执行一个签到。`MAX_ACTIVE_ITEMS=256`、`MAX_BATCH_ITEMS=1000`、`MAX_OUTBOX_ITEMS=1000`；入队时预留终态和通知容量，达到上限时拒绝新请求，不为新记录删除活动记录。手动冷却按用户和任务绑定分别记录，只对来源为手动或已标记手动参与的批次写入；用户间隔和任务间隔不分别计时，队列只保留一条最近全局执行与清理完成记录。只有 Neo 运行的 `business_attempted` 为真时才推进全局记录，手动冷却仅在手动参与时写入；未发送业务请求的取消或失败不产生间隔。下一条切换任务时使用 `task_interval` 且不叠加 `user_interval`；任务不变但用户变化时使用 `user_interval`；同一用户同一任务的手动请求还受手动冷却限制。跳过、未发送业务请求就取消或未执行的请求不改变这条全局记录；发送业务请求后才取消的记录按实际执行更新。排队超过 `queue_expiry_seconds` 时记为取消。
 
 队列在 Neo 恢复后启动恢复：保留未过期排队记录，过期记录转为取消；已经开始或结果不明的记录不重放，使用已确认的 Neo 结果或 `interrupted/unknown`。待确认 KV 写入期间停止新工作，保留记录，按原快照重试后再恢复。`guard` 在入队、业务请求前和执行期间复查权限、任务版本、制品摘要、绑定暂停/删除状态及是否在录入向导中；取消后先完成资源清理，再处理下一条。
+
+管理员取消通过 `request_cancel(run_id, guard=...)` 完成，只接受 32 位小写十六进制 run_id。请求在 `mutate` 写入确认后才生效；已结束、已请求或不存在的 run_id 返回对应状态，不重写批次、不补发通知，也不重跑业务。worker 在准入、认领、凭据上传边界、执行回调和轮询守卫中检查 `cancel_requested`：尚未发送业务请求时以 `cancelled/admin_cancelled` 结算，不执行脚本；凭据尚未上传时也不会继续上传，且不写冷却或全局间隔。业务可能已开始且没有明确结果时以 `unknown` 结算，已有可靠结果保持原值，只附加 `queue_reason=admin_cancelled`。取消不修改任务、Cron、绑定或后续计划，终态通知仍按现有规则发给运行所属用户。`tests/test_admin_cancellation.py` 覆盖权限、排队与运行阶段、已知结果保留、未确认写入和重载恢复。
 
 执行回调加载已准备制品，解密最新已确认凭据，生成 `TY_ACCOUNTS`，并以同一 run_id 调用 `NeoExecutor.execute`。凭据明文不写入批次记录，也不进入日志。
 
@@ -185,7 +187,7 @@ CLI 拒绝覆盖已有输出，成功后只打印包含 `source_commit`、`sourc
 
 PR 的“离线测试”任务分别在 Python 3.12、3.13、3.14 上安装宿主 `requirements.txt`，显式安装 Node 22，并运行 `unittest discover -s tests -p 'test_*.py' -v`；“天翼脚本离线测试”在相同 Python 矩阵的独立虚拟环境中校验脚本依赖哈希并运行脚本测试。既有必需检查“提交信息规范”等待两组矩阵，仅在全部成功后校验提交历史；任一失败、取消或跳过都不能通过，无需修改现有必需检查名称。普通 PR CI 不连接真实 QQ、Neo 或云盘服务。
 
-执行层回归位于 `tests/test_neo_client.py`、`tests/test_neo_executor.py`、`tests/test_neo_lifecycle.py` 和 `tests/test_bootstrap.py`。制品构建与准备服务回归位于 `tests/test_preparation.py` 和 `tests/test_artifact_service.py`；管理员准备指令位于 `tests/test_admin_preparation.py`，schema 迁移与写入确认位于 `tests/test_state.py`、`tests/test_storage.py`。签到队列、恢复和容量位于 `tests/test_execution_queue.py`，自动计划准入、去重和生命周期位于 `tests/test_automatic_execution.py`，终态通知位于 `tests/test_notifications.py`，聊天入口和集成位于 `tests/test_manual_execution.py`。`tests/neo_support.py` 是受控 Bay 替身，会在临时目录运行本仓库 wrapper 与假脚本；这不是产品的宿主回退路径。本地未安装 Node 时对应测试会明确跳过；CI 显式安装并检查 Node，不依赖 runner 预装。macOS 测试只将 Node 的可执行路径映射到本机安装位置，实际运行 Node 子进程。
+执行层回归位于 `tests/test_neo_client.py`、`tests/test_neo_executor.py`、`tests/test_neo_lifecycle.py` 和 `tests/test_bootstrap.py`。制品构建与准备服务回归位于 `tests/test_preparation.py` 和 `tests/test_artifact_service.py`；管理员准备指令位于 `tests/test_admin_preparation.py`，schema 迁移与写入确认位于 `tests/test_state.py`、`tests/test_storage.py`。签到队列、恢复和容量位于 `tests/test_execution_queue.py`，自动计划准入、去重和生命周期位于 `tests/test_automatic_execution.py`，终态通知位于 `tests/test_notifications.py`，聊天入口和集成位于 `tests/test_manual_execution.py`，管理员取消位于 `tests/test_admin_cancellation.py`。`tests/neo_support.py` 是受控 Bay 替身，会在临时目录运行本仓库 wrapper 与假脚本；这不是产品的宿主回退路径。本地未安装 Node 时对应测试会明确跳过；CI 显式安装并检查 Node，不依赖 runner 预装。macOS 测试只将 Node 的可执行路径映射到本机安装位置，实际运行 Node 子进程。
 
 离线 smoke 通过真实 loopback HTTP 连接受控 Bay，覆盖两用户隔离、非零退出码的显式业务结果、超时、清理阻断及恢复不重跑。真实 Neo 假凭据测试与真实账号测试分别记录如下。
 
@@ -205,6 +207,15 @@ PR 的“离线测试”任务分别在 Python 3.12、3.13、3.14 上安装宿�
 - 全量测试另覆盖同任务重叠跳过、准入提交屏障、到期分钟内重载不补跑、事件循环延迟后只准入当前命中分钟、错过分钟不补跑、关闭后重开从未来计划开始、暂停和撤权过滤、缺少制品以 `config_error` 结束、时钟回拨不重放、时区日和星期 OR 及周日 `7`、schema 2 升级后仅未开始的手动请求继续执行。
 - Sandbox、Cargo、宿主物理目录和 `cleanup_jobs` 均为 0；假凭据 canary 未出现在快照、Bay 历史或回执中。
 - 该 smoke 的 Bay 是受控替身，不是真实 Neo 部署；未连接真实 QQ 或云盘账号。
+
+### 管理员取消本地验收
+
+- Python 3.14 下全量 430 项测试通过，耗时 18.700 秒；包含管理员取消回归。scoped Ruff 检查通过，范围为 `main.py`、`execution_queue.py`、`execution_bridge.py`、`notifications.py` 和新增取消测试；不声明全仓 Ruff 全绿。
+- 新增真实 wrapper 脚本 SHA 失配回归：结果为可靠的 `start_error/config_error/runner_error`。清理期间管理员取消时，修复前会被误改为 `cancelled`；修复后保留 `config_error` 并附加 `admin_cancelled` 原因，终态通知使用同一结果。
+- 独立 smoke 使用实际队列和执行入口，经真实 loopback HTTP 连接受控 FakeBay，运行实际 wrapper 和假脚本，共发出 32 次 HTTP 请求。取消对象得到 `cancelled`，另一用户得到 `already_signed`；取消对象没有上传凭据，也没有业务执行；后续用户只执行 1 次业务，最大并发为 1。
+- 重复取消同一 run_id 不增加 revision。终态按来源投递到原用户和第二用户各自的 owner 来源（跨平台），没有投递给管理员。
+- Sandbox、Cargo、宿主物理目录和 `cleanup_jobs` 均为 0；假凭据 canary 未出现在 KV、Bay 历史或回执中。
+- 未连接真实 Neo、真实 QQ 或云盘账号。
 
 ### 制品准备本地验收
 
