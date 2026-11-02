@@ -3,7 +3,10 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -256,6 +259,35 @@ class PreparationTests(unittest.TestCase):
         )
         with self.assertRaises(preparation.PreparationError):
             self.inputs.build()
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires POSIX FIFO support")
+    def test_named_pipe_wheel_is_rejected_without_waiting_for_a_writer(self):
+        wheel = self.inputs.wheel_path("certifi")
+        wheel.unlink()
+        os.mkfifo(wheel)
+        code = """from pathlib import Path
+import preparation, sys
+preparation._ROOT = Path(sys.argv[1])
+try:
+    preparation.build_tianyi(Path(sys.argv[2]))
+except preparation.PreparationError:
+    raise SystemExit(0)
+raise SystemExit(1)
+"""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                code,
+                str(self.inputs.root),
+                str(self.inputs.wheelhouse),
+            ],
+            cwd=Path(preparation.__file__).parent,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0)
 
 
 class PreparationCliTests(unittest.TestCase):

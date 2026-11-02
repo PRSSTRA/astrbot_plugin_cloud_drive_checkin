@@ -82,7 +82,8 @@ def _canonical_distribution(value: str) -> str:
 
 def _read_regular_file(path: Path, maximum: int, label: str) -> bytes:
     descriptor: int | None = None
-    flags = os.O_RDONLY
+    # A FIFO must reach fstat rather than waiting for a writer in os.open.
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
