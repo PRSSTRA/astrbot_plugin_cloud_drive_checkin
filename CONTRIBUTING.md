@@ -18,7 +18,7 @@ python3 -m venv .venv
 
 ## 代码结构
 
-- `main.py`：Star 生命周期、指令入口、帮助、任务查询、本人状态回复、手动签到入口、调度器生命周期和管理员准备、取消与停用入口。
+- `main.py`：Star 生命周期、指令入口、帮助、任务查询、本人状态回复、手动签到入口、调度器生命周期和管理员准备、取消、停用与重载入口。
 - `permissions.py`：私聊事件校验、身份提取和权限判定。
 - `config.py`：权限配置的解析和 QQ 号规范化。
 - `task_config.py`：任务目录校验、Cron 计算和配置版本。
@@ -28,6 +28,7 @@ python3 -m venv .venv
 - `state.py`：快照结构、JSON 校验和 schema 迁移。
 - `storage.py`：基于 Star 异步 KV 的事务写入。
 - `task_control.py`：管理员停用意图、目标活动批次取消标记、最新配置保存与恢复，以及关闭时排空配置写入。
+- `reload_control.py`：管理员重载的目标校验、管理器锁、终止与加载，以及旧实例静默和新实例接管检查。
 - `executors/client.py`：完整来源的 Neo 连接解析、异步 REST、鉴权检查和有界响应。
 - `executors/neo.py`：持久化执行意图、串行执行、资源归属检查、清理阻断与恢复。
 - `execution_config.py`：解析签到冷却、排队有效期、保留天数和执行间隔。
@@ -131,6 +132,20 @@ python3 -m venv .venv
 
 `NotificationService(store, send)` 在外部发送前先持久化 `phase=sending`：`send` 返回 `True` 记为 `sent`，返回 `False` 记为 `pending` 并在上限内重试，重试用尽后记为 `failed`，异常或取消记为 `unknown`，不盲目重发。默认最多 3 次尝试，重试窗口 30 秒。KV 写入失败时停止发送，但不重跑签到。通知发送失败不改变批次中的业务终态，`/签到 状态` 仍可查询，抑制状态显示为“按偏好静默”。
 
+### 管理员重载
+
+`/签到 管理 重载` 的入口检查在 `main.py`，目标校验和生命周期在 `reload_control.py`。每个 `Context` 的 `_cloud_drive_checkin_state_registry` 按 `plugin_id` 保存状态槽；槽内 `reload_task` 保证同一实例只有一个重载任务，`owner` 记录当前状态存储。`initialize` 用槽内 `lock` 串行化状态接管；重载的终止、解绑和加载用插件管理器的 `_pm_lock` 串行化，替换实例的公开清理不获取该锁。
+
+`check_reload_target(plugin)` 只做前置检查：`context._star_manager` 存在，`_pm_lock` 是 `asyncio.Lock`，`_terminate_plugin`、`_unbind_plugin` 和 `load` 都是可等待方法；当前插件在 `context.get_all_stars()` 中恰好对应一个已激活元数据，名称唯一且 `module_path` 等于插件类的模块。`reload_plugin(plugin, guard=...)` 在持有 `_pm_lock` 后再次检查管理员和目标身份，依次调用 `_terminate_plugin(metadata)`、`_unbind_plugin(name, module_path)` 和 `load(specified_module_path=module_path)`。终止前后都复查目标未变化；终止后要求旧实例的状态存储、队列、调度器、停用服务、执行器、准备服务和通知全部关闭或静默，才解绑。加载返回值必须是 `(True, ...)`；新实例必须已激活、沿用同一 `plugin_id`、状态存储就绪并接管同一状态槽。
+
+实现只使用 AstrBot v4.29.4 的上述受控私有接口，不调用 `manager.reload` 或跳过身份检查的入口。接口名和方法签名属于管理器私有实现，升级 AstrBot 4.x 版本时需要重新核对；前置检查失败时不得改用其他重载入口。接口不兼容、目标在等待期间变化或关闭条件不满足时统一抛出 `ReloadError`，由命令返回固定提示。
+
+已接受的重载任务由状态槽持有，调用方事件取消不会取消它。解绑后加载成功的新实例由该重载任务按精确引用持有；加载返回失败、接管检查失败或任务被取消时，关闭这个实例，再完成收尾。不能依赖 `StarMetadata` 是否仍在 `get_all_stars()` 中：固定 v4.29.4 的加载器在取消时可能已删除元数据，但不终止已初始化实例。也不能按名称或“最新实例”重新查找，避免关闭后续独立重载创建的实例。
+
+替换实例的公开清理直接关闭这个精确对象，不获取 `_pm_lock`，也不修改 `StarMetadata` 注册表或调用 `load`。安装或更新流程可能已持有该锁，稍后的 terminate 与 cleanup 若再次进入同一锁会形成 join cycle；`reload_plugin` 内部的加载失败清理仍在原有 `_pm_lock` 内执行，不经过这条公开路径。
+
+外部 `terminate()` 会取消该任务，等待旧实例关闭并排空本次重载创建的首个替换实例，再结束，不会留下延迟启动或孤儿执行组件。若排空时替换实例的待确认写入重试仍失败，重载任务以非取消异常结束，`terminate()` 传播该异常，不报告重载成功。
+
 ### 接口依据与许可
 
 Neo 接口按 [Shipyard Neo `f4d248b4274c1a2f05402f75a3b39e5c19be9ff5`](https://github.com/AstrBotDevs/shipyard-neo/tree/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5) 核验，该项目使用 AGPLv3；本插件客户端和 wrapper 为独立实现，没有移植上游代码。相关依据：
@@ -138,7 +153,8 @@ Neo 接口按 [Shipyard Neo `f4d248b4274c1a2f05402f75a3b39e5c19be9ff5`](https://
 - [Bay API v1](https://github.com/AstrBotDevs/shipyard-neo/blob/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5/doc/bay_api_v1.md)：请求、响应与文件路径。
 - [CargoManager](https://github.com/AstrBotDevs/shipyard-neo/blob/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5/pkgs/bay/app/managers/cargo/cargo.py) 与 [Docker driver](https://github.com/AstrBotDevs/shipyard-neo/blob/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5/pkgs/bay/app/drivers/docker/docker.py)：删除引用指向的数据后才删 Cargo 记录；bind 模式必须保证该宿主路径在 Bay 内仍指向真实 Cargo，不能只检查 API 404。
 - [K8s driver](https://github.com/AstrBotDevs/shipyard-neo/blob/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5/pkgs/bay/app/drivers/k8s/k8s.py)：PVC 删除受理不等于清理完成，因此当前执行层仅接受已确认的固定 Docker 部署。
-- [AstrBot v4.29.4 Context](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.4/astrbot/core/star/context.py)：通过 `get_config()` 读取框架配置，不访问框架私有存储或借用聊天资源。
+- [AstrBot v4.29.4 Context](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.4/astrbot/core/star/context.py)：通过 `get_config()` 读取框架配置，通过 `get_all_stars()` 查询当前插件元数据；不访问框架 KV 底层存储，也不借用聊天资源。
+- [AstrBot v4.29.4 star_manager](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.4/astrbot/core/star/star_manager.py)：管理员重载使用 `_pm_lock`、`_terminate_plugin`、`_unbind_plugin` 和 `load(specified_module_path=...)` 完成单实例替换；前置检查要求这些接口都可等待，不调用 `manager.reload` 或其他跳过身份检查的入口作为回退。
 - [AstrBot v4.29.4 astrbot_config](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.4/astrbot/core/config/astrbot_config.py)：管理员停用只调用公共异步方法 `save_config_async(replace_config)`；该方法先合并替换值，再以原子文件替换保存，返回 `False` 表示保存被更新提交取代。
 
 ### 本仓库维护的天翼脚本
@@ -195,7 +211,7 @@ CLI 拒绝覆盖已有输出，成功后只打印包含 `source_commit`、`sourc
 
 PR 的“离线测试”任务分别在 Python 3.12、3.13、3.14 上安装宿主 `requirements.txt`，显式安装 Node 22，并运行 `unittest discover -s tests -p 'test_*.py' -v`；“天翼脚本离线测试”在相同 Python 矩阵的独立虚拟环境中校验脚本依赖哈希并运行脚本测试。既有必需检查“提交信息规范”等待两组矩阵，仅在全部成功后校验提交历史；任一失败、取消或跳过都不能通过，无需修改现有必需检查名称。普通 PR CI 不连接真实 QQ、Neo 或云盘服务。
 
-执行层回归位于 `tests/test_neo_client.py`、`tests/test_neo_executor.py`、`tests/test_neo_lifecycle.py` 和 `tests/test_bootstrap.py`。制品构建与准备服务回归位于 `tests/test_preparation.py` 和 `tests/test_artifact_service.py`；管理员准备指令位于 `tests/test_admin_preparation.py`，schema 迁移与写入确认位于 `tests/test_state.py`、`tests/test_storage.py`。签到队列、恢复和容量位于 `tests/test_execution_queue.py`，自动计划准入、去重和生命周期位于 `tests/test_automatic_execution.py`，终态通知位于 `tests/test_notifications.py`，聊天入口和集成位于 `tests/test_manual_execution.py`，管理员取消位于 `tests/test_admin_cancellation.py`，管理员停用位于 `tests/test_admin_disablement.py` 和 `tests/test_task_control.py`。`tests/neo_support.py` 是受控 Bay 替身，会在临时目录运行本仓库 wrapper 与假脚本；这不是产品的宿主回退路径。本地未安装 Node 时对应测试会明确跳过；CI 显式安装并检查 Node，不依赖 runner 预装。macOS 测试只将 Node 的可执行路径映射到本机安装位置，实际运行 Node 子进程。
+执行层回归位于 `tests/test_neo_client.py`、`tests/test_neo_executor.py`、`tests/test_neo_lifecycle.py` 和 `tests/test_bootstrap.py`。制品构建与准备服务回归位于 `tests/test_preparation.py` 和 `tests/test_artifact_service.py`；管理员准备指令位于 `tests/test_admin_preparation.py`，schema 迁移与写入确认位于 `tests/test_state.py`、`tests/test_storage.py`。签到队列、恢复和容量位于 `tests/test_execution_queue.py`，自动计划准入、去重和生命周期位于 `tests/test_automatic_execution.py`，终态通知位于 `tests/test_notifications.py`，聊天入口和集成位于 `tests/test_manual_execution.py`，管理员取消位于 `tests/test_admin_cancellation.py`，管理员停用位于 `tests/test_admin_disablement.py` 和 `tests/test_task_control.py`，管理员重载入口与生命周期位于 `tests/test_admin_reload.py` 和 `tests/test_reload_control.py`。`tests/neo_support.py` 是受控 Bay 替身，会在临时目录运行本仓库 wrapper 与假脚本；这不是产品的宿主回退路径。本地未安装 Node 时对应测试会明确跳过；CI 显式安装并检查 Node，不依赖 runner 预装。macOS 测试只将 Node 的可执行路径映射到本机安装位置，实际运行 Node 子进程。
 
 离线 smoke 通过真实 loopback HTTP 连接受控 Bay，覆盖两用户隔离、非零退出码的显式业务结果、超时、清理阻断及恢复不重跑。真实 Neo 假凭据测试与真实账号测试分别记录如下。
 
@@ -233,6 +249,15 @@ PR 的“离线测试”任务分别在 Python 3.12、3.13、3.14 上安装宿�
 - 真实目录路径错误导致配置保存失败时，KV 停用意图保留，目标没有上传凭据、没有执行业务并以取消结束；修复路径后重试保存 `enabled=false` 并清除停用意图；从实际配置文件重载后目标继续禁用。另一任务得到 `already_signed`，执行 1 次业务，最大并发 1。
 - 绑定和密文保持不变，两个 owner 来源分别投递；Sandbox、Cargo、物理目录和 `cleanup_jobs` 均为 0，假凭据 canary 未出现在快照、Bay 历史或回执中。
 - 该 smoke 使用受控 FakeBay 和临时配置文件，不是完整 AstrBot/QQ 部署；未连接真实 Neo、真实 QQ 或云盘账号。
+
+### 管理员重载本地验收
+
+- Python 3.14 下全量 486 项测试通过，耗时 23.822 秒；`main.py`、`reload_control.py`、`tests/astrbot_support.py`、`tests/reload_support.py`、`tests/test_admin_reload.py` 和 `tests/test_reload_control.py` 通过同范围 scoped Ruff 检查，不声明全仓 Ruff 全绿。
+- 两个新增 P1 回归在修复前均因新实例状态存储未关闭（`replacement.store.closed` 为 `False`）而失败：分别覆盖“新实例已就绪但终态回复阻塞时发生外部终止”的窗口，以及 AstrBot v4.29.4 加载器捕获取消、删除元数据但不终止已初始化新实例的窗口；修复后均通过。
+- 另修复两个实际缺陷，均在失败前复现、修复后回归通过：安装/更新流程持有 `_pm_lock` 时，稍后的 terminate 与 cleanup 会形成 join cycle，公开清理改为直接关闭精确替换实例、不获取 `_pm_lock`，内部加载失败清理仍在原锁内；替换实例的待确认 KV 写入在关闭重试中再次失败时，旧实例 `terminate()` 必须传播非取消的重载任务异常，不能报告成功。
+- 最终独立 smoke 使用 AstrBot v4.29.4 原始 `terminate`、`unbind`、`purge` 方法和受控 fresh import loader，加载真实插件并执行实际 `initialize`；经真实 loopback HTTP 连接受控 FakeBay，共 35 次请求，全部证据再次通过。重载 1 次，确认模块重新导入、其他插件未被触碰、旧写者关闭且新 owner 就绪。
+- 同轮得到 `cancelled` 和 `already_signed`，业务执行 1 次，最大并发 1；管理员收到 2 条回复，终态分别投递到两个不同平台的 owner 来源；绑定和密文保持不变，Sandbox、Cargo 和物理目录残留均为 0，输出未包含敏感值。
+- 该 smoke 使用受控 FakeBay、受控 fresh import loader 和真实插件初始化，不是完整 AstrBot/QQ 部署；未连接真实 Neo、真实 QQ 或云盘账号。已有历史 Neo 假凭据验收不代表本轮结果。
 
 ### 制品准备本地验收
 
