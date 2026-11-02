@@ -1,4 +1,5 @@
 # Upstream regression tests from commit 43d2e7054dba7c5c2152e9c8c88fd23e6073a45b; Apache-2.0, see ../LICENSE.
+# Local modification: added this provenance/license notice; test logic is unchanged.
 import contextlib
 import io
 import json
