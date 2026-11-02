@@ -23,7 +23,7 @@ from .reload_control import (
     cleanup_reload_replacement,
     reload_plugin,
 )
-from .scheduler import CronScheduler
+from .scheduler import BindingPlanState, BindingPlanView, CronScheduler
 from .state import InvalidStateError
 from .storage import CommitUnconfirmedError, StateStore, StateUnavailableError
 from .task_config import TaskConfig, next_run_times, parse_task_catalog
@@ -108,6 +108,41 @@ def _render_task_detail(
         f"- {run_time.isoformat(timespec='minutes')}" for run_time in run_times
     )
     lines.append(f"配置版本：{task.version}")
+    return "\n".join(lines)
+
+
+def _render_binding_plans(views: tuple[BindingPlanView, ...]) -> str:
+    if not views:
+        return ""
+
+    unavailable = {
+        BindingPlanState.PAUSED: "绑定已暂停，不会自动触发",
+        BindingPlanState.GLOBAL_DISABLED: "服务全局禁用，不会自动触发",
+        BindingPlanState.TASK_DISABLED: "任务配置禁用，不会自动触发",
+        BindingPlanState.DISABLING: "管理员停用保存待确认，禁止自动触发",
+        BindingPlanState.ENROLLMENT: "正在录入凭据，自动触发已抑制",
+        BindingPlanState.PLAN_ABSENT: "没有当前自动触发计划",
+        BindingPlanState.PLAN_STALE: "自动触发计划已过期，等待调度器刷新",
+        BindingPlanState.STOPPED: "自动调度已停止",
+        BindingPlanState.ERROR: "自动调度错误，当前计划不可用",
+        BindingPlanState.UNREADY: "自动调度未就绪",
+    }
+    lines = ["本人自动计划："]
+    for view in views:
+        if (
+            view.state is BindingPlanState.PLANNED
+            and view.planned_at is not None
+            and view.timezone is not None
+        ):
+            lines.append(
+                f"- {view.task_id}：下次计划触发："
+                f"{view.planned_at.isoformat(timespec='minutes')}（{view.timezone}；"
+                "共享队列可能等待，不是保证执行时间）"
+            )
+        else:
+            lines.append(
+                f"- {view.task_id}：{unavailable.get(view.state, '自动调度未就绪')}"
+            )
     return "\n".join(lines)
 
 
@@ -701,6 +736,14 @@ class CloudDriveCheckin(Star):
             else:
                 try:
                     message = enrollment.describe(identity, task_id)
+                    if self.scheduler is None:
+                        message += "\n自动调度未就绪。"
+                    else:
+                        plans = _render_binding_plans(
+                            self.scheduler.binding_plan_views(identity, task_id)
+                        )
+                        if plans:
+                            message += "\n" + plans
                     execution = describe_execution(store.snapshot(), identity, task_id)
                     if execution:
                         message += "\n" + execution
