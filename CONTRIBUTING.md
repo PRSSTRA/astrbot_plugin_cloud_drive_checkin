@@ -27,6 +27,9 @@ python3 -m venv .venv
 - `bindings.py`：本人绑定偏好更新、删除确认指纹和绑定与凭据的原子删除。
 - `state.py`：快照结构和 JSON 校验。
 - `storage.py`：基于 Star 异步 KV 的事务写入。
+- `executors/client.py`：完整来源的 Neo 连接解析、异步 REST、鉴权检查和有界响应。
+- `executors/neo.py`：持久化执行意图、串行执行、资源归属检查、清理阻断与恢复。
+- `runners/bootstrap.py`：上传到 Neo 的独立 wrapper；消费凭据文件，以 argv 启动子进程并只返回安全结果信封。
 
 向导字段原文只保存在进程内会话中，持久化前加密。明文凭据不得进入日志、回执、shell 或命令行参数。
 
@@ -55,11 +58,36 @@ python3 -m venv .venv
 
 同一 Context 上按 `plugin_id` 保存进程内写者登记，避免模块重载后丢失交接信息。活跃旧写者会阻止新实例；关闭失败则保留原写者与待确认快照，确认关闭后才允许接管。登记只保存运行时锁和对象引用，业务持久化仍只有 KV。仅支持单进程、单实例写入。
 
+## 内部执行接口
+
+`NeoExecutor.execute(PreparedExecution(...), guard=...)` 接收已经准备好的脚本字节、SHA256、固定来源 commit、任务版本、身份和本次环境变量。调用方负责脚本来源及依赖制品验收，并在同步 `guard(snapshot)` 中重新检查权限和版本；拒绝时抛异常，放行时返回 `None`。执行器本身不下载脚本、不安装依赖、不提供 shell 聊天入口。天翼输入/结果适配、管理员准备入口、队列和通知还没有接入。
+
+执行器在 `checkin_state.runs` 和 `cleanup_jobs` 中记录 `kind=neo_execution` 的状态。创建前提交意图，取得资源 ID 后再次提交，发送业务执行请求前再确认状态。每个运行预留 8 KiB 的快照空间用于资源 ID 和终态，最多保留 1000 个运行条目，容量不足拒绝新增；自动历史裁剪尚未接入。记录不保存脚本内容、环境变量或原始输出。
+
+脚本只在独立 Sandbox 中执行。固定命令先建立执行用户拥有的 0700 目录和 0600 文件，再经文件 API 覆写；Ship 的上传实现使用 `wb`，保留已有文件的 owner/mode。wrapper 读出凭据后立即解除文件链接，校验脚本 hash，以 `shell=False` 和独立进程组启动 Python 或 Node。stdout 有界收集，stderr 只排空；两者均不透传到 Bay。子进程退出后也清理其残留进程组，Linux 下使用 subreaper 回收已脱离直接父进程的后代。
+
+`json_protocol` 只接受完整 JSON 对象中已知的 `status`；自由文本原因和其他字段不会返回。退出码与业务状态分别保存，`process_only` 或无有效证据均为 `unknown`。安全信封包含 `protocol/process_status/exit_code/business_status/reason_code/duration_ms`，字段和范围由 `validate_result` 验证。超时、取消和重启中断分别记录，不根据退出 0 推断成功。
+
+终止插件时先停止入口，再取消并等待执行及受管清理，最后关闭 StateStore。旧执行器未退出时新实例不能接管写者。待确认 KV 写入期间只进行已知资源清理，不另写快照；下一次恢复仍先确认原待写快照，再处理清理记录。清理不能确认时保留记录，不放行新执行。
+
+### 接口依据与许可
+
+Neo 接口按 [Shipyard Neo `f4d248b4274c1a2f05402f75a3b39e5c19be9ff5`](https://github.com/AstrBotDevs/shipyard-neo/tree/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5) 核验，该项目使用 AGPLv3；本插件客户端和 wrapper 为独立实现，没有移植上游代码。相关依据：
+
+- [Bay API v1](https://github.com/AstrBotDevs/shipyard-neo/blob/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5/doc/bay_api_v1.md)：请求、响应与文件路径。
+- [CargoManager](https://github.com/AstrBotDevs/shipyard-neo/blob/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5/pkgs/bay/app/managers/cargo/cargo.py) 与 [Docker driver](https://github.com/AstrBotDevs/shipyard-neo/blob/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5/pkgs/bay/app/drivers/docker/docker.py)：先删卷后删记录、非 404 错误保留重试条件。
+- [K8s driver](https://github.com/AstrBotDevs/shipyard-neo/blob/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5/pkgs/bay/app/drivers/k8s/k8s.py)：PVC 删除受理不等于清理完成，因此当前执行层仅接受已确认的固定 Docker 部署。
+- [AstrBot v4.29.4 Context](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.4/astrbot/core/star/context.py)：通过 `get_config()` 读取框架配置，不访问框架私有存储或借用聊天资源。
+
 ## 测试与验证
 
 提交前至少运行上面的离线测试。涉及框架接口、OneBot 事件、KV 写入确认或调度时间的改动，需要补充对应的回归测试；不要用占位实现、吞异常或弱化断言通过测试。
 
 PR 的“提交信息规范”任务会在 Python 3.12 上安装 `requirements.txt` 并运行 `unittest discover -s tests -p 'test_*.py'`。本地通过不代表真实 QQ、Neo 或云盘签到已经验证，集成后的行为由维护者验证并记录。
+
+执行层回归位于 `tests/test_neo_client.py`、`tests/test_neo_executor.py`、`tests/test_neo_lifecycle.py` 和 `tests/test_bootstrap.py`。`tests/neo_support.py` 是受控 Bay 替身，会在临时目录运行本仓库 wrapper 与假脚本；这不是产品的宿主回退路径。Node 测试需要本机 Node，未安装时会明确跳过；macOS 测试只将 Node 的可执行路径映射到本机安装位置，实际运行 Node 子进程。
+
+本轮另以真实 loopback HTTP 连接受控 Bay，跑通两用户隔离、非零退出码的显式业务结果、超时、清理阻断及恢复不重跑；未连接真实 Neo、Docker、QQ 或云盘账号。部署后的真实 Neo 假凭据测试和真实账号测试必须分别报告。
 
 ## Git hooks
 

@@ -102,6 +102,8 @@ git clone --branch dev/0.0.1 https://github.com/PRSSTRA/astrbot_plugin_cloud_dri
 
 内置模板为 `tianyi_cloud`（天翼云盘）和 `mobile_cloud_experimental`（移动云盘，实验），默认禁用。模板只在未配置 `tasks` 时提供，显式设置 `tasks=[]` 不会补回。移动模板必须保持 `enabled=false` 和 `experimental=true`。
 
+`neo_connection` 默认关闭。启用后，插件连接独立的 Docker Neo 服务并在启动时处理本插件遗留资源；不会自动部署 Neo，也不会开放聊天签到。尚未部署 Neo 时保持关闭，不影响录入和绑定管理。
+
 完整配置表、任务字段、Cron、脚本来源、适配器和主密钥部署步骤见 [配置说明](docs/configuration.md)。
 
 ## 数据与安全
@@ -117,6 +119,8 @@ git clone --branch dev/0.0.1 https://github.com/PRSSTRA/astrbot_plugin_cloud_dri
 - 基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 插件接口，AstrBot 以 AGPLv3 发布。
 - [croniter 6.2.4](https://pypi.org/project/croniter/6.2.4/) 用于 Cron 计算，许可证为 MIT。
 - [cryptography 50.0.2](https://pypi.org/project/cryptography/50.0.2/) 用于凭据认证加密，许可证为 Apache-2.0 或 BSD-3-Clause。
+- [HTTPX 0.28.1](https://pypi.org/project/httpx/0.28.1/) 用于异步访问 Neo，许可证为 BSD-3-Clause。
+- Neo 接口按 [Shipyard Neo 固定提交](https://github.com/AstrBotDevs/shipyard-neo/tree/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5) 核验，该项目以 AGPLv3 发布；当前尚未完成真实 Neo 验收。
 - 天翼模板引用 [BlueSkyXN/189Cloud-Checkin 的固定提交](https://github.com/BlueSkyXN/189Cloud-Checkin/tree/8e02d162ec6d1b5c00736afffb727d9dcfe8ba7b)，移动模板引用 [smallfawn/QLScriptPublic 的固定提交](https://github.com/smallfawn/QLScriptPublic/tree/2d4c26fdc72c3206bb9cf9afc1fb4991d337f888)。脚本本身不在本仓库中。
 
 ## 参与开发

@@ -24,6 +24,41 @@ QQ 号必须是正整数，或由数字组成、不含空白、符号和前导�
 
 任务目录最多 32 个任务。`tasks` 不是数组、任务不是对象、任务 ID 重复或任一任务校验失败时，整份任务目录被视为无效。加载阶段发现无效会导致插件加载失败；运行期间发现无效时，插件拒绝处理指令并返回固定提示。
 
+## Neo 连接
+
+尚未部署 Neo 时保持 `neo_connection.enabled=false`。查询、录入和绑定管理不需要 Neo。启用连接只会初始化内部执行服务并恢复遗留资源清理，当前没有聊天执行指令、定时 worker 或结果通知发送器。连接配置无效、鉴权失败或恢复记录不匹配会导致插件初始化失败；先修正配置，不要删除业务状态。
+
+`neo_connection` 的字段如下：
+
+| 字段 | 默认值 | 规则 |
+| --- | --- | --- |
+| `enabled` | `false` | 是否连接 Neo 并在启动时恢复清理 |
+| `docker_cleanup_confirmed` | `false` | 管理员核对下述固定 Docker 清理条件后才能设为 `true` |
+| `endpoint` | 空字符串 | 备用 Bay API 地址；必须明确填写 HTTP 或 HTTPS 地址，不含用户名、密码、查询参数或片段 |
+| `profile` | `python-default` | 备用 profile，须提供 shell 和 filesystem 能力，镜像中须有 Python；Node 脚本还需要 Node |
+| `access_key_env` | `CLOUD_DRIVE_CHECKIN_NEO_KEY` | 备用访问密钥的环境变量名，只填写名称，不填写密钥值 |
+| `ttl` | `900` | 本插件沙箱 TTL，允许 300 到 3600 秒；不继承聊天沙箱 TTL |
+
+启用后，插件通过 AstrBot 公共 `Context.get_config()` 读取 `provider_settings.sandbox`。当 `booter=shipyard_neo`，且 `shipyard_neo_endpoint`、`shipyard_neo_access_token` 均已明确配置时，优先使用这一完整连接和 `shipyard_neo_profile`。框架连接不完整、地址为空或为 `__auto__` 时，改用插件的完整备用连接，不把一个来源的地址与另一个来源的密钥拼在一起。插件不读取 Neo 的 `credentials.json`，不启动 Bay，也不获取聊天沙箱。
+
+访问检查使用受保护的沙箱查询入口，查询一个不会由 Neo 自动生成的探测 ID：未带密钥须返回 401，带密钥须返回 Neo 的 `not_found`，随后读取公开 profile 目录确认目标能力。不会读取或借用聊天资源；匿名访问未关闭时拒绝执行。HTTP 仅用于可信的本机或隔离内部网络；跨不可信网络应使用 HTTPS。插件不自动修改服务鉴权、网络、权限或镜像。
+
+### Docker 清理条件
+
+当前按 Neo 提交 `f4d248b4274c1a2f05402f75a3b39e5c19be9ff5` 的 Docker 实现核验：删除存储卷失败时保留 Cargo 记录；存储卷删除成功后才删除记录。部署及升级时须确认这一行为仍成立，并在资源创建至清理期间保持同一 Docker daemon、存储配置和鉴权身份。不能仅凭 Cargo 返回的 `backend` 字段判断部署方式，该版本把它固定写为 `docker_volume`。
+
+每次执行都创建独立 Sandbox 和托管 Cargo。清理只使用本插件已经记录的资源 ID，检查 Cargo 的管理沙箱，删除 Sandbox 后再查询 Cargo；仍有残留时只重试该 Cargo 的删除，并要求查询返回 Neo 的 `not_found`。不会调用全局 GC、按创建时间猜测归属或删除聊天资源。这里验证的是资源删除，不是存储介质安全擦除，也不代表 Bay 历史记录已删除。
+
+Kubernetes 不适用上述条件：PVC 删除受理后可能仍处于 Terminating，Cargo 记录却已经消失。该模式不能勾选 Docker 清理确认。
+
+### 中断和清理失败
+
+创建请求结果不明时不会重发创建请求；业务执行超时或断连也不会重发。资源 ID 不明、清理未确认或连接指纹变化时保留 `cleanup_jobs`，阻断新执行。连接指纹覆盖地址、密钥和 profile，不保存这些密钥的明文；存在待清理资源时不要切换连接，应先用原连接完成清理。
+
+启动恢复只清理已记录资源，未完成运行记为 `interrupted/unknown`，不补跑业务。创建结果不明且未取得资源 ID 的记录需要操作者核查，不能通过清空 KV 绕过。KV 写入未确认时仍遵守原快照重试规则，清理结果不能用来覆盖待确认写入。
+
+目前只有受控 Bay 和假脚本的离线验证。真实 Docker Neo 的生命周期、权限、历史脱敏及 Cargo 清理须在部署后单独验收；真实账号签到另行确认。
+
 ## 凭据主密钥
 
 只有录入凭据需要主密钥。帮助、任务查询、`/签到 我的`、`/签到 状态`，以及暂停、恢复、通知和删除等绑定管理操作都不读取主密钥。

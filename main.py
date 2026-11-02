@@ -8,6 +8,8 @@ from . import bindings
 from .config import PluginConfigError, parse_config
 from .credentials import CredentialError
 from .enrollment import Enrollment, raw_private_text
+from .executors.client import NeoClient, resolve_connection
+from .executors.neo import NeoExecutor
 from .permissions import authorize, get_private_identity
 from .state import InvalidStateError
 from .storage import CommitUnconfirmedError, StateStore, StateUnavailableError
@@ -82,6 +84,8 @@ class CloudDriveCheckin(Star):
         self.state_store: StateStore | None = None
         self.enrollment: Enrollment | None = None
         self._delete_requests: dict[tuple[str, str, str], tuple[str, float]] = {}
+        self.executor: NeoExecutor | None = None
+        self._terminating = False
 
     def _state_slot(self) -> dict:
         registry = getattr(self.context, _STATE_REGISTRY_ATTRIBUTE, None)
@@ -100,7 +104,8 @@ class CloudDriveCheckin(Star):
         try:
             permissions = parse_config(self.config)
             if (
-                identity is None
+                self._terminating
+                or identity is None
                 or authorize(
                     identity, astrbot_admin=event.is_admin(), config=permissions
                 )
@@ -143,7 +148,8 @@ class CloudDriveCheckin(Star):
         except PluginConfigError:
             raise bindings.BindingError("permission configuration changed") from None
         if (
-            get_private_identity(event) != identity
+            self._terminating
+            or get_private_identity(event) != identity
             or authorize(identity, astrbot_admin=event.is_admin(), config=permissions)
             is None
         ):
@@ -260,7 +266,7 @@ class CloudDriveCheckin(Star):
             return
 
         store = self.state_store
-        if store is None or store.closing or store.closed:
+        if self._terminating or store is None or store.closing or store.closed:
             return
 
         try:
@@ -384,22 +390,41 @@ class CloudDriveCheckin(Star):
             slot["owner"] = store
             try:
                 await store.initialize()
+                neo_config = self.config.get("neo_connection", {})
+                framework = (
+                    self.context.get_config()
+                    if isinstance(neo_config, dict)
+                    and neo_config.get("enabled", False) is True
+                    else {}
+                )
+                connection = resolve_connection(self.config, framework)
+                if connection is not None:
+                    self.executor = NeoExecutor(store, NeoClient(connection))
+                    await self.executor.recover()
+                self._terminating = False
                 self.enrollment = Enrollment(store)
             except asyncio.CancelledError:
                 store.stop_accepting()
+                if self.executor is not None:
+                    await self.executor.close()
                 raise
             except Exception:
                 store.stop_accepting()
+                if self.executor is not None:
+                    await self.executor.close()
                 raise
 
     async def terminate(self) -> None:
+        self._terminating = True
         self._delete_requests.clear()
         store = self.state_store
         if store is None:
             return
-        store.stop_accepting()
         if self.enrollment is not None:
             self.enrollment.close()
+        if self.executor is not None:
+            await self.executor.close()
+        store.stop_accepting()
 
         slot = self._state_slot()
         async with slot["lock"]:
