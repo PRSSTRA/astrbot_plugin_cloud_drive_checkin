@@ -35,21 +35,48 @@ jobs:
           bash scripts/check-pr-policy.sh title "$title_file"
           bash scripts/check-pr-policy.sh branch "$BASE_BRANCH" "$HEAD_BRANCH"
 
+  tests:
+    name: 离线测试 (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.12', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 确认 Python 与 Node 运行时
+        run: |
+          python3 --version
+          node --version
+      - name: 安装插件宿主依赖
+        run: python3 -m pip install -r requirements.txt
+      - name: 运行全量离线测试
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+
   commit-msg:
     name: 提交信息规范
+    needs: tests
+    if: ${{ always() }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
+      - name: 要求所有运行时测试通过
+        env:
+          TEST_RESULT: ${{ needs.tests.result }}
+        run: test "$TEST_RESULT" = success
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: 安装插件宿主依赖
-        run: python3 -m pip install -r requirements.txt
-      - name: 运行策略回归测试
-        run: python3 -m unittest discover -s tests -p 'test_*.py'
       - name: 逐个校验
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}

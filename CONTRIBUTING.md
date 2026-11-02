@@ -83,9 +83,9 @@ Neo 接口按 [Shipyard Neo `f4d248b4274c1a2f05402f75a3b39e5c19be9ff5`](https://
 
 提交前至少运行上面的离线测试。涉及框架接口、OneBot 事件、KV 写入确认或调度时间的改动，需要补充对应的回归测试；不要用占位实现、吞异常或弱化断言通过测试。
 
-PR 的“提交信息规范”任务会在 Python 3.12 上安装 `requirements.txt` 并运行 `unittest discover -s tests -p 'test_*.py'`。本地通过不代表真实 QQ、Neo 或云盘签到已经验证，集成后的行为由维护者验证并记录。
+PR 的“离线测试”任务分别在 Python 3.12、3.13、3.14 上安装 `requirements.txt`，显式安装 Node 22，并运行 `unittest discover -s tests -p 'test_*.py' -v`。既有必需检查“提交信息规范”等待全部矩阵结果，仅在测试全部成功后校验提交历史；测试失败、取消或跳过都不能通过该检查，无需修改现有必需检查名称。本地通过不代表真实 QQ、Neo 或云盘签到已经验证，普通 PR CI 不连接这些服务。
 
-执行层回归位于 `tests/test_neo_client.py`、`tests/test_neo_executor.py`、`tests/test_neo_lifecycle.py` 和 `tests/test_bootstrap.py`。`tests/neo_support.py` 是受控 Bay 替身，会在临时目录运行本仓库 wrapper 与假脚本；这不是产品的宿主回退路径。Node 测试需要本机 Node，未安装时会明确跳过；macOS 测试只将 Node 的可执行路径映射到本机安装位置，实际运行 Node 子进程。
+执行层回归位于 `tests/test_neo_client.py`、`tests/test_neo_executor.py`、`tests/test_neo_lifecycle.py` 和 `tests/test_bootstrap.py`。`tests/neo_support.py` 是受控 Bay 替身，会在临时目录运行本仓库 wrapper 与假脚本；这不是产品的宿主回退路径。本地未安装 Node 时对应测试会明确跳过；CI 显式安装并检查 Node，不依赖 runner 预装。macOS 测试只将 Node 的可执行路径映射到本机安装位置，实际运行 Node 子进程。
 
 离线 smoke 通过真实 loopback HTTP 连接受控 Bay，覆盖两用户隔离、非零退出码的显式业务结果、超时、清理阻断及恢复不重跑。真实 Neo 假凭据测试与真实账号测试分别记录如下。
 
