@@ -17,6 +17,7 @@ from .executors.neo import ExecutionBlocked, NeoExecutor
 from .notifications import NotificationService, enqueue_terminal, reserve_terminal
 from .permissions import authorize, get_private_identity
 from .preparation import PreparationError
+from .scheduler import CronScheduler
 from .state import InvalidStateError
 from .storage import CommitUnconfirmedError, StateStore, StateUnavailableError
 from .task_config import TaskConfig, next_run_times, parse_task_catalog
@@ -51,7 +52,7 @@ def _render_task_list(tasks: tuple[TaskConfig, ...]) -> str:
     if not tasks:
         return "暂无配置的签到任务。"
 
-    lines = ["签到任务（Cron 仅预览，使用 /签到 立即 手动入队）："]
+    lines = ["签到任务（启用后按 Cron 入队，也可使用 /签到 立即）："]
     lines.extend(
         f"- {task.task_id}｜{task.name}｜{_task_status(task)}" for task in tasks
     )
@@ -101,6 +102,7 @@ class CloudDriveCheckin(Star):
         self.preparation: PreparationService | None = None
         self.queue: ExecutionQueue | None = None
         self.notifications: NotificationService | None = None
+        self.scheduler: CronScheduler | None = None
         self.execution_bridge = ExecutionBridge(self)
         self._shutdown_task: asyncio.Task | None = None
         self._terminating = False
@@ -502,6 +504,11 @@ class CloudDriveCheckin(Star):
                         message += "\n队列暂不可用，请管理员检查执行配置和状态。"
                     if self.notifications is not None and self.notifications.frozen:
                         message += "\n通知发送器已暂停，请管理员重载。"
+                    if (
+                        self.scheduler is not None
+                        and self.scheduler.last_error is not None
+                    ):
+                        message += "\n自动调度存在未处理错误，请管理员检查配置和状态。"
                 except (CredentialError, StateUnavailableError):
                     message = "绑定状态不可用，请联系管理员。"
             await event.send(event.plain_result(message))
@@ -588,7 +595,11 @@ class CloudDriveCheckin(Star):
                     terminal=self._terminal_notice,
                 )
                 await self.queue.initialize()
+                self.scheduler = CronScheduler(store, self.queue, lambda: self.config)
+                await self.scheduler.initialize()
             except asyncio.CancelledError:
+                if self.scheduler is not None:
+                    await self.scheduler.close()
                 if self.queue is not None:
                     await self.queue.close()
                 if self.notifications is not None:
@@ -598,6 +609,8 @@ class CloudDriveCheckin(Star):
                 store.stop_accepting()
                 raise
             except Exception:
+                if self.scheduler is not None:
+                    await self.scheduler.close()
                 if self.queue is not None:
                     await self.queue.close()
                 if self.notifications is not None:
@@ -632,8 +645,12 @@ class CloudDriveCheckin(Star):
         store = self.state_store
         already_closing = store.closing
         try:
-            if self.queue is not None:
-                await self.queue.close()
+            try:
+                if self.scheduler is not None:
+                    await self.scheduler.close()
+            finally:
+                if self.queue is not None:
+                    await self.queue.close()
         finally:
             try:
                 if self.preparation is not None:
@@ -648,6 +665,8 @@ class CloudDriveCheckin(Star):
                         and not self.queue.closed
                         or self.executor is not None
                         and not self.executor.quiescent
+                        or self.scheduler is not None
+                        and not self.scheduler.closed
                     ):
                         if self.notifications is not None:
                             await self.notifications.close()

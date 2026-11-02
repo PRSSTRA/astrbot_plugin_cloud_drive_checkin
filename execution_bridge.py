@@ -65,7 +65,6 @@ class ExecutionBridge:
                 and platform.meta().name == "aiocqhttp"
                 for platform in platforms
             )
-            connection = resolve_connection(plugin.config, plugin.context.get_config())
         except (PluginConfigError, AttributeError, TypeError, ValueError):
             raise QueueRejected(
                 "config_error", business_status="config_error"
@@ -80,12 +79,6 @@ class ExecutionBridge:
             raise QueueRejected("permission_revoked")
         if not permission.enabled:
             raise QueueRejected("service_disabled")
-        if (
-            plugin.executor is None
-            or connection is None
-            or connection != plugin.executor.client.connection
-        ):
-            raise QueueRejected("executor_unavailable", business_status="config_error")
         task = self._task(item["task_id"])
         if task.version != item["task_version"]:
             raise QueueRejected("task_changed")
@@ -110,6 +103,18 @@ class ExecutionBridge:
             raise QueueRejected("enrollment_active")
         if binding.get("paused", False) is not False:
             raise QueueRejected("binding_paused")
+        try:
+            connection = resolve_connection(plugin.config, plugin.context.get_config())
+        except (PluginConfigError, AttributeError, TypeError, ValueError):
+            raise QueueRejected(
+                "executor_unavailable", business_status="config_error"
+            ) from None
+        if (
+            plugin.executor is None
+            or connection is None
+            or connection != plugin.executor.client.connection
+        ):
+            raise QueueRejected("executor_unavailable", business_status="config_error")
         credential = snapshot["credentials"].get(target_key)
         if (
             not isinstance(credential, dict)
@@ -154,7 +159,7 @@ class ExecutionBridge:
         snapshot = store.snapshot()
         owned_inflight = snapshot["cleanup_jobs"] and all(
             snapshot["batches"].get(run_id, {}).get("status") == "running"
-            and snapshot["batches"][run_id].get("kind") == "manual_checkin"
+            and snapshot["batches"][run_id].get("kind") == "checkin"
             for run_id in snapshot["cleanup_jobs"]
         )
         if plugin.executor.blocked and not owned_inflight:
@@ -244,7 +249,7 @@ def describe_execution(snapshot, identity, task_id=""):
         item
         for item in snapshot["batches"].values()
         if isinstance(item, dict)
-        and item.get("kind") == "manual_checkin"
+        and item.get("kind") == "checkin"
         and item.get("user_key") == owner
         and item.get("platform_id") == identity.platform_id
         and item.get("qq_id") == identity.qq_id
@@ -278,5 +283,6 @@ def describe_execution(snapshot, identity, task_id=""):
         "sent": "已发送",
         "failed": "发送失败",
         "unknown": "送达未确认",
+        "suppressed": "按偏好静默",
     }.get(notice.get("phase"), "未知")
     return f"最近执行：{latest['run_id']}｜{state}\n业务结果：{status}\n通知：{notice_state}"

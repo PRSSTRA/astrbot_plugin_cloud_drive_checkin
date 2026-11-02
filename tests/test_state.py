@@ -230,6 +230,77 @@ class StateSchemaTests(unittest.TestCase):
         with self.assertRaises(state.StateTooLargeError):
             state.validate_snapshot(snapshot, max_bytes=exact_size - 1)
 
+    def test_manual_schema_upgrade_preserves_pending_delivery_and_execution(self):
+        old = state.new_snapshot()
+        old["schema_version"] = 2
+        old["revision"] = 41
+        old["batches"]["run"] = {
+            "kind": "manual_checkin",
+            "status": "queued",
+            "run_id": "run",
+        }
+        old["outbox"]["run"] = {
+            "kind": "manual_terminal_notification",
+            "phase": "sending",
+            "attempts": 1,
+        }
+        old["cooldowns"]["manual:global_spacing"] = {
+            "kind": "manual_queue_cooldown",
+            "scope": "spacing",
+            "completed_at": "2026-11-02T00:00:00+00:00",
+        }
+        old["dedupe"]["manual:owner"] = {"kind": "manual_checkin", "run_id": "run"}
+        old["credentials"]["owner"] = {"ciphertext": "UNCHANGED_TEST_CIPHERTEXT"}
+        upgraded = state.upgrade_snapshot(old)
+        self.assertEqual(upgraded["revision"], 41)
+        self.assertEqual(
+            upgraded["batches"]["run"],
+            {
+                "kind": "checkin",
+                "status": "queued",
+                "run_id": "run",
+                "source": "manual",
+                "manual_requested": True,
+                "scheduled_at": None,
+                "batch_id": None,
+            },
+        )
+        self.assertEqual(
+            upgraded["outbox"]["run"],
+            {
+                "kind": "terminal_notification",
+                "phase": "sending",
+                "attempts": 1,
+                "source": "manual",
+                "manual_requested": True,
+            },
+        )
+        self.assertEqual(upgraded["credentials"], old["credentials"])
+        self.assertEqual(
+            upgraded["dedupe"], {"binding:owner": {"kind": "checkin", "run_id": "run"}}
+        )
+        self.assertEqual(
+            upgraded["cooldowns"]["checkin:global_spacing"]["completed_at"],
+            "2026-11-02T00:00:00+00:00",
+        )
+        self.assertEqual(old["batches"]["run"]["kind"], "manual_checkin")
+        self.assertEqual(old["schema_version"], 2)
+
+    def test_migration_refuses_index_collision_and_expanded_oversize(self):
+        old = state.new_snapshot()
+        old["schema_version"] = 2
+        old["dedupe"] = {
+            "manual:owner": {"kind": "manual_checkin", "run_id": "one"},
+            "binding:owner": {"run_id": "two"},
+        }
+        with self.assertRaises(state.InvalidStateError):
+            state.upgrade_snapshot(old)
+        self.assertEqual(old["dedupe"]["binding:owner"]["run_id"], "two")
+        old["dedupe"].clear()
+        old["batches"]["run"] = {"kind": "manual_checkin", "status": "queued"}
+        with self.assertRaises(state.StateTooLargeError):
+            state.upgrade_snapshot(old, max_bytes=encoded_size(old))
+
 
 if __name__ == "__main__":
     unittest.main()

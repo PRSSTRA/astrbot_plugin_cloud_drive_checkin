@@ -211,6 +211,31 @@ class ExecutionQueueTests(unittest.IsolatedAsyncioTestCase):
             inputs_sha256="5" * 64,
         )
 
+    async def enqueue_scheduled(
+        self,
+        queue,
+        *,
+        scheduled_at=None,
+        identities=None,
+        task=None,
+        artifact_sha256="4" * 64,
+        inputs_sha256="5" * 64,
+    ):
+        selected = identities if identities is not None else [self.identity]
+        return await queue.enqueue_scheduled(
+            task=task or self.base_task,
+            scheduled_at=scheduled_at or self.clock(),
+            requests=[
+                {
+                    "identity": identity,
+                    "origin": f"origin:auto:{identity.qq_id}",
+                    "artifact_sha256": artifact_sha256,
+                    "inputs_sha256": inputs_sha256,
+                }
+                for identity in selected
+            ],
+        )
+
     def batch(self, run_id):
         return self.store.snapshot()["batches"][run_id]
 
@@ -408,12 +433,12 @@ class ExecutionQueueTests(unittest.IsolatedAsyncioTestCase):
         await wait_until(
             lambda: (
                 self.store.snapshot()["cooldowns"]
-                .get("manual:global_spacing", {})
+                .get("checkin:global_spacing", {})
                 .get("target_run_id")
                 == second
             )
         )
-        spacing = self.store.snapshot()["cooldowns"]["manual:global_spacing"]
+        spacing = self.store.snapshot()["cooldowns"]["checkin:global_spacing"]
         self.assertEqual(spacing["target_kind"], "user")
         self.clock.advance(29)
         queue.wake()
@@ -446,12 +471,12 @@ class ExecutionQueueTests(unittest.IsolatedAsyncioTestCase):
         await wait_until(
             lambda: (
                 self.store.snapshot()["cooldowns"]
-                .get("manual:global_spacing", {})
+                .get("checkin:global_spacing", {})
                 .get("target_run_id")
                 == second
             )
         )
-        spacing = self.store.snapshot()["cooldowns"]["manual:global_spacing"]
+        spacing = self.store.snapshot()["cooldowns"]["checkin:global_spacing"]
         self.assertEqual(spacing["target_kind"], "task")
         self.clock.advance(60)
         queue.wake()
@@ -486,12 +511,12 @@ class ExecutionQueueTests(unittest.IsolatedAsyncioTestCase):
         await wait_until(
             lambda: (
                 self.store.snapshot()["cooldowns"]
-                .get("manual:global_spacing", {})
+                .get("checkin:global_spacing", {})
                 .get("target_run_id")
                 == third
             )
         )
-        spacing = self.store.snapshot()["cooldowns"]["manual:global_spacing"]
+        spacing = self.store.snapshot()["cooldowns"]["checkin:global_spacing"]
         self.assertEqual(spacing["task_id"], "task_two")
         self.assertEqual(spacing["target_kind"], "task")
         self.clock.advance(30)
@@ -571,7 +596,7 @@ class ExecutionQueueTests(unittest.IsolatedAsyncioTestCase):
             datetime.fromisoformat(cooldown["expires_at"]),
             self.clock() + timedelta(seconds=300),
         )
-        spacing = self.store.snapshot()["cooldowns"]["manual:global_spacing"]
+        spacing = self.store.snapshot()["cooldowns"]["checkin:global_spacing"]
         self.assertEqual(datetime.fromisoformat(spacing["completed_at"]), self.clock())
 
     async def test_same_identity_and_zero_or_none_intervals_add_no_delay(self):
@@ -640,12 +665,12 @@ class ExecutionQueueTests(unittest.IsolatedAsyncioTestCase):
         await wait_until(
             lambda: (
                 self.store.snapshot()["cooldowns"]
-                .get("manual:global_spacing", {})
+                .get("checkin:global_spacing", {})
                 .get("target_run_id")
                 == next_run
             )
         )
-        spacing = self.store.snapshot()["cooldowns"]["manual:global_spacing"]
+        spacing = self.store.snapshot()["cooldowns"]["checkin:global_spacing"]
         self.assertEqual(spacing["task_id"], "task_one")
         self.assertEqual(spacing["target_kind"], "user")
         self.clock.advance(29)
@@ -682,7 +707,7 @@ class ExecutionQueueTests(unittest.IsolatedAsyncioTestCase):
         await wait_until(
             lambda: (
                 self.store.snapshot()["cooldowns"]
-                .get("manual:global_spacing", {})
+                .get("checkin:global_spacing", {})
                 .get("target_run_id")
                 == second
             )
@@ -827,7 +852,7 @@ class ExecutionQueueTests(unittest.IsolatedAsyncioTestCase):
         await queue.reconcile_shutdown()
         self.assertEqual(self.batch(run_id)["result"]["business_status"], "success")
         self.assertEqual(self.store.snapshot()["outbox"][run_id]["phase"], "pending")
-        self.assertIn("manual:global_spacing", self.store.snapshot()["cooldowns"])
+        self.assertIn("checkin:global_spacing", self.store.snapshot()["cooldowns"])
 
     async def test_shutdown_reconcile_keeps_sent_unknown_and_expires_only_due_queue(
         self,
@@ -886,6 +911,466 @@ class ExecutionQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(old, snapshot["batches"])
         self.assertNotIn(old, snapshot["outbox"])
         self.assertIn(newer, snapshot["batches"])
+
+    async def test_scheduled_duplicate_restart_and_backward_watermark_dedupe(self):
+        self.blocked = True
+        scheduled_at = self.clock()
+        first_queue = await self.make_queue()
+        admitted = await self.enqueue_scheduled(
+            first_queue,
+            scheduled_at=scheduled_at,
+            artifact_sha256=None,
+            inputs_sha256=None,
+        )
+        self.assertEqual(admitted["status"], "admitted")
+        run_id = admitted["run_ids"][0]
+        item = self.batch(run_id)
+        self.assertEqual(item["kind"], "checkin")
+        self.assertEqual(item["source"], "automatic")
+        self.assertIs(item["manual_requested"], False)
+        self.assertIsNone(item["artifact_sha256"])
+        self.assertIsNone(item["inputs_sha256"])
+
+        await first_queue.close()
+        self.queues.remove(first_queue)
+        second_queue = await self.make_queue()
+        duplicate = await self.enqueue_scheduled(
+            second_queue,
+            scheduled_at=scheduled_at,
+            artifact_sha256=None,
+            inputs_sha256=None,
+        )
+        self.assertEqual(duplicate, {"status": "duplicate", "run_ids": [run_id]})
+
+        later = scheduled_at + timedelta(minutes=1)
+        overlap = await self.enqueue_scheduled(second_queue, scheduled_at=later)
+        self.assertEqual(overlap, {"status": "skipped_overlap", "run_ids": []})
+        backward = await self.enqueue_scheduled(
+            second_queue, scheduled_at=scheduled_at + timedelta(seconds=30)
+        )
+        self.assertEqual(backward, {"status": "duplicate", "run_ids": []})
+        cursor = self.store.snapshot()["dedupe"]["schedule_cursor:task_one"]
+        self.assertEqual(cursor["kind"], "schedule_cursor")
+        self.assertEqual(cursor["scheduled_at"], later.isoformat())
+
+    async def test_scheduled_overlap_includes_cleanup_pending_and_empty_eligibility(
+        self,
+    ):
+        task_two = replace(
+            self.base_task,
+            task_id="task_two",
+            name="Task Two",
+            version="6" * 64,
+        )
+
+        def guard(item, snapshot):
+            if item["task_id"] == "task_two":
+                raise execution_queue.QueueRejected("binding_missing")
+
+        async def execute(item):
+            self.execute_calls.append(item["run_id"])
+
+            def finish_run(snapshot):
+                snapshot["runs"][item["run_id"]] = {
+                    "phase": "finished",
+                    "finished_at": self.clock().isoformat(),
+                    "cleanup_status": "pending",
+                    "cleanup_finished_at": None,
+                    "business_attempted": True,
+                    **_RESULT,
+                }
+                snapshot["cleanup_jobs"][item["run_id"]] = {"pending": True}
+
+            confirmed = await self.store.mutate(finish_run)
+            return confirmed["runs"][item["run_id"]]
+
+        queue = await self.make_queue(execute=execute, guard=guard)
+        first = await self.enqueue_scheduled(queue, scheduled_at=self.clock())
+        run_id = first["run_ids"][0]
+        await wait_until(lambda: self.batch(run_id).get("cooldown_pending") is True)
+
+        overlap = await self.enqueue_scheduled(
+            queue, scheduled_at=self.clock() + timedelta(minutes=1)
+        )
+        empty = await self.enqueue_scheduled(
+            queue,
+            task=task_two,
+            scheduled_at=self.clock() + timedelta(minutes=2),
+            identities=[permissions.Identity("qq-bot", "10002")],
+        )
+        self.assertEqual(overlap, {"status": "skipped_overlap", "run_ids": []})
+        self.assertEqual(empty, {"status": "skipped_empty", "run_ids": []})
+        self.assertEqual(self.execute_calls, [run_id])
+
+    async def test_scheduled_eligibility_skips_recipients_but_aborts_generic_config(
+        self,
+    ):
+        self.blocked = True
+
+        def guard(item, snapshot):
+            if item["qq_id"] == "10001":
+                raise execution_queue.QueueRejected("permission_revoked")
+            if item["qq_id"] == "10002":
+                raise execution_queue.QueueRejected(
+                    "credentials_missing", business_status="config_error"
+                )
+            if item["qq_id"] == "10003":
+                raise execution_queue.QueueRejected(
+                    "config_error", business_status="config_error"
+                )
+
+        queue = await self.make_queue(guard=guard)
+        admitted = await self.enqueue_scheduled(
+            queue,
+            scheduled_at=self.clock(),
+            identities=[
+                permissions.Identity("qq-bot", "10002"),
+                permissions.Identity("qq-bot", "10001"),
+            ],
+        )
+        self.assertEqual(admitted["status"], "admitted")
+        self.assertEqual(self.batch(admitted["run_ids"][0])["qq_id"], "10002")
+
+        task_two = replace(
+            self.base_task,
+            task_id="task_two",
+            name="Task Two",
+            version="6" * 64,
+        )
+        scheduled_at = self.clock() + timedelta(minutes=1)
+        with self.assertRaises(execution_queue.QueueRejected) as raised:
+            await self.enqueue_scheduled(
+                queue,
+                task=task_two,
+                scheduled_at=scheduled_at,
+                identities=[permissions.Identity("qq-bot", "10003")],
+            )
+        self.assertEqual(raised.exception.reason, "config_error")
+        self.assertNotIn(
+            f"schedule:task_two:{scheduled_at.isoformat()}",
+            self.store.snapshot()["dedupe"],
+        )
+
+    async def test_scheduled_occurrence_is_atomic_across_failure_and_capacity(self):
+        self.blocked = True
+        queue = await self.make_queue()
+        scheduled_at = self.clock()
+        identities = [
+            permissions.Identity("qq-bot", "10002"),
+            permissions.Identity("qq-bot", "10001"),
+        ]
+        self.kv.fail_at = len(self.kv.writes) + 1
+        with self.assertRaises(storage.CommitUnconfirmedError):
+            await self.enqueue_scheduled(
+                queue, scheduled_at=scheduled_at, identities=identities
+            )
+        occurrence_key = f"schedule:task_one:{scheduled_at.isoformat()}"
+        self.assertEqual(self.store.snapshot()["batches"], {})
+        pending = copy.deepcopy(self.kv.writes[-1])
+        self.assertEqual(len(pending["batches"]), 2)
+        self.assertEqual(len(pending["outbox"]), 2)
+        self.assertEqual(pending["dedupe"][occurrence_key]["status"], "admitted")
+
+        self.kv.fail_at = None
+        await self.store.retry_pending()
+        duplicate = await self.enqueue_scheduled(
+            queue, scheduled_at=scheduled_at, identities=identities
+        )
+        self.assertEqual(duplicate["status"], "duplicate")
+        self.assertEqual(set(duplicate["run_ids"]), set(pending["batches"]))
+
+        task_two = replace(
+            self.base_task,
+            task_id="task_two",
+            name="Task Two",
+            version="6" * 64,
+        )
+        original_limit = execution_queue.MAX_ACTIVE_ITEMS
+        execution_queue.MAX_ACTIVE_ITEMS = 2
+        try:
+            with self.assertRaises(execution_queue.QueueRejected) as raised:
+                await self.enqueue_scheduled(
+                    queue,
+                    task=task_two,
+                    scheduled_at=scheduled_at + timedelta(minutes=1),
+                    identities=[permissions.Identity("qq-bot", "10003")],
+                )
+        finally:
+            execution_queue.MAX_ACTIVE_ITEMS = original_limit
+        self.assertEqual(raised.exception.reason, "queue_capacity")
+        snapshot = self.store.snapshot()
+        rejected_key = (
+            f"schedule:task_two:{(scheduled_at + timedelta(minutes=1)).isoformat()}"
+        )
+        self.assertNotIn(rejected_key, snapshot["dedupe"])
+        self.assertEqual(set(snapshot["batches"]), set(pending["batches"]))
+
+    async def test_scheduled_group_is_sorted_contiguous_and_fifo_with_manual_work(self):
+        self.blocked = True
+        task_two = replace(
+            self.base_task,
+            task_id="task_two",
+            name="Task Two",
+            version="6" * 64,
+        )
+        queue = await self.make_queue()
+        manual = await self.enqueue(queue, task=task_two)
+        identities = [
+            permissions.Identity("qq-bot", "10003"),
+            permissions.Identity("qq-bot", "10001"),
+            permissions.Identity("qq-bot", "10002"),
+        ]
+        admitted = await self.enqueue_scheduled(
+            queue, scheduled_at=self.clock(), identities=identities
+        )
+        run_ids = admitted["run_ids"]
+        snapshot = self.store.snapshot()
+        self.assertEqual(
+            [snapshot["batches"][run_id]["qq_id"] for run_id in run_ids],
+            ["10001", "10002", "10003"],
+        )
+        self.assertEqual(
+            [snapshot["batches"][run_id]["sequence"] for run_id in run_ids],
+            [2, 3, 4],
+        )
+        self.assertEqual(
+            len({snapshot["batches"][run_id]["batch_id"] for run_id in run_ids}),
+            1,
+        )
+
+        self.blocked = False
+        queue.wake()
+        await wait_until(lambda: self.batch(run_ids[-1])["status"] == "finished")
+        self.assertEqual(self.execute_calls, [manual, *run_ids])
+
+    async def test_automatic_bypasses_and_does_not_rewrite_manual_cooldown(self):
+        self.raw_config["manual_cooldown_seconds"] = 300
+        queue = await self.make_queue()
+        manual = await self.enqueue(queue)
+        await wait_until(lambda: self.batch(manual)["status"] == "finished")
+        manual_key = "manual:" + self.batch(manual)["binding_key"]
+        original_cooldown = copy.deepcopy(
+            self.store.snapshot()["cooldowns"][manual_key]
+        )
+
+        automatic = await self.enqueue_scheduled(
+            queue, scheduled_at=self.clock() + timedelta(minutes=1)
+        )
+        run_id = automatic["run_ids"][0]
+        await wait_until(lambda: self.batch(run_id)["status"] == "finished")
+        snapshot = self.store.snapshot()
+        self.assertEqual(snapshot["cooldowns"][manual_key], original_cooldown)
+        self.assertEqual(snapshot["outbox"][run_id]["phase"], "suppressed")
+        with self.assertRaises(execution_queue.QueueRejected) as raised:
+            await self.enqueue(queue)
+        self.assertEqual(raised.exception.reason, "cooldown_active")
+
+        self.raw_config["history_retention_days"] = 0
+        task_two = replace(
+            self.base_task,
+            task_id="task_two",
+            name="Task Two",
+            version="6" * 64,
+        )
+        await self.enqueue(
+            queue,
+            identity=permissions.Identity("qq-bot", "10002"),
+            task=task_two,
+        )
+        self.assertNotIn(run_id, self.store.snapshot()["batches"])
+
+    async def test_manual_request_merges_into_running_automatic_notice_and_cooldown(
+        self,
+    ):
+        self.raw_config["manual_cooldown_seconds"] = 300
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        async def execute(item):
+            calls.append(item["run_id"])
+            started.set()
+            await release.wait()
+
+            def finish_run(snapshot):
+                snapshot["runs"][item["run_id"]] = {
+                    "phase": "finished",
+                    "finished_at": self.clock().isoformat(),
+                    "cleanup_status": "cleaned",
+                    "cleanup_finished_at": self.clock().isoformat(),
+                    "business_attempted": True,
+                    **_RESULT,
+                }
+
+            confirmed = await self.store.mutate(finish_run)
+            return confirmed["runs"][item["run_id"]]
+
+        queue = await self.make_queue(execute=execute)
+        automatic = await self.enqueue_scheduled(queue, scheduled_at=self.clock())
+        run_id = automatic["run_ids"][0]
+        await asyncio.wait_for(started.wait(), 2)
+        merged = await self.enqueue(queue)
+        self.assertEqual(merged, run_id)
+        running = self.batch(run_id)
+        self.assertEqual(running["source"], "automatic")
+        self.assertIs(running["manual_requested"], True)
+        self.assertEqual(running["origin"], "origin:test")
+        self.assertEqual(list(self.store.snapshot()["outbox"]), [run_id])
+
+        release.set()
+        await wait_until(lambda: self.batch(run_id)["status"] == "finished")
+        snapshot = self.store.snapshot()
+        notice = snapshot["outbox"][run_id]
+        self.assertEqual(calls, [run_id])
+        self.assertEqual(notice["phase"], "pending")
+        self.assertIs(notice["manual_requested"], True)
+        self.assertTrue(notice["message"].startswith("手动签到结果\n"))
+        self.assertIn(
+            "manual:" + self.batch(run_id)["binding_key"], snapshot["cooldowns"]
+        )
+
+    async def test_manual_merge_at_batch_capacity_preserves_unexpired_history_and_reservation(
+        self,
+    ):
+        self.blocked = True
+        queue = await self.make_queue()
+        automatic = await self.enqueue_scheduled(queue, scheduled_at=self.clock())
+        active_run = automatic["run_ids"][0]
+
+        def fill_history(snapshot):
+            used = set(snapshot["batches"])
+            for index in range(999):
+                candidate = index + 1
+                run_id = f"{candidate:032x}"
+                while run_id in used:
+                    candidate += 1000
+                    run_id = f"{candidate:032x}"
+                used.add(run_id)
+                identity = permissions.Identity("history-bot", f"9{index:05d}")
+                snapshot["batches"][run_id] = {
+                    "kind": "checkin",
+                    "run_id": run_id,
+                    "platform_id": identity.platform_id,
+                    "qq_id": identity.qq_id,
+                    "user_key": execution_queue.user_key(identity),
+                    "binding_key": execution_queue.binding_key(
+                        identity, self.base_task.task_id
+                    ),
+                    "task_id": self.base_task.task_id,
+                    "task_name": self.base_task.name,
+                    "task_version": self.base_task.version,
+                    "artifact_sha256": "4" * 64,
+                    "inputs_sha256": "5" * 64,
+                    "origin": f"origin:history:{index}",
+                    "queued_at": self.clock().isoformat(),
+                    "expires_at": (self.clock() + timedelta(minutes=15)).isoformat(),
+                    "source": "manual",
+                    "manual_requested": True,
+                    "scheduled_at": None,
+                    "batch_id": None,
+                    "sequence": index + 2,
+                    "status": "finished",
+                    "finished_at": self.clock().isoformat(),
+                    "result": dict(_RESULT),
+                }
+                snapshot["outbox"][run_id] = {
+                    "kind": "terminal_notification",
+                    "phase": "sent",
+                }
+
+        await self.store.mutate(fill_history)
+        before = self.store.snapshot()
+        before_batches = set(before["batches"])
+        before_outbox = set(before["outbox"])
+        reservation = copy.deepcopy(before["outbox"][active_run])
+        self.assertEqual(len(before_batches), execution_queue.MAX_BATCH_ITEMS)
+        self.assertEqual(len(before_outbox), notifications.MAX_OUTBOX_ITEMS)
+
+        merged = await self.enqueue(queue)
+        after = self.store.snapshot()
+        self.assertEqual(merged, active_run)
+        self.assertEqual(set(after["batches"]), before_batches)
+        self.assertEqual(set(after["outbox"]), before_outbox)
+        self.assertEqual(after["outbox"][active_run], reservation)
+        self.assertEqual(after["outbox"][active_run]["phase"], "reserved")
+        self.assertIs(after["batches"][active_run]["manual_requested"], True)
+
+    async def test_schedule_capacity_retains_unsettled_occurrence_then_prunes_when_settled(
+        self,
+    ):
+        failed_result = {
+            **_RESULT,
+            "exit_code": 1,
+            "business_status": "failed",
+        }
+
+        async def execute(item):
+            def finish_run(snapshot):
+                snapshot["runs"][item["run_id"]] = {
+                    "phase": "finished",
+                    "finished_at": self.clock().isoformat(),
+                    "cleanup_status": "cleaned",
+                    "cleanup_finished_at": self.clock().isoformat(),
+                    "business_attempted": True,
+                    **failed_result,
+                }
+
+            confirmed = await self.store.mutate(finish_run)
+            return confirmed["runs"][item["run_id"]]
+
+        queue = await self.make_queue(execute=execute)
+        first = await self.enqueue_scheduled(queue, scheduled_at=self.clock())
+        first_run = first["run_ids"][0]
+        await wait_until(lambda: self.batch(first_run)["status"] == "finished")
+        snapshot = self.store.snapshot()
+        occurrence_key = f"schedule:task_one:{self.clock().isoformat()}"
+        self.assertIn(occurrence_key, snapshot["dedupe"])
+        self.assertEqual(snapshot["outbox"][first_run]["phase"], "pending")
+
+        self.blocked = True
+        self.raw_config["history_retention_days"] = 0
+        task_two = replace(
+            self.base_task,
+            task_id="task_two",
+            name="Task Two",
+            version="6" * 64,
+        )
+        next_at = self.clock() + timedelta(minutes=1)
+        next_key = f"schedule:task_two:{next_at.isoformat()}"
+        original_limit = execution_queue.MAX_SCHEDULED_BATCHES
+        execution_queue.MAX_SCHEDULED_BATCHES = 1
+        try:
+            with self.assertRaises(execution_queue.QueueRejected) as raised:
+                await self.enqueue_scheduled(
+                    queue,
+                    task=task_two,
+                    scheduled_at=next_at,
+                    identities=[],
+                )
+            self.assertEqual(raised.exception.reason, "queue_capacity")
+            retained = self.store.snapshot()
+            self.assertIn(occurrence_key, retained["dedupe"])
+            self.assertNotIn(next_key, retained["dedupe"])
+            self.assertEqual(retained["outbox"][first_run]["phase"], "pending")
+
+            await self.store.mutate(
+                lambda current: current["outbox"][first_run].update(phase="sent")
+            )
+            admitted = await self.enqueue_scheduled(
+                queue,
+                task=task_two,
+                scheduled_at=next_at,
+                identities=[],
+            )
+        finally:
+            execution_queue.MAX_SCHEDULED_BATCHES = original_limit
+
+        self.assertEqual(admitted, {"status": "skipped_empty", "run_ids": []})
+        settled = self.store.snapshot()
+        self.assertNotIn(occurrence_key, settled["dedupe"])
+        self.assertIn(next_key, settled["dedupe"])
+        self.assertNotIn(first_run, settled["batches"])
+        self.assertNotIn(first_run, settled["outbox"])
 
     async def test_close_is_cancellation_safe_and_closed_waits_for_execute_exit(self):
         started = asyncio.Event()

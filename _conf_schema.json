@@ -3,7 +3,7 @@
     "description": "签到服务开关",
     "type": "bool",
     "default": false,
-    "hint": "关闭时仍可查看帮助，手动签到会被拒绝；开启后还需任务启用、已准备制品、Neo 连接和本人凭据。"
+    "hint": "关闭时不接受签到或自动触发；先配置任务、准备制品、录入凭据并启用 Neo，再开启服务。"
   },
   "plugin_admin_qqs": {
     "description": "插件附加管理员 QQ 列表",
@@ -33,7 +33,7 @@
     "description": "同一任务手动签到冷却秒数",
     "type": "int",
     "default": 300,
-    "hint": "按本人任务绑定计算；从上一次实际执行与清理完成时开始，0 表示不等待。"
+    "hint": "按本人任务绑定计算，从实际参与手动请求的执行与清理完成时开始；自动任务不受该冷却限制，0 表示不等待。"
   },
   "queue_expiry_seconds": {
     "description": "排队请求有效期秒数",
@@ -123,7 +123,7 @@
   "neo_connection": {
     "description": "独立 Neo 执行连接",
     "type": "object",
-    "hint": "手动签到需要启用并通过访问检查；不会启动或修改 Neo 部署。",
+    "hint": "手动与自动签到都需要启用并通过访问检查；不会启动或修改 Neo 部署。",
     "items": {
       "enabled": {
         "description": "启用 Neo 连接与启动清理",
@@ -164,7 +164,7 @@
   "tasks": {
     "description": "签到任务模板",
     "type": "template_list",
-    "hint": "Cron 目前只用于预览计划；手动签到使用已准备的固定天翼制品。",
+    "hint": "启用服务与任务后按 Cron 自动入队；手动与自动共用串行队列和已准备的固定天翼制品。",
     "templates": {
       "task": {
         "name": "签到任务",
@@ -186,7 +186,7 @@
             "description": "配置启用状态",
             "type": "bool",
             "default": false,
-            "hint": "启用后允许本人手动执行；Cron 不会自动触发签到。"
+            "hint": "启用任务并开启全局服务后按 Cron 自动入队，也允许本人手动执行；修改任务后需重新准备制品。"
           },
           "runtime": {
             "description": "脚本运行时",
