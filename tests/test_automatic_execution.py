@@ -2,6 +2,7 @@ import asyncio
 import copy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from astrbot_support import FakeEvent
@@ -18,6 +19,75 @@ class Clock:
 
     def advance(self, seconds):
         self.now += timedelta(seconds=seconds)
+
+
+class ColdStartSchedulerTests(ExecutionFixture):
+    host_platforms_ready = False
+
+    async def asyncSetUp(self):
+        self.clock = Clock()
+        scheduler = load_module("scheduler", "_manual_execution_tests")
+        queue = load_module("execution_queue", "_manual_execution_tests")
+        for module in (scheduler, queue):
+            patcher = mock.patch.object(module, "_utc_now", self.clock)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        await super().asyncSetUp()
+
+    async def test_cold_plan_is_unready_and_missed_minute_is_not_replayed(self):
+        identity = await self.bind()
+        state = self.main.BindingPlanState
+
+        views = self.plugin.scheduler.binding_plan_views(identity)
+        self.assertEqual([view.state for view in views], [state.UNREADY])
+        self.assertEqual(self.plugin.scheduler._plans, {})
+
+        self.clock.advance(10)
+        await self.plugin.scheduler.tick()
+        self.context.platforms.append(
+            SimpleNamespace(
+                meta=lambda: SimpleNamespace(id="bot-instance", name="aiocqhttp")
+            )
+        )
+        await self.plugin.scheduler.tick()
+        self.assertEqual(self.plugin.scheduler._plans, {})
+        self.assertEqual(self.snapshot()["batches"], {})
+
+        self.clock.advance(60)
+        await self.plugin.on_astrbot_loaded()
+        await self.plugin.scheduler.tick()
+
+        resumed = self.plugin.scheduler.binding_plan_views(identity)
+        self.assertEqual([view.state for view in resumed], [state.PLANNED])
+        self.assertGreater(
+            resumed[0].planned_at.astimezone(UTC), self.clock().astimezone(UTC)
+        )
+        self.assertEqual(self.snapshot()["batches"], {})
+
+    async def test_close_during_last_initialize_await_cannot_start_worker(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        scheduler = self.main.CronScheduler(
+            self.plugin.state_store,
+            self.plugin.queue,
+            lambda: self.config,
+            clock=self.clock,
+        )
+
+        async def gated_tick():
+            entered.set()
+            await release.wait()
+
+        scheduler.tick = gated_tick
+        initialization = asyncio.create_task(scheduler.initialize())
+        await asyncio.wait_for(entered.wait(), 1)
+        await scheduler.close()
+        release.set()
+        outcome = (await asyncio.gather(initialization, return_exceptions=True))[0]
+
+        self.assertIsInstance(outcome, self.main.ExecutionBlocked)
+        self.assertTrue(scheduler.closed)
+        self.assertIsNone(scheduler._worker)
 
 
 class AutomaticExecutionTests(ExecutionFixture):
