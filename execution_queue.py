@@ -1,4 +1,4 @@
-"""Durable FIFO admission and dispatch for manual check-in execution."""
+"""Durable FIFO admission and dispatch for manual and automatic check-ins."""
 
 from __future__ import annotations
 
@@ -24,10 +24,14 @@ from .task_config import TaskConfig
 MAX_ACTIVE_ITEMS = 256
 MAX_BATCH_ITEMS = 1000
 MAX_COOLDOWN_ITEMS = 2048
+MAX_SCHEDULED_BATCHES = 1000
+MAX_SCHEDULE_CURSORS = 256
 _POLL_SECONDS = 0.25
-_KIND = "manual_checkin"
-_COOLDOWN_KIND = "manual_queue_cooldown"
-_SPACING_KEY = "manual:global_spacing"
+_KIND = "checkin"
+_COOLDOWN_KIND = "checkin_cooldown"
+_SPACING_KEY = "checkin:global_spacing"
+_SCHEDULED_KIND = "scheduled_batch"
+_SCHEDULE_CURSOR_KIND = "schedule_cursor"
 _MISSING = object()
 _RESULT_KEYS = (
     "protocol",
@@ -39,7 +43,7 @@ _RESULT_KEYS = (
 )
 _HEX_32 = re.compile(r"[0-9a-f]{32}\Z")
 _HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
-_SETTLED_NOTICE_PHASES = frozenset({"sent", "failed", "unknown"})
+_SETTLED_NOTICE_PHASES = frozenset({"sent", "failed", "unknown", "suppressed"})
 
 
 class QueueReason(str, Enum):
@@ -87,6 +91,11 @@ class _DuplicateAdmission(Exception):
         self.run_id = run_id
 
 
+class _DuplicateOccurrence(Exception):
+    def __init__(self, run_ids: list[str]) -> None:
+        self.run_ids = run_ids
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -97,13 +106,13 @@ def _timestamp(value: datetime) -> str:
 
 def _parse_timestamp(value: object) -> datetime:
     if type(value) is not str:
-        raise ExecutionBlocked("manual execution timestamp is invalid")
+        raise ExecutionBlocked("check-in execution timestamp is invalid")
     try:
         parsed = datetime.fromisoformat(value)
     except (TypeError, ValueError):
-        raise ExecutionBlocked("manual execution timestamp is invalid") from None
+        raise ExecutionBlocked("check-in execution timestamp is invalid") from None
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ExecutionBlocked("manual execution timestamp is invalid")
+        raise ExecutionBlocked("check-in execution timestamp is invalid")
     return parsed.astimezone(UTC)
 
 
@@ -189,7 +198,19 @@ def _manual_cooldown_key(item: Mapping[str, object]) -> str:
 
 
 def _dedupe_key(item: Mapping[str, object]) -> str:
-    return "manual:" + str(item["binding_key"])
+    return "binding:" + str(item["binding_key"])
+
+
+def _schedule_key(task_id: str, scheduled_at: str) -> str:
+    return f"schedule:{task_id}:{scheduled_at}"
+
+
+def _schedule_cursor_key(task_id: str) -> str:
+    return f"schedule_cursor:{task_id}"
+
+
+def _has_manual_participation(item: Mapping[str, object]) -> bool:
+    return item.get("source") == "manual" or item.get("manual_requested") is True
 
 
 def _sample_interval(interval: IntervalConfig) -> int:
@@ -331,31 +352,63 @@ class ExecutionQueue:
 
         settings = self._settings()
         now = _utc_now()
-        owner = user_key(identity)
-        target_binding = binding_key(identity, task.task_id)
         run_id = uuid.uuid4().hex
-        queued_at = _timestamp(now)
-        expires_at = _timestamp(_add_seconds(now, settings.queue_expiry_seconds))
+        item = self._new_item(
+            identity=identity,
+            task=task,
+            origin=origin,
+            artifact_sha256=artifact_sha256,
+            inputs_sha256=inputs_sha256,
+            queued_at=_timestamp(now),
+            expires_at=_timestamp(_add_seconds(now, settings.queue_expiry_seconds)),
+            run_id=run_id,
+            source="manual",
+            manual_requested=True,
+            scheduled_at=None,
+            batch_id=None,
+        )
 
         def admit(snapshot: dict) -> None:
             self._validate_snapshot(snapshot)
-            self._prune(snapshot, settings, now, for_admission=True)
+            self._prune(
+                snapshot,
+                settings,
+                now,
+                for_admission=True,
+                batch_slots=0,
+            )
             active = self._active_items(snapshot)
+            pending_cooldowns = self._pending_cooldown_items(snapshot)
             for existing in active:
-                if existing["binding_key"] == target_binding:
-                    raise _DuplicateAdmission(existing["run_id"])
-            pending_cooldowns = [
-                item
-                for item in snapshot["batches"].values()
-                if type(item) is dict
-                and item.get("kind") == _KIND
-                and item.get("cooldown_pending") is True
-            ]
-            if any(item["binding_key"] == target_binding for item in pending_cooldowns):
+                if existing["binding_key"] != item["binding_key"]:
+                    continue
+                if existing["source"] == "automatic":
+                    existing["manual_requested"] = True
+                    existing["origin"] = origin
+                    self._ensure_cooldown_capacity(
+                        snapshot, (*active, *pending_cooldowns)
+                    )
+                    snapshot["dedupe"][_dedupe_key(existing)] = {
+                        "kind": _KIND,
+                        "run_id": existing["run_id"],
+                    }
+                    return
+                raise _DuplicateAdmission(existing["run_id"])
+            if any(
+                existing["binding_key"] == item["binding_key"]
+                for existing in pending_cooldowns
+            ):
                 raise QueueRejected(
                     QueueReason.EXECUTOR_UNAVAILABLE,
                     business_status="config_error",
                 )
+            self._prune(
+                snapshot,
+                settings,
+                now,
+                for_admission=True,
+                batch_slots=1,
+            )
             if (
                 len(active) >= MAX_ACTIVE_ITEMS
                 or len(snapshot["batches"]) >= MAX_BATCH_ITEMS
@@ -363,8 +416,7 @@ class ExecutionQueue:
             ):
                 raise QueueRejected(QueueReason.QUEUE_CAPACITY)
 
-            cooldown_key = "manual:" + target_binding
-            cooldown = snapshot["cooldowns"].get(cooldown_key)
+            cooldown = snapshot["cooldowns"].get(_manual_cooldown_key(item))
             if (
                 settings.manual_cooldown_seconds
                 and cooldown is not None
@@ -372,46 +424,11 @@ class ExecutionQueue:
             ):
                 raise QueueRejected(QueueReason.COOLDOWN_ACTIVE)
 
-            sequence = 1 + max(
-                (
-                    item.get("sequence", 0)
-                    for item in snapshot["batches"].values()
-                    if type(item) is dict and item.get("kind") == _KIND
-                ),
-                default=0,
+            item["sequence"] = self._next_sequence(snapshot)
+            self._validate_item(run_id, item)
+            self._ensure_cooldown_capacity(
+                snapshot, (*active, *pending_cooldowns, item)
             )
-            item = {
-                "kind": _KIND,
-                "run_id": run_id,
-                "platform_id": identity.platform_id,
-                "qq_id": identity.qq_id,
-                "user_key": owner,
-                "binding_key": target_binding,
-                "task_id": task.task_id,
-                "task_name": task.name,
-                "task_version": task.version,
-                "artifact_sha256": artifact_sha256,
-                "inputs_sha256": inputs_sha256,
-                "origin": origin,
-                "queued_at": queued_at,
-                "expires_at": expires_at,
-                "sequence": sequence,
-                "status": "queued",
-                "_reserve": _cooldown_reserve(
-                    {
-                        "binding_key": target_binding,
-                        "user_key": owner,
-                        "task_id": task.task_id,
-                    }
-                ),
-            }
-            needed_cooldowns = set(snapshot["cooldowns"])
-            for reserved_item in (*active, *pending_cooldowns):
-                needed_cooldowns.update(self._cooldown_keys(reserved_item))
-            needed_cooldowns.update(self._cooldown_keys(item))
-            if len(needed_cooldowns) > MAX_COOLDOWN_ITEMS:
-                raise QueueRejected(QueueReason.QUEUE_CAPACITY)
-
             snapshot["batches"][run_id] = item
             snapshot["dedupe"][_dedupe_key(item)] = {
                 "kind": _KIND,
@@ -426,11 +443,374 @@ class ExecutionQueue:
                 if not self._accepting or self._closed or not self.store.ready:
                     raise ExecutionBlocked("manual execution queue is unavailable")
                 await self._complete_pending_cooldowns(settings)
-                await self.store.mutate(admit)
+                confirmed = await self.store.mutate(admit)
         except _DuplicateAdmission as duplicate:
             return duplicate.run_id
         self.wake()
-        return run_id
+        active_item = confirmed["batches"].get(run_id)
+        if type(active_item) is dict:
+            return run_id
+        merged = next(
+            existing
+            for existing in self._active_items(confirmed)
+            if existing["binding_key"] == item["binding_key"]
+        )
+        return merged["run_id"]
+
+    async def enqueue_scheduled(
+        self,
+        *,
+        task: TaskConfig,
+        scheduled_at: datetime,
+        requests: list[dict],
+    ) -> dict[str, object]:
+        if not self._accepting or self._closed or not self.store.ready:
+            raise ExecutionBlocked("automatic execution queue is unavailable")
+        if (
+            not isinstance(task, TaskConfig)
+            or not isinstance(scheduled_at, datetime)
+            or scheduled_at.tzinfo is None
+            or scheduled_at.utcoffset() is None
+            or type(requests) is not list
+        ):
+            raise ExecutionBlocked("automatic execution request is invalid")
+
+        scheduled_text = _timestamp(scheduled_at)
+        occurrence_key = _schedule_key(task.task_id, scheduled_text)
+        batch_id = uuid.uuid4().hex
+        settings = self._settings()
+        now = _utc_now()
+        queued_at = _timestamp(now)
+        expires_at = _timestamp(_add_seconds(now, settings.queue_expiry_seconds))
+        candidates: list[dict] = []
+        seen_bindings: set[str] = set()
+        normalized_requests: list[tuple[Identity, str, str | None, str | None]] = []
+        for request in requests:
+            if type(request) is not dict:
+                raise ExecutionBlocked("automatic execution request is invalid")
+            identity = request.get("identity")
+            origin = request.get("origin")
+            artifact_sha256 = request.get("artifact_sha256")
+            inputs_sha256 = request.get("inputs_sha256")
+            if (
+                not isinstance(identity, Identity)
+                or type(identity.platform_id) is not str
+                or not identity.platform_id
+                or type(identity.qq_id) is not str
+                or not identity.qq_id
+                or type(origin) is not str
+                or not origin
+                or (
+                    artifact_sha256 is not None
+                    and (
+                        type(artifact_sha256) is not str
+                        or _HEX_64.fullmatch(artifact_sha256) is None
+                    )
+                )
+                or (
+                    inputs_sha256 is not None
+                    and (
+                        type(inputs_sha256) is not str
+                        or _HEX_64.fullmatch(inputs_sha256) is None
+                    )
+                )
+            ):
+                raise ExecutionBlocked("automatic execution request is invalid")
+            normalized_requests.append(
+                (identity, origin, artifact_sha256, inputs_sha256)
+            )
+        normalized_requests.sort(
+            key=lambda value: (value[0].platform_id, value[0].qq_id)
+        )
+        for identity, origin, artifact_sha256, inputs_sha256 in normalized_requests:
+            target_binding = binding_key(identity, task.task_id)
+            if target_binding in seen_bindings:
+                raise ExecutionBlocked("automatic execution request is invalid")
+            seen_bindings.add(target_binding)
+            candidate = self._new_item(
+                identity=identity,
+                task=task,
+                origin=origin,
+                artifact_sha256=artifact_sha256,
+                inputs_sha256=inputs_sha256,
+                queued_at=queued_at,
+                expires_at=expires_at,
+                run_id=uuid.uuid4().hex,
+                source="automatic",
+                manual_requested=False,
+                scheduled_at=scheduled_text,
+                batch_id=batch_id,
+            )
+            candidates.append(candidate)
+
+        def admit(snapshot: dict) -> None:
+            self._validate_snapshot(snapshot)
+            self._prune(
+                snapshot,
+                settings,
+                now,
+                for_admission=True,
+                batch_slots=0,
+                schedule_slots=1,
+            )
+            occurrence = snapshot["dedupe"].get(occurrence_key)
+            if occurrence is not None:
+                if (
+                    type(occurrence) is not dict
+                    or occurrence.get("kind") != _SCHEDULED_KIND
+                    or occurrence.get("task_id") != task.task_id
+                    or occurrence.get("scheduled_at") != scheduled_text
+                    or type(occurrence.get("run_ids")) is not list
+                    or any(type(run_id) is not str for run_id in occurrence["run_ids"])
+                ):
+                    raise ExecutionBlocked("automatic execution occurrence is invalid")
+                raise _DuplicateOccurrence(list(occurrence["run_ids"]))
+            cursor_key = _schedule_cursor_key(task.task_id)
+            cursor = snapshot["dedupe"].get(cursor_key)
+            if cursor is not None:
+                if (
+                    type(cursor) is not dict
+                    or cursor.get("kind") != _SCHEDULE_CURSOR_KIND
+                    or cursor.get("task_id") != task.task_id
+                ):
+                    raise ExecutionBlocked("automatic execution cursor is invalid")
+                if _parse_timestamp(
+                    cursor.get("scheduled_at")
+                ) >= scheduled_at.astimezone(UTC):
+                    raise _DuplicateOccurrence([])
+            elif self._schedule_cursor_count(snapshot) >= MAX_SCHEDULE_CURSORS:
+                raise QueueRejected(QueueReason.QUEUE_CAPACITY)
+            if (
+                sum(
+                    1
+                    for record in snapshot["dedupe"].values()
+                    if type(record) is dict and record.get("kind") == _SCHEDULED_KIND
+                )
+                >= MAX_SCHEDULED_BATCHES
+            ):
+                raise QueueRejected(QueueReason.QUEUE_CAPACITY)
+
+            unfinished = [
+                item
+                for item in snapshot["batches"].values()
+                if type(item) is dict
+                and item.get("kind") == _KIND
+                and item.get("task_id") == task.task_id
+                and self._item_is_unfinished(item)
+            ]
+            if unfinished:
+                self._record_occurrence(
+                    snapshot,
+                    occurrence_key=occurrence_key,
+                    task_id=task.task_id,
+                    scheduled_at=scheduled_text,
+                    status="skipped_overlap",
+                    run_ids=[],
+                )
+                return
+
+            eligible: list[dict] = []
+            for candidate in candidates:
+                try:
+                    self._guard_item(candidate, snapshot)
+                except QueueRejected as rejection:
+                    if rejection.reason in {
+                        QueueReason.PERMISSION_REVOKED.value,
+                        QueueReason.BINDING_MISSING.value,
+                        QueueReason.BINDING_PAUSED.value,
+                        QueueReason.ENROLLMENT_ACTIVE.value,
+                        QueueReason.INVALID_ORIGIN.value,
+                    }:
+                        continue
+                    if rejection.reason not in {
+                        QueueReason.EXECUTOR_UNAVAILABLE.value,
+                        QueueReason.ARTIFACT_CHANGED.value,
+                        QueueReason.CREDENTIALS_MISSING.value,
+                    }:
+                        raise
+                eligible.append(candidate)
+
+            if not eligible:
+                self._record_occurrence(
+                    snapshot,
+                    occurrence_key=occurrence_key,
+                    task_id=task.task_id,
+                    scheduled_at=scheduled_text,
+                    status="skipped_empty",
+                    run_ids=[],
+                )
+                return
+
+            self._prune(
+                snapshot,
+                settings,
+                now,
+                for_admission=True,
+                batch_slots=len(eligible),
+            )
+            active = self._active_items(snapshot)
+            pending_cooldowns = self._pending_cooldown_items(snapshot)
+            if (
+                len(active) + len(eligible) > MAX_ACTIVE_ITEMS
+                or len(snapshot["batches"]) + len(eligible) > MAX_BATCH_ITEMS
+                or len(snapshot["outbox"]) + len(eligible) > MAX_OUTBOX_ITEMS
+            ):
+                raise QueueRejected(QueueReason.QUEUE_CAPACITY)
+            sequence = self._next_sequence(snapshot)
+            for offset, candidate in enumerate(eligible):
+                candidate["sequence"] = sequence + offset
+                self._validate_item(candidate["run_id"], candidate)
+            self._ensure_cooldown_capacity(
+                snapshot, (*active, *pending_cooldowns, *eligible)
+            )
+            for candidate in eligible:
+                run_id = candidate["run_id"]
+                snapshot["batches"][run_id] = candidate
+                snapshot["dedupe"][_dedupe_key(candidate)] = {
+                    "kind": _KIND,
+                    "run_id": run_id,
+                }
+                result = _call_sync(self._reserve, snapshot, candidate)
+                if result is not None:
+                    raise ExecutionBlocked(
+                        "terminal reservation callback must return None"
+                    )
+            self._record_occurrence(
+                snapshot,
+                occurrence_key=occurrence_key,
+                task_id=task.task_id,
+                scheduled_at=scheduled_text,
+                status="admitted",
+                run_ids=[candidate["run_id"] for candidate in eligible],
+            )
+
+        try:
+            async with self._admission_lock:
+                if not self._accepting or self._closed or not self.store.ready:
+                    raise ExecutionBlocked("automatic execution queue is unavailable")
+                await self._complete_pending_cooldowns(settings)
+                confirmed = await self.store.mutate(admit)
+        except _DuplicateOccurrence as duplicate:
+            return {"status": "duplicate", "run_ids": duplicate.run_ids}
+        record = confirmed["dedupe"][occurrence_key]
+        if record["status"] == "admitted":
+            self.wake()
+        return {"status": record["status"], "run_ids": list(record["run_ids"])}
+
+    @staticmethod
+    def _new_item(
+        *,
+        identity: Identity,
+        task: TaskConfig,
+        origin: str,
+        artifact_sha256: str | None,
+        inputs_sha256: str | None,
+        queued_at: str,
+        expires_at: str,
+        run_id: str,
+        source: str,
+        manual_requested: bool,
+        scheduled_at: str | None,
+        batch_id: str | None,
+    ) -> dict:
+        owner = user_key(identity)
+        target_binding = binding_key(identity, task.task_id)
+        return {
+            "kind": _KIND,
+            "run_id": run_id,
+            "platform_id": identity.platform_id,
+            "qq_id": identity.qq_id,
+            "user_key": owner,
+            "binding_key": target_binding,
+            "task_id": task.task_id,
+            "task_name": task.name,
+            "task_version": task.version,
+            "artifact_sha256": artifact_sha256,
+            "inputs_sha256": inputs_sha256,
+            "origin": origin,
+            "queued_at": queued_at,
+            "expires_at": expires_at,
+            "source": source,
+            "manual_requested": manual_requested,
+            "scheduled_at": scheduled_at,
+            "batch_id": batch_id,
+            "status": "queued",
+            "_reserve": _cooldown_reserve(
+                {
+                    "binding_key": target_binding,
+                    "user_key": owner,
+                    "task_id": task.task_id,
+                }
+            ),
+        }
+
+    @staticmethod
+    def _next_sequence(snapshot: dict) -> int:
+        return 1 + max(
+            (
+                item.get("sequence", 0)
+                for item in snapshot["batches"].values()
+                if type(item) is dict and item.get("kind") == _KIND
+            ),
+            default=0,
+        )
+
+    @staticmethod
+    def _pending_cooldown_items(snapshot: dict) -> list[dict]:
+        return [
+            item
+            for item in snapshot["batches"].values()
+            if type(item) is dict
+            and item.get("kind") == _KIND
+            and item.get("cooldown_pending") is True
+        ]
+
+    def _ensure_cooldown_capacity(
+        self, snapshot: dict, items: tuple[dict, ...]
+    ) -> None:
+        needed = set(snapshot["cooldowns"])
+        for item in items:
+            needed.update(self._cooldown_keys(item))
+        if len(needed) > MAX_COOLDOWN_ITEMS:
+            raise QueueRejected(QueueReason.QUEUE_CAPACITY)
+
+    @staticmethod
+    def _item_is_unfinished(item: Mapping[str, object]) -> bool:
+        return (
+            item.get("status") in {"queued", "running"}
+            or item.get("cooldown_pending") is True
+        )
+
+    @staticmethod
+    def _schedule_cursor_count(snapshot: dict) -> int:
+        return sum(
+            1
+            for record in snapshot["dedupe"].values()
+            if type(record) is dict and record.get("kind") == _SCHEDULE_CURSOR_KIND
+        )
+
+    @staticmethod
+    def _record_occurrence(
+        snapshot: dict,
+        *,
+        occurrence_key: str,
+        task_id: str,
+        scheduled_at: str,
+        status: str,
+        run_ids: list[str],
+    ) -> None:
+        snapshot["dedupe"][occurrence_key] = {
+            "kind": _SCHEDULED_KIND,
+            "task_id": task_id,
+            "scheduled_at": scheduled_at,
+            "status": status,
+            "run_ids": list(run_ids),
+        }
+        snapshot["dedupe"][_schedule_cursor_key(task_id)] = {
+            "kind": _SCHEDULE_CURSOR_KIND,
+            "task_id": task_id,
+            "scheduled_at": scheduled_at,
+        }
 
     async def close(self) -> None:
         if self._close_task is None:
@@ -506,12 +886,14 @@ class ExecutionQueue:
             raise ExecutionBlocked("execution queue guard must return None")
 
     @staticmethod
-    def _cooldown_keys(item: Mapping[str, object]) -> tuple[str, str]:
-        return (_manual_cooldown_key(item), _SPACING_KEY)
+    def _cooldown_keys(item: Mapping[str, object]) -> tuple[str, ...]:
+        if _has_manual_participation(item):
+            return (_manual_cooldown_key(item), _SPACING_KEY)
+        return (_SPACING_KEY,)
 
     def _validate_snapshot(self, snapshot: object) -> None:
         if type(snapshot) is not dict:
-            raise ExecutionBlocked("manual execution state is invalid")
+            raise ExecutionBlocked("check-in execution state is invalid")
         active_bindings: set[str] = set()
         run_ids: set[str] = set()
         for key, item in snapshot["batches"].items():
@@ -519,12 +901,13 @@ class ExecutionQueue:
                 continue
             self._validate_item(key, item)
             if item["run_id"] in run_ids:
-                raise ExecutionBlocked("manual execution state is invalid")
+                raise ExecutionBlocked("check-in execution state is invalid")
             run_ids.add(item["run_id"])
             if item["status"] in {"queued", "running"}:
                 if item["binding_key"] in active_bindings:
-                    raise ExecutionBlocked("manual execution state is invalid")
+                    raise ExecutionBlocked("check-in execution state is invalid")
                 active_bindings.add(item["binding_key"])
+        self._validate_schedule_records(snapshot)
 
     @staticmethod
     def _validate_item(key: object, item: dict) -> None:
@@ -536,14 +919,17 @@ class ExecutionQueue:
             "task_id",
             "task_name",
             "task_version",
-            "artifact_sha256",
-            "inputs_sha256",
             "origin",
             "queued_at",
             "expires_at",
         )
         run_id = item.get("run_id")
         status = item.get("status")
+        source = item.get("source")
+        artifact_sha256 = item.get("artifact_sha256")
+        inputs_sha256 = item.get("inputs_sha256")
+        scheduled_at = item.get("scheduled_at")
+        batch_id = item.get("batch_id")
         if (
             type(key) is not str
             or type(run_id) is not str
@@ -555,13 +941,47 @@ class ExecutionQueue:
             or not item["task_id"]
             or not item["origin"]
             or _HEX_64.fullmatch(item["task_version"]) is None
-            or _HEX_64.fullmatch(item["artifact_sha256"]) is None
-            or _HEX_64.fullmatch(item["inputs_sha256"]) is None
+            or (
+                artifact_sha256 is not None
+                and (
+                    type(artifact_sha256) is not str
+                    or _HEX_64.fullmatch(artifact_sha256) is None
+                )
+            )
+            or (
+                inputs_sha256 is not None
+                and (
+                    type(inputs_sha256) is not str
+                    or _HEX_64.fullmatch(inputs_sha256) is None
+                )
+            )
             or type(item.get("sequence")) is not int
             or item["sequence"] < 1
             or status not in {"queued", "running", "finished"}
+            or source not in {"manual", "automatic"}
+            or type(item.get("manual_requested")) is not bool
         ):
-            raise ExecutionBlocked("manual execution state is invalid")
+            raise ExecutionBlocked("check-in execution state is invalid")
+        if source == "manual":
+            if (
+                item["manual_requested"] is not True
+                or scheduled_at is not None
+                or batch_id is not None
+                or artifact_sha256 is None
+                or inputs_sha256 is None
+            ):
+                raise ExecutionBlocked("check-in execution state is invalid")
+        elif (
+            type(scheduled_at) is not str
+            or type(batch_id) is not str
+            or _HEX_32.fullmatch(batch_id) is None
+        ):
+            raise ExecutionBlocked("check-in execution state is invalid")
+        else:
+            parsed_scheduled = _parse_timestamp(scheduled_at)
+            if _timestamp(parsed_scheduled) != scheduled_at:
+                raise ExecutionBlocked("check-in execution state is invalid")
+
         _parse_timestamp(item["queued_at"])
         _parse_timestamp(item["expires_at"])
         expected_user = user_key(Identity(item["platform_id"], item["qq_id"]))
@@ -569,24 +989,84 @@ class ExecutionQueue:
             Identity(item["platform_id"], item["qq_id"]), item["task_id"]
         )
         if item["user_key"] != expected_user or item["binding_key"] != expected_binding:
-            raise ExecutionBlocked("manual execution state is invalid")
+            raise ExecutionBlocked("check-in execution state is invalid")
         if status == "finished":
             _parse_timestamp(item.get("finished_at"))
             _normalize_result(item.get("result"))
         elif "finished_at" in item or "result" in item:
-            raise ExecutionBlocked("manual execution state is invalid")
+            raise ExecutionBlocked("check-in execution state is invalid")
         if "cooldown_pending" in item and (
             status != "finished"
             or item["cooldown_pending"] is not True
             or type(item.get("_cooldown_reserve")) is not str
         ):
-            raise ExecutionBlocked("manual execution state is invalid")
+            raise ExecutionBlocked("check-in execution state is invalid")
         if "_cooldown_reserve" in item and item.get("cooldown_pending") is not True:
-            raise ExecutionBlocked("manual execution state is invalid")
+            raise ExecutionBlocked("check-in execution state is invalid")
         if status in {"queued", "running"} and type(item.get("_reserve")) is not str:
-            raise ExecutionBlocked("manual execution state is invalid")
+            raise ExecutionBlocked("check-in execution state is invalid")
         if status == "finished" and "_reserve" in item:
-            raise ExecutionBlocked("manual execution state is invalid")
+            raise ExecutionBlocked("check-in execution state is invalid")
+
+    @staticmethod
+    def _validate_schedule_records(snapshot: dict) -> None:
+        occurrences: dict[str, datetime] = {}
+        cursors: dict[str, datetime] = {}
+        occurrence_count = 0
+        cursor_count = 0
+        for key, record in snapshot["dedupe"].items():
+            if type(record) is not dict:
+                continue
+            kind = record.get("kind")
+            if kind == _SCHEDULED_KIND:
+                occurrence_count += 1
+                task_id = record.get("task_id")
+                scheduled_at = record.get("scheduled_at")
+                run_ids = record.get("run_ids")
+                if (
+                    type(task_id) is not str
+                    or not task_id
+                    or type(scheduled_at) is not str
+                    or key != _schedule_key(task_id, scheduled_at)
+                    or record.get("status")
+                    not in {"admitted", "skipped_overlap", "skipped_empty"}
+                    or type(run_ids) is not list
+                    or any(
+                        type(run_id) is not str or _HEX_32.fullmatch(run_id) is None
+                        for run_id in run_ids
+                    )
+                    or len(set(run_ids)) != len(run_ids)
+                    or (record["status"] == "admitted") != bool(run_ids)
+                ):
+                    raise ExecutionBlocked("automatic execution occurrence is invalid")
+                parsed = _parse_timestamp(scheduled_at)
+                if _timestamp(parsed) != scheduled_at:
+                    raise ExecutionBlocked("automatic execution occurrence is invalid")
+                latest = occurrences.get(task_id)
+                occurrences[task_id] = parsed if latest is None else max(latest, parsed)
+            elif kind == _SCHEDULE_CURSOR_KIND:
+                cursor_count += 1
+                task_id = record.get("task_id")
+                scheduled_at = record.get("scheduled_at")
+                if (
+                    type(task_id) is not str
+                    or not task_id
+                    or type(scheduled_at) is not str
+                    or key != _schedule_cursor_key(task_id)
+                ):
+                    raise ExecutionBlocked("automatic execution cursor is invalid")
+                parsed = _parse_timestamp(scheduled_at)
+                if _timestamp(parsed) != scheduled_at:
+                    raise ExecutionBlocked("automatic execution cursor is invalid")
+                cursors[task_id] = parsed
+        if (
+            occurrence_count > MAX_SCHEDULED_BATCHES
+            or cursor_count > MAX_SCHEDULE_CURSORS
+        ):
+            raise ExecutionBlocked("automatic execution history capacity is invalid")
+        for task_id, latest in occurrences.items():
+            if task_id not in cursors or cursors[task_id] < latest:
+                raise ExecutionBlocked("automatic execution cursor is invalid")
 
     @staticmethod
     def _active_items(snapshot: dict) -> list[dict]:
@@ -721,6 +1201,57 @@ class ExecutionQueue:
             and run.get("cleanup_status") == "cleaned"
         )
 
+    def _prune_scheduled_occurrences(
+        self,
+        snapshot: dict,
+        settings: ExecutionConfig,
+        now: datetime,
+        *,
+        for_admission: bool,
+        schedule_slots: int,
+    ) -> bool:
+        cutoff = _add_days(now, -settings.history_retention_days)
+        records = sorted(
+            (
+                (key, record)
+                for key, record in snapshot["dedupe"].items()
+                if type(record) is dict and record.get("kind") == _SCHEDULED_KIND
+            ),
+            key=lambda entry: (_parse_timestamp(entry[1]["scheduled_at"]), entry[0]),
+        )
+        removable = [
+            (key, record)
+            for key, record in records
+            if all(
+                item is None
+                or (
+                    type(item) is dict
+                    and item.get("kind") == _KIND
+                    and self._settled_history(snapshot, item)
+                )
+                for run_id in record["run_ids"]
+                for item in (snapshot["batches"].get(run_id),)
+            )
+        ]
+        remove = [
+            (key, record)
+            for key, record in removable
+            if _parse_timestamp(record["scheduled_at"]) <= cutoff
+        ]
+        remaining_count = len(records) - len(remove)
+        if for_admission and remaining_count + schedule_slots > MAX_SCHEDULED_BATCHES:
+            already = {key for key, _ in remove}
+            for key, record in removable:
+                if key in already:
+                    continue
+                remove.append((key, record))
+                remaining_count -= 1
+                if remaining_count + schedule_slots <= MAX_SCHEDULED_BATCHES:
+                    break
+        for key, _ in remove:
+            snapshot["dedupe"].pop(key, None)
+        return bool(remove)
+
     def _prune(
         self,
         snapshot: dict,
@@ -728,8 +1259,20 @@ class ExecutionQueue:
         now: datetime,
         *,
         for_admission: bool,
+        batch_slots: int = 0,
+        schedule_slots: int = 0,
     ) -> bool:
         changed = self._prune_cooldowns(snapshot, now)
+        changed = (
+            self._prune_scheduled_occurrences(
+                snapshot,
+                settings,
+                now,
+                for_admission=for_admission,
+                schedule_slots=schedule_slots,
+            )
+            or changed
+        )
         cutoff = _add_days(now, -settings.history_retention_days)
         eligible = sorted(
             (
@@ -744,15 +1287,26 @@ class ExecutionQueue:
         remove = [
             item for item in eligible if _parse_timestamp(item["finished_at"]) <= cutoff
         ]
-        remaining_count = len(snapshot["batches"]) - len(remove)
-        if for_admission and remaining_count >= MAX_BATCH_ITEMS:
+        remaining_batches = len(snapshot["batches"]) - len(remove)
+        remaining_outbox = len(snapshot["outbox"]) - sum(
+            1 for item in remove if item["run_id"] in snapshot["outbox"]
+        )
+        if for_admission and (
+            remaining_batches + batch_slots > MAX_BATCH_ITEMS
+            or remaining_outbox + batch_slots > MAX_OUTBOX_ITEMS
+        ):
             already = {item["run_id"] for item in remove}
             for item in eligible:
                 if item["run_id"] in already:
                     continue
                 remove.append(item)
-                remaining_count -= 1
-                if remaining_count < MAX_BATCH_ITEMS:
+                remaining_batches -= 1
+                if item["run_id"] in snapshot["outbox"]:
+                    remaining_outbox -= 1
+                if (
+                    remaining_batches + batch_slots <= MAX_BATCH_ITEMS
+                    and remaining_outbox + batch_slots <= MAX_OUTBOX_ITEMS
+                ):
                     break
 
         for item in remove:
@@ -1304,17 +1858,18 @@ class ExecutionQueue:
         settings: ExecutionConfig,
         finished: datetime,
     ) -> None:
-        manual_key = _manual_cooldown_key(item)
-        if settings.manual_cooldown_seconds == 0:
-            snapshot["cooldowns"].pop(manual_key, None)
-        else:
-            snapshot["cooldowns"][manual_key] = {
-                "kind": _COOLDOWN_KIND,
-                "scope": "manual",
-                "expires_at": _timestamp(
-                    _add_seconds(finished, settings.manual_cooldown_seconds)
-                ),
-            }
+        if _has_manual_participation(item):
+            manual_key = _manual_cooldown_key(item)
+            if settings.manual_cooldown_seconds == 0:
+                snapshot["cooldowns"].pop(manual_key, None)
+            else:
+                snapshot["cooldowns"][manual_key] = {
+                    "kind": _COOLDOWN_KIND,
+                    "scope": "manual",
+                    "expires_at": _timestamp(
+                        _add_seconds(finished, settings.manual_cooldown_seconds)
+                    ),
+                }
         snapshot["cooldowns"][_SPACING_KEY] = {
             "kind": _COOLDOWN_KIND,
             "scope": "spacing",
@@ -1323,4 +1878,6 @@ class ExecutionQueue:
             "completed_at": _timestamp(finished),
         }
         if len(snapshot["cooldowns"]) > MAX_COOLDOWN_ITEMS:
-            raise ExecutionBlocked("manual execution cooldown capacity is unavailable")
+            raise ExecutionBlocked(
+                "check-in execution cooldown capacity is unavailable"
+            )

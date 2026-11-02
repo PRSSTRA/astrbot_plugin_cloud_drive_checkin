@@ -1,9 +1,9 @@
+import copy
 import json
 import math
 
-
 STATE_KEY = "checkin_state"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 
 _COLLECTION_FIELDS = (
@@ -109,14 +109,54 @@ def validate_snapshot(value, *, max_bytes=MAX_SNAPSHOT_BYTES) -> None:
 
 
 def upgrade_snapshot(value, *, max_bytes=MAX_SNAPSHOT_BYTES) -> dict:
-    """Validate and upgrade schema 1 without altering its business records."""
-    if (
-        type(value) is dict
-        and type(value.get("schema_version")) is int
-        and value["schema_version"] == 1
-    ):
+    """Migrate confirmed manual-only snapshots before the startup save barrier."""
+    if type(value) is not dict or type(value.get("schema_version")) is not int:
+        validate_snapshot(value, max_bytes=max_bytes)
+    version = value["schema_version"]
+    if version == 1:
         if value.keys() != _V1_SNAPSHOT_FIELDS:
             raise InvalidStateError("snapshot fields are invalid")
-        value = {**value, "schema_version": SCHEMA_VERSION, "prepared_artifacts": {}}
+        value = {**value, "schema_version": 2, "prepared_artifacts": {}}
+        version = 2
+    if version == 2:
+        # Validate JSON and collection shapes before traversing business records.
+        candidate = {**value, "schema_version": SCHEMA_VERSION}
+        validate_snapshot(candidate, max_bytes=max_bytes)
+        value = copy.deepcopy(candidate)
+        for item in value["batches"].values():
+            if type(item) is dict and item.get("kind") == "manual_checkin":
+                item.update(
+                    kind="checkin",
+                    source="manual",
+                    manual_requested=True,
+                    scheduled_at=None,
+                    batch_id=None,
+                )
+        for record in value["outbox"].values():
+            if (
+                type(record) is dict
+                and record.get("kind") == "manual_terminal_notification"
+            ):
+                record.update(
+                    kind="terminal_notification", source="manual", manual_requested=True
+                )
+        cooldowns = value["cooldowns"]
+        for key, record in tuple(cooldowns.items()):
+            if type(record) is dict and record.get("kind") == "manual_queue_cooldown":
+                record["kind"] = "checkin_cooldown"
+                if key == "manual:global_spacing":
+                    _move_record(cooldowns, key, "checkin:global_spacing")
+        indexes = value["dedupe"]
+        for key, record in tuple(indexes.items()):
+            if type(record) is dict and record.get("kind") == "manual_checkin":
+                record["kind"] = "checkin"
+                if key.startswith("manual:"):
+                    _move_record(indexes, key, "binding:" + key[len("manual:") :])
     validate_snapshot(value, max_bytes=max_bytes)
     return value
+
+
+def _move_record(records: dict, old: str, new: str) -> None:
+    if new in records:
+        raise InvalidStateError("snapshot migration index conflict")
+    records[new] = records.pop(old)

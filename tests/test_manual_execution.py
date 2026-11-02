@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -24,7 +25,7 @@ from test_artifact_service import MockPyPI, SyntheticArtifactRepository
 _FAKE_PASSWORD = 'FAKE quote" semicolon; spaces  \nsecond line'
 
 
-class ManualExecutionTests(unittest.IsolatedAsyncioTestCase):
+class ExecutionFixture(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
         cls.astrbot = patch_astrbot_modules()
@@ -110,6 +111,13 @@ class ManualExecutionTests(unittest.IsolatedAsyncioTestCase):
         )
         directory_patch.start()
         self.addCleanup(directory_patch.stop)
+        if not hasattr(self, "clock"):
+            scheduler = load_module("scheduler", "_manual_execution_tests")
+            clock_patch = mock.patch.object(
+                scheduler, "_utc_now", return_value=datetime(2026, 1, 1, tzinfo=UTC)
+            )
+            clock_patch.start()
+            self.addCleanup(clock_patch.stop)
         self.plugin = self.main.CloudDriveCheckin(self.context, self.config)
         self.plugin.plugin_id = "test/manual-execution"
         await self.plugin.initialize()
@@ -171,6 +179,8 @@ class ManualExecutionTests(unittest.IsolatedAsyncioTestCase):
         )
         return self.snapshot()["batches"][run_id]
 
+
+class ManualExecutionTests(ExecutionFixture):
     async def test_two_users_share_fifo_deduplicate_and_receive_isolated_terminals(
         self,
     ):
@@ -330,7 +340,7 @@ class ManualExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             (
                 "checkin/credentials.json" in self.bay.upload_paths,
-                "manual:global_spacing" in self.snapshot()["cooldowns"],
+                "checkin:global_spacing" in self.snapshot()["cooldowns"],
                 "manual:" + self.credentials.binding_key(identity, self.task.task_id)
                 in self.snapshot()["cooldowns"],
             ),

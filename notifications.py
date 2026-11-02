@@ -1,4 +1,4 @@
-"""Durable terminal-result notifications for manual check-in executions."""
+"""Durable terminal-result notifications for check-in executions."""
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
+from .credentials import CredentialError, binding_key, user_key
+from .permissions import Identity
 from .runners.bootstrap import validate_result
 from .storage import StateStore, StateUnavailableError
 
@@ -19,7 +21,7 @@ RETRY_DELAY_SECONDS = 5.0
 OUTBOX_RECHECK_SECONDS = 1.0
 SEND_TIMEOUT_SECONDS = 30.0
 
-_KIND = "manual_terminal_notification"
+_KIND = "terminal_notification"
 _RUN_ID = re.compile(r"[0-9a-f]{32}\Z")
 _TASK_ID = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _QUEUE_REASONS = frozenset(
@@ -94,6 +96,14 @@ _IDENTITY_FIELDS = (
     "task_id",
     "task_name",
 )
+_PARTICIPATION_FIELDS = ("source", "manual_requested")
+_TERMINAL_IDENTITY_FIELDS = (
+    "run_id",
+    "platform_id",
+    "qq_id",
+    "task_id",
+    "task_name",
+)
 
 
 class NotificationError(RuntimeError):
@@ -115,10 +125,19 @@ def _required_string(item: Mapping[str, Any], key: str) -> str:
     return value
 
 
+def _participation(item: Mapping[str, Any]) -> tuple[str, bool]:
+    source = item.get("source")
+    manual_requested = item.get("manual_requested")
+    if source not in {"manual", "automatic"} or type(manual_requested) is not bool:
+        raise NotificationReservationError("notification participation is invalid")
+    return source, manual_requested
+
+
 def _reservation(item: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(item, Mapping):
         raise NotificationReservationError("notification item is invalid")
     values = {key: _required_string(item, key) for key in _IDENTITY_FIELDS}
+    source, manual_requested = _participation(item)
     if _RUN_ID.fullmatch(values["run_id"]) is None:
         raise NotificationReservationError("notification run identifier is invalid")
     if _TASK_ID.fullmatch(values["task_id"]) is None:
@@ -127,6 +146,8 @@ def _reservation(item: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "kind": _KIND,
         **values,
+        "source": source,
+        "manual_requested": manual_requested,
         "phase": "reserved",
         "message": None,
         "result": None,
@@ -141,11 +162,23 @@ def _reservation(item: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _matches(record: object, expected: Mapping[str, Any]) -> bool:
+def _matches_reservation(record: object, expected: Mapping[str, Any]) -> bool:
     return (
         type(record) is dict
         and record.get("kind") == _KIND
-        and all(record.get(key) == expected.get(key) for key in _IDENTITY_FIELDS)
+        and all(
+            record.get(key) == expected.get(key)
+            for key in (*_IDENTITY_FIELDS, *_PARTICIPATION_FIELDS)
+        )
+    )
+
+
+def _matches_terminal(record: object, item: Mapping[str, Any]) -> bool:
+    return (
+        type(record) is dict
+        and record.get("kind") == _KIND
+        and all(record.get(key) == item.get(key) for key in _TERMINAL_IDENTITY_FIELDS)
+        and record.get("source") == item.get("source")
     )
 
 
@@ -175,7 +208,7 @@ def reserve_terminal(snapshot: dict[str, Any], item: Mapping[str, Any]) -> None:
     run_id = expected["run_id"]
     existing = outbox.get(run_id)
     if existing is not None:
-        if _matches(existing, expected):
+        if _matches_reservation(existing, expected):
             return
         raise NotificationReservationError("notification reservation conflicts")
 
@@ -263,9 +296,14 @@ def _render(record: Mapping[str, Any], result: Mapping[str, Any]) -> str:
         if queue_reason in _QUEUE_REASON_LABELS
         else _REASON_LABELS.get(result["reason_code"], "执行结果无法确认")
     )
+    participation = (
+        "手动"
+        if record.get("source") == "manual" or record.get("manual_requested") is True
+        else "自动"
+    )
     return "\n".join(
         (
-            "手动签到结果",
+            f"{participation}签到结果",
             f"任务：{record['task_name']}",
             f"运行 ID：{record['run_id']}",
             f"状态：{_STATUS_LABELS.get(result['business_status'], '结果未知')}",
@@ -273,6 +311,29 @@ def _render(record: Mapping[str, Any], result: Mapping[str, Any]) -> str:
             f"耗时：{result['duration_ms']} 毫秒",
             f"处理建议：{_guidance(result, record['task_id'])}",
         )
+    )
+
+
+def _current_notify_all(snapshot: Mapping[str, Any], item: Mapping[str, Any]) -> bool:
+    try:
+        identity = Identity(
+            _required_string(item, "platform_id"),
+            _required_string(item, "qq_id"),
+        )
+        task_id = _required_string(item, "task_id")
+        owner_key = user_key(identity)
+        target_key = binding_key(identity, task_id)
+    except (CredentialError, NotificationReservationError):
+        return False
+    if item.get("user_key") != owner_key or item.get("binding_key") != target_key:
+        return False
+    bindings = snapshot.get("bindings")
+    binding = bindings.get(target_key) if type(bindings) is dict else None
+    return (
+        type(binding) is dict
+        and binding.get("user_key") == owner_key
+        and binding.get("task_id") == task_id
+        and binding.get("notify_all") is True
     )
 
 
@@ -284,26 +345,37 @@ def enqueue_terminal(
     outbox = snapshot.get("outbox")
     if type(outbox) is not dict or not isinstance(item, Mapping):
         raise NotificationReservationError("notification reservation is unavailable")
+    source, manual_requested = _participation(item)
     run_id = item.get("run_id")
     record = outbox.get(run_id) if type(run_id) is str else None
-    if record is None or not _matches(record, item):
+    if record is None or not _matches_terminal(record, item):
         raise NotificationReservationError("notification reservation is unavailable")
     if record.get("phase") != "reserved":
         return
 
+    origin = _required_string(item, "origin")
     safe_result = _safe_result(result)
     finished_at = item.get("finished_at")
     if type(finished_at) is not str or not finished_at:
         finished_at = record["created_at"]
+    mandatory = source == "manual" or manual_requested
+    should_send = (
+        mandatory
+        or safe_result["business_status"] not in {"success", "already_signed"}
+        or _current_notify_all(snapshot, item)
+    )
     record.update(
-        phase="pending",
-        message=_render(record, safe_result),
+        origin=origin,
+        source=source,
+        manual_requested=manual_requested,
+        phase="pending" if should_send else "suppressed",
         result=safe_result,
         attempts=0,
-        next_attempt_at=0.0,
+        next_attempt_at=0.0 if should_send else None,
         retry_deadline_at=None,
         finished_at=finished_at,
     )
+    record["message"] = _render(record, safe_result)
     record.pop("_reserve", None)
 
 

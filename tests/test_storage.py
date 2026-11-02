@@ -50,7 +50,9 @@ class FakeKV:
         return copy.deepcopy(self.cache[key])
 
     async def put_kv_data(self, key, value):
-        control = self._write_controls.popleft() if self._write_controls else WriteControl()
+        control = (
+            self._write_controls.popleft() if self._write_controls else WriteControl()
+        )
         self.write_values.append(copy.deepcopy(value))
 
         # AstrBot's cache can retain the exact object before its writer finishes.
@@ -70,7 +72,16 @@ class StateStoreTests(unittest.IsolatedAsyncioTestCase):
         return kv, store
 
     def test_write_timeout_must_be_positive_and_finite(self):
-        for invalid in (0, -1, math.inf, -math.inf, math.nan, True, "1", "not-a-number"):
+        for invalid in (
+            0,
+            -1,
+            math.inf,
+            -math.inf,
+            math.nan,
+            True,
+            "1",
+            "not-a-number",
+        ):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(ValueError):
                     storage.StateStore(FakeKV(), write_timeout=invalid)
@@ -145,7 +156,7 @@ class StateStoreTests(unittest.IsolatedAsyncioTestCase):
         upgraded = await store.retry_pending()
         self.assertEqual(kv.write_values[0], kv.write_values[1])
         self.assertEqual(kv.persisted[state.STATE_KEY], upgraded)
-        self.assertEqual(upgraded["schema_version"], 2)
+        self.assertEqual(upgraded["schema_version"], state.SCHEMA_VERSION)
         self.assertEqual(upgraded["prepared_artifacts"], {})
         for field in initial.keys() - {"schema_version"}:
             self.assertEqual(upgraded[field], initial[field])
@@ -272,7 +283,9 @@ class StateStoreTests(unittest.IsolatedAsyncioTestCase):
         snapshot["users"].clear()
         self.assertTrue(store.snapshot()["users"]["42"]["enabled"])
 
-    async def test_callback_references_and_host_cache_cannot_mutate_internal_state(self):
+    async def test_callback_references_and_host_cache_cannot_mutate_internal_state(
+        self,
+    ):
         kv, store = await self.make_initialized_store()
         external = {"roles": []}
         retained = {}
@@ -314,7 +327,9 @@ class StateStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.snapshot(), baseline)
 
         with self.assertRaises(state.InvalidStateError):
-            await store.mutate(lambda candidate: candidate["users"].update({"42": object()}))
+            await store.mutate(
+                lambda candidate: candidate["users"].update({"42": object()})
+            )
         self.assertFalse(store.has_pending)
         self.assertEqual(store.snapshot(), baseline)
 
@@ -330,7 +345,9 @@ class StateStoreTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(field=field, value=value):
                 with self.assertRaises(state.InvalidStateError):
-                    await store.mutate(lambda candidate: candidate.__setitem__(field, value))
+                    await store.mutate(
+                        lambda candidate: candidate.__setitem__(field, value)
+                    )
                 self.assertFalse(store.has_pending)
                 self.assertEqual(store.snapshot()["revision"], 0)
 
@@ -385,7 +402,9 @@ class StateStoreTests(unittest.IsolatedAsyncioTestCase):
 
         committed = await store.retry_pending()
 
-        self.assertEqual(kv.write_values[-3:], [pending_value, pending_value, pending_value])
+        self.assertEqual(
+            kv.write_values[-3:], [pending_value, pending_value, pending_value]
+        )
         self.assertEqual(committed, pending_value)
         self.assertEqual(committed["revision"], 1)
         self.assertEqual(kv.get_calls, 1)
@@ -609,7 +628,9 @@ class StateStoreTests(unittest.IsolatedAsyncioTestCase):
             await store.retry_pending()
 
         await store.close()
-        self.assertEqual(kv.write_values[-3:], [pending_value, pending_value, pending_value])
+        self.assertEqual(
+            kv.write_values[-3:], [pending_value, pending_value, pending_value]
+        )
         self.assertTrue(store.closed)
         self.assertFalse(store.has_pending)
 
@@ -636,7 +657,9 @@ class StateStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(store.has_pending)
 
         await store.close()
-        self.assertEqual(kv.write_values[-3:], [pending_value, pending_value, pending_value])
+        self.assertEqual(
+            kv.write_values[-3:], [pending_value, pending_value, pending_value]
+        )
         self.assertTrue(store.closed)
         self.assertFalse(store.has_pending)
 

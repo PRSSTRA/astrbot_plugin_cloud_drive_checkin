@@ -18,21 +18,22 @@ python3 -m venv .venv
 
 ## 代码结构
 
-- `main.py`：Star 生命周期、指令入口、帮助、任务查询、本人状态回复、手动签到入口和管理员准备入口。
+- `main.py`：Star 生命周期、指令入口、帮助、任务查询、本人状态回复、手动签到入口、调度器生命周期和管理员准备入口。
 - `permissions.py`：私聊事件校验、身份提取和权限判定。
 - `config.py`：权限配置的解析和 QQ 号规范化。
 - `task_config.py`：任务目录校验、Cron 计算和配置版本。
 - `enrollment.py`：5 分钟私聊录入会话、原始文本读取、超时和待录入意图。
 - `credentials.py`：主密钥读取、认证加密、绑定键和凭据原子保存。
 - `bindings.py`：本人绑定偏好更新、删除确认指纹和绑定与凭据的原子删除。
-- `state.py`：快照结构和 JSON 校验。
+- `state.py`：快照结构、JSON 校验和 schema 迁移。
 - `storage.py`：基于 Star 异步 KV 的事务写入。
 - `executors/client.py`：完整来源的 Neo 连接解析、异步 REST、鉴权检查和有界响应。
 - `executors/neo.py`：持久化执行意图、串行执行、资源归属检查、清理阻断与恢复。
-- `execution_config.py`：解析手动签到的冷却、排队有效期、保留天数和执行间隔。
-- `execution_queue.py`：持久化手动签到 FIFO 队列、去重、冷却、间隔、权限复核和终态记录。
-- `execution_bridge.py`：把手动请求绑定到最新凭据、已准备制品和 Neo 执行器。
-- `notifications.py`：终态通知 outbox、有界重试和投递状态。
+- `execution_config.py`：解析签到冷却、排队有效期、保留天数和执行间隔。
+- `execution_queue.py`：持久化手动与自动签到 FIFO 队列、计划去重、冷却、间隔、权限复核和终态记录。
+- `scheduler.py`：未来计划的 Cron 观察与准入，只调用队列，不执行脚本或读取凭据。
+- `execution_bridge.py`：把队列请求绑定到最新凭据、已准备制品和 Neo 执行器，并生成本人状态摘要。
+- `notifications.py`：终态通知 outbox、按来源和偏好决定发送、有界重试和投递状态。
 - `preparation.py`：从本地源码、许可和锁定 wheel 离线构建天翼 zipapp，校验输入与制品。
 - `artifact_service.py`：下载锁定 wheel、校验缓存、构建制品，并把准备记录写入 KV。
 - `scripts/prepare-tianyi.py`：使用本地 wheelhouse 生成制品的开发命令。
@@ -47,11 +48,11 @@ python3 -m venv .venv
 
 `state.py` 定义快照格式，`storage.py` 通过 `get_kv_data` 和 `put_kv_data` 操作唯一业务键 `checkin_state`。插件不创建数据库或状态文件。
 
-快照包含 `schema_version`、`revision`，以及 `users`、`bindings`、`credentials`、`batches`、`runs`、`outbox`、`cleanup_jobs`、`cooldowns`、`dedupe`、`prepared_artifacts` 集合。当前 schema 版本为 2；读取版本 1 时补充空的 `prepared_artifacts` 后迁移，原有记录保持不变。迁移结果要作为完整快照重新保存并确认后才能使用。未知版本、结构损坏或超限都会报错，不会重置或裁剪记录。默认序列化上限为 8 MiB。
+快照包含 `schema_version`、`revision`，以及 `users`、`bindings`、`credentials`、`batches`、`runs`、`outbox`、`cleanup_jobs`、`cooldowns`、`dedupe`、`prepared_artifacts` 集合。当前 schema 版本为 3。读取版本 1 时补充空的 `prepared_artifacts`；读取版本 2 时把旧手动批次、通知、冷却和索引改为 `checkin`、`terminal_notification`、`checkin_cooldown` 和 `checkin` 索引，旧批次补 `source="manual"`、`manual_requested=true`、空的 `scheduled_at` 和 `batch_id`，旧通知按手动来源处理。迁移保留原有业务记录，结果作为完整快照重新保存并确认后才能使用。未知版本、结构损坏或超限都会报错，不会重置或裁剪记录。默认序列化上限为 8 MiB。
 
 `prepared_artifacts[task_id]` 保存 `task_version`、`source_commit`、`source_sha256`、`sha256`、`size` 和 `inputs_sha256`，不保存脚本字节、凭据或制品文件。制品文件按内容摘要存放在插件数据目录；state 层只校验快照结构，不读取或重建文件。
 
-集合内业务记录由对应业务操作定义。手动签到使用现有 `batches`、`runs`、`outbox`、`cooldowns` 和 `dedupe` 集合，不新增快照版本。状态层不执行入队、历史保留策略或凭据加密；调用方不得写入明文凭据。`metadata.yaml` 的 author 和 name 决定框架 KV 命名空间，开始保存业务数据后必须保持稳定。
+集合内业务记录由对应业务操作定义。签到使用现有 `batches`、`runs`、`outbox`、`cooldowns` 和 `dedupe` 集合；自动计划在 `dedupe` 中保存 `scheduled_batch` 与 `schedule_cursor` 记录，不新增业务集合或快照版本。状态层不执行入队、历史保留策略或凭据加密；调用方不得写入明文凭据。`metadata.yaml` 的 author 和 name 决定框架 KV 命名空间，开始保存业务数据后必须保持稳定。
 
 插件通过 `state_store` 暴露以下接口：
 
@@ -70,33 +71,56 @@ python3 -m venv .venv
 
 ## 内部执行接口
 
-`NeoExecutor.execute(PreparedExecution(...), guard=..., run_id=None)` 接收已经准备好的脚本字节、SHA256、固定来源 commit、任务版本、身份和本次环境变量。调用方负责脚本来源及依赖制品验收，并在同步 `guard(snapshot)` 中重新检查权限和版本；拒绝时抛异常，放行时返回 `None`。传入 `run_id` 时执行器使用该稳定编号；省略时保持原有每次调用生成 UUID 的行为。执行器本身不下载脚本、不安装依赖、不提供 shell 聊天入口。天翼离线制品及其单账号结果入口、管理员准备指令和持久制品缓存已接入；手动签到通过队列使用同一执行器，Cron 自动触发尚未接入。
+`NeoExecutor.execute(PreparedExecution(...), guard=..., run_id=None)` 接收已经准备好的脚本字节、SHA256、固定来源 commit、任务版本、身份和本次环境变量。调用方负责脚本来源及依赖制品验收，并在同步 `guard(snapshot)` 中重新检查权限和版本；拒绝时抛异常，放行时返回 `None`。传入 `run_id` 时执行器使用该稳定编号；省略时保持原有每次调用生成 UUID 的行为。执行器本身不下载脚本、不安装依赖、不提供 shell 聊天入口。天翼离线制品及其单账号结果入口、管理员准备指令和持久制品缓存已接入；手动和自动签到通过同一队列使用同一执行器。
 
-执行器在 `checkin_state.runs` 和 `cleanup_jobs` 中记录 `kind=neo_execution` 的状态。先持久化 `phase=admitted` 表示尚未尝试分配，再单独确认 `phase=creating` 的创建意图，之后才能调用 Neo；创建和执行意图的写入返回后均再次同步检查授权。恢复时仅对结构合法、没有资源 ID 的 `admitted` 记录确定取消并解除阻断；`creating` 或之后的阶段不能凭缺少 ID 推断未创建。这样，即使无分配证明的终态写入被另一笔未确认提交阻挡，精确重试后仍可从持久化阶段恢复。每个运行预留 8 KiB 的快照空间用于资源 ID 和终态，最多保留 1000 个运行条目，容量不足拒绝新增；手动签到的已结算批次会连同同 run_id 的已结束运行和 outbox 按 `history_retention_days` 裁剪，独立 Neo 运行只受 1000 条上限约束。记录不保存脚本内容、环境变量或原始输出。
+执行器在 `checkin_state.runs` 和 `cleanup_jobs` 中记录 `kind=neo_execution` 的状态。先持久化 `phase=admitted` 表示尚未尝试分配，再单独确认 `phase=creating` 的创建意图，之后才能调用 Neo；创建和执行意图的写入返回后均再次同步检查授权。恢复时仅对结构合法、没有资源 ID 的 `admitted` 记录确定取消并解除阻断；`creating` 或之后的阶段不能凭缺少 ID 推断未创建。这样，即使无分配证明的终态写入被另一笔未确认提交阻挡，精确重试后仍可从持久化阶段恢复。每个运行预留 8 KiB 的快照空间用于资源 ID 和终态，最多保留 1000 个运行条目，容量不足拒绝新增；签到已结算批次会连同同 run_id 的已结束运行和 outbox 按 `history_retention_days` 裁剪，独立 Neo 运行只受 1000 条上限约束。记录不保存脚本内容、环境变量或原始输出。
 
-脚本只在独立 Sandbox 中执行。固定命令先建立执行用户拥有的 0700 目录和 0600 文件，再经文件 API 覆写；Ship 的上传实现使用 `wb`，保留已有文件的 owner/mode。wrapper 读出凭据后立即解除文件链接，校验脚本 hash，以 `shell=False` 和独立进程组启动 Python 或 Node。stdout 有界收集，stderr 只排空；两者均不透传到 Bay。子进程退出后也清理其残留进程组，Linux 下使用 subreaper 回收已脱离直接父进程的后代。上传 `credentials.json` 前重新检查存储就绪并运行捕获的凭据 guard，暂停绑定或替换凭据后的旧请求不会继续进入业务阶段。
+脚本只在独立 Sandbox 中执行。固定命令先建立执行用户拥有的 0700 目录和 0600 文件，再经文件 API 覆写；Ship 的上传实现使用 `wb`，保留已有文件的 owner/mode。wrapper 读出凭据后立即解除文件链接，校验脚本 hash，以 `shell=False` 和独立进程组启动 Python 或 Node。stdout 有界收集，stderr 只排空；两者均不透传到 Bay。子进程退出后也清理其残留进程组，Linux 下使用 subreaper 回收已脱离直接父进程的后代。上传 `credentials.json` 前重新检查存储就绪并运行捕获的凭据 guard，暂停绑定或替换凭据后的旧请求不会继续进入业务阶段。手动和自动签到都通过同一队列进入该执行器，自动准入本身不加载脚本、不读取凭据。
 
 `json_protocol` 只接受完整 JSON 对象中已知的 `status`；自由文本原因和其他字段不会返回。退出码与业务状态分别保存，`process_only` 或无有效证据均为 `unknown`。安全信封包含 `protocol/process_status/exit_code/business_status/reason_code/duration_ms`，字段和范围由 `validate_result` 验证。业务请求可能已经发出后的本地取消记为 `interrupted/unknown`，不把取消 HTTP 等待或成功清理资源当作业务未发生的证据；未发送请求或取得明确 wrapper 取消信封时才能记录确定取消。
 
-终止插件时先停止队列 worker 和已接受的执行，等待 Neo 执行与清理停止，再对账 `running` 批次并排空当前到期的终态通知；未过期 queued 保留，不依赖下一次重载才发送终态。旧执行器未退出时新实例不能接管写者。待确认 KV 写入期间只重试原快照，恢复后继续处理清理记录，不另写快照覆盖待确认值。清理不能确认时保留记录，不放行新执行。
+终止插件时先关闭调度器，停止队列 worker 和已接受的执行，等待 Neo 执行与清理停止，再对账 `running` 批次并排空当前到期的终态通知；未过期 queued 保留，不依赖下一次重载才发送终态。启动时调度器在队列初始化完成后创建，关闭时先于队列停止。旧执行器未退出时新实例不能接管写者。待确认 KV 写入期间只重试原快照，恢复后继续处理清理记录，不另写快照覆盖待确认值。清理不能确认时保留记录，不放行新执行。
 
-### 手动签到队列
+### 签到队列
 
-`ExecutionQueue` 接收状态存储、执行回调、同步 `guard`、配置读取、阻断判定、终态回调和通知预留回调。`enqueue(...)` 持久化 `batches[run_id]` 后返回 run_id；同一用户同一任务在排队或运行期间重复提交时返回原 run_id。批次只保存身份键、任务 ID 与版本、制品摘要、来源会话、排队和过期时间、序号及终态，不保存凭据、密文、事件对象或脚本字节。
+`ExecutionQueue` 接收状态存储、执行回调、同步 `guard`、配置读取、阻断判定、终态回调和通知预留回调。`enqueue(...)` 是手动入口，持久化 `batches[run_id]` 后返回 run_id。批次保存身份键、任务 ID 与版本、制品摘要、来源会话、排队和过期时间、序号、来源、是否手动参与、计划时间、批次 ID 及终态，不保存凭据、密文、事件对象或脚本字节。手动批次来源为 `manual`、`manual_requested=true`；自动批次来源为 `automatic`，同一计划共享一个 `batch_id`。
 
-队列是单 worker FIFO，同一时间只执行一个签到。`MAX_ACTIVE_ITEMS=256`、`MAX_BATCH_ITEMS=1000`；入队时预留终态和通知容量，达到上限时拒绝新请求，不为新记录删除活动记录。手动冷却按用户和任务绑定分别记录；用户间隔和任务间隔不分别计时，队列只保留一条最近全局执行与清理完成记录。只有 Neo 运行的 `business_attempted` 为真时才写入冷却并推进全局记录；未发送业务请求的取消或失败不产生间隔。下一条切换任务时使用 `task_interval` 且不叠加 `user_interval`；任务不变但用户变化时使用 `user_interval`；同一用户同一任务只受手动冷却限制。跳过、取消或未执行的请求不改变这条全局记录。排队超过 `queue_expiry_seconds` 时记为取消。
+同一用户同一任务已有活动手动批次时，重复手动提交返回原 run_id。若活动批次是自动批次，手动提交在同一原子修改中把该批次标记为 `manual_requested=true`，采用本次合法来源会话，保留原 run_id，并保证最终只产生一条手动终态通知。
+
+`enqueue_scheduled(task=..., scheduled_at=..., requests=[...])` 是自动入口。每个请求包含身份、来源会话和可空的制品摘要；队列校验后按平台和 QQ 身份稳定排序，并拒绝同一绑定的重复请求。整个计划在一次 `StateStore.mutate` 中完成：
+
+1. 校验并清理过期记录，检查计划去重、游标、批次与通知容量。
+2. 以 `schedule:<task_id>:<UTC ISO>` 作为计划键；已存在相同计划时返回 `duplicate` 和记录的 run_ids。`schedule_cursor:<task_id>` 保存任务水位，阻止已清理的旧计划重放。
+3. 同一任务存在 `queued`、`running` 或 `cooldown_pending` 的批次时，记录 `skipped_overlap` 并返回，不创建请求。`finished` 且仅等待通知发送的批次不阻断下一次计划，但其记录继续保留，直到通知结算后才能清理。
+4. 逐个运行同步 `guard`。权限撤销、绑定缺失或暂停、录入向导中、来源无效的用户本次跳过；执行器不可用、制品变化或凭据缺失仍纳入队列，由 worker 以配置错误正常结算；其他拒绝中止整个触发。
+5. 没有可用用户时记录 `skipped_empty` 并返回。
+6. 为所有可用用户预留终态和通知槽位，按连续序号写入批次，最后记录 `admitted` 及 run_ids。返回 `admitted`、`skipped_overlap`、`skipped_empty` 或 `duplicate`。
+
+计划记录上限为 1000，任务游标上限为 256；清理只移除已结算、没有活动 run 且没有未结算通知关联的计划，游标保留最近水位。自动准入不检查手动冷却，自动和手动实际执行都会更新同一条全局执行间隔。自动用户与手动请求共用单 worker FIFO，没有优先级插入或独立 worker。
+
+队列是单 worker FIFO，同一时间只执行一个签到。`MAX_ACTIVE_ITEMS=256`、`MAX_BATCH_ITEMS=1000`、`MAX_OUTBOX_ITEMS=1000`；入队时预留终态和通知容量，达到上限时拒绝新请求，不为新记录删除活动记录。手动冷却按用户和任务绑定分别记录，只对来源为手动或已标记手动参与的批次写入；用户间隔和任务间隔不分别计时，队列只保留一条最近全局执行与清理完成记录。只有 Neo 运行的 `business_attempted` 为真时才推进全局记录，手动冷却仅在手动参与时写入；未发送业务请求的取消或失败不产生间隔。下一条切换任务时使用 `task_interval` 且不叠加 `user_interval`；任务不变但用户变化时使用 `user_interval`；同一用户同一任务的手动请求还受手动冷却限制。跳过、取消或未执行的请求不改变这条全局记录。排队超过 `queue_expiry_seconds` 时记为取消。
 
 队列在 Neo 恢复后启动恢复：保留未过期排队记录，过期记录转为取消；已经开始或结果不明的记录不重放，使用已确认的 Neo 结果或 `interrupted/unknown`。待确认 KV 写入期间停止新工作，保留记录，按原快照重试后再恢复。`guard` 在入队、业务请求前和执行期间复查权限、任务版本、制品摘要、绑定暂停/删除状态及是否在录入向导中；取消后先完成资源清理，再处理下一条。
 
 执行回调加载已准备制品，解密最新已确认凭据，生成 `TY_ACCOUNTS`，并以同一 run_id 调用 `NeoExecutor.execute`。凭据明文不写入批次记录，也不进入日志。
 
+### 自动调度
+
+`CronScheduler` 只读取状态存储、队列、配置回调和时钟。初始化时先执行一次 tick，建立每个启用任务的未来计划基线，再启动单 worker 循环；默认每 1 秒检查一次。tick 在存储未就绪时清空计划并返回，不补跑；全局 `enabled` 关闭时清空计划，重新打开后从新的未来计划开始。
+
+任务配置版本变化、任务重新启用或时钟回拨时，计划重新建立。运行中只准入落在当前分钟的计划；已经错过的旧计划丢弃，不排空积压。每个到期计划从快照收集未暂停、不在录入向导中的绑定，按平台和 QQ 排序后交给 `enqueue_scheduled(...)`，不加载脚本、不读取明文凭据。
+
+到期任务准入或入队时的已分类错误只记录在该任务下，其他到期任务继续；`parse_task_catalog` 整体配置无效会使 tick 失败并暂停调度；未预期内部错误会退出定时 worker。状态存储不可用时清空计划并暂停，恢复后重新建立未来基线。scheduler 的 `last_error` 由 `/签到 我的` 和 `/签到 状态` 输出提示；配置修复后或重载插件后从后续计划继续，内部错误导致的 worker 退出需要重载恢复。关闭时取消 worker，必须先于队列关闭。
+
 ### 终态通知
 
-`notifications.enqueue_terminal(snapshot, item, result)` 与终态批次在同一修改函数中创建 `outbox[run_id]`，只记录安全文本、身份、来源和固定结果字段。手动签到无论成功、失败还是取消都会创建通知。入队时可通过通知预留回调创建不发送的 `phase=reserved` 占位记录，终态时填入同一记录。
+`notifications.enqueue_terminal(snapshot, item, result)` 与终态批次在同一修改函数中填充 `outbox[run_id]`，记录安全文本、身份、来源、是否手动参与和固定结果字段。所有被准入的用户在入队时通过 `reserve_terminal(snapshot, item)` 创建 `phase=reserved` 占位；终态时填入同一记录。
 
-`MAX_OUTBOX_ITEMS` 为 1000；`terminal_capacity(snapshot)` 供队列在入队时检查槽位，`reserve_terminal(snapshot, item)` 创建占位。
+发送判断在终态保存 outbox 时进行：来源为 `manual` 或 `manual_requested=true` 时必发；否则业务状态不是 `success`、`already_signed` 时发送；否则读取当时的本人绑定 `notify_all`，为真时发送。保存后、发送前修改偏好不会重算已保存通知。成功自动结果不发送时使用 `phase=suppressed`，不进入发送队列，也不重试；该记录视为已结算，可按历史保留策略清理。手动加入自动批次后，通知按手动参与渲染并强制发送。绑定在终态保存前被删除时按仅失败处理。
 
-`NotificationService(store, send)` 在外部发送前先持久化 `phase=sending`：`send` 返回 `True` 记为 `sent`，返回 `False` 记为 `pending` 并在上限内重试，重试用尽后记为 `failed`，异常或取消记为 `unknown`，不盲目重发。默认最多 3 次尝试，重试窗口 30 秒。KV 写入失败时停止发送，但不重跑签到。通知发送失败不改变批次中的业务终态，`/签到 状态` 仍可查询。
+`MAX_OUTBOX_ITEMS` 为 1000；`terminal_capacity(snapshot)` 供队列在入队时检查槽位。
+
+`NotificationService(store, send)` 在外部发送前先持久化 `phase=sending`：`send` 返回 `True` 记为 `sent`，返回 `False` 记为 `pending` 并在上限内重试，重试用尽后记为 `failed`，异常或取消记为 `unknown`，不盲目重发。默认最多 3 次尝试，重试窗口 30 秒。KV 写入失败时停止发送，但不重跑签到。通知发送失败不改变批次中的业务终态，`/签到 状态` 仍可查询，抑制状态显示为“按偏好静默”。
 
 ### 接口依据与许可
 
@@ -161,7 +185,7 @@ CLI 拒绝覆盖已有输出，成功后只打印包含 `source_commit`、`sourc
 
 PR 的“离线测试”任务分别在 Python 3.12、3.13、3.14 上安装宿主 `requirements.txt`，显式安装 Node 22，并运行 `unittest discover -s tests -p 'test_*.py' -v`；“天翼脚本离线测试”在相同 Python 矩阵的独立虚拟环境中校验脚本依赖哈希并运行脚本测试。既有必需检查“提交信息规范”等待两组矩阵，仅在全部成功后校验提交历史；任一失败、取消或跳过都不能通过，无需修改现有必需检查名称。普通 PR CI 不连接真实 QQ、Neo 或云盘服务。
 
-执行层回归位于 `tests/test_neo_client.py`、`tests/test_neo_executor.py`、`tests/test_neo_lifecycle.py` 和 `tests/test_bootstrap.py`。制品构建与准备服务回归位于 `tests/test_preparation.py` 和 `tests/test_artifact_service.py`；管理员准备指令位于 `tests/test_admin_preparation.py`，schema 迁移与写入确认位于 `tests/test_state.py`、`tests/test_storage.py`。手动签到队列、恢复和容量位于 `tests/test_execution_queue.py`，终态通知位于 `tests/test_notifications.py`，聊天入口和集成位于 `tests/test_manual_execution.py`。`tests/neo_support.py` 是受控 Bay 替身，会在临时目录运行本仓库 wrapper 与假脚本；这不是产品的宿主回退路径。本地未安装 Node 时对应测试会明确跳过；CI 显式安装并检查 Node，不依赖 runner 预装。macOS 测试只将 Node 的可执行路径映射到本机安装位置，实际运行 Node 子进程。
+执行层回归位于 `tests/test_neo_client.py`、`tests/test_neo_executor.py`、`tests/test_neo_lifecycle.py` 和 `tests/test_bootstrap.py`。制品构建与准备服务回归位于 `tests/test_preparation.py` 和 `tests/test_artifact_service.py`；管理员准备指令位于 `tests/test_admin_preparation.py`，schema 迁移与写入确认位于 `tests/test_state.py`、`tests/test_storage.py`。签到队列、恢复和容量位于 `tests/test_execution_queue.py`，自动计划准入、去重和生命周期位于 `tests/test_automatic_execution.py`，终态通知位于 `tests/test_notifications.py`，聊天入口和集成位于 `tests/test_manual_execution.py`。`tests/neo_support.py` 是受控 Bay 替身，会在临时目录运行本仓库 wrapper 与假脚本；这不是产品的宿主回退路径。本地未安装 Node 时对应测试会明确跳过；CI 显式安装并检查 Node，不依赖 runner 预装。macOS 测试只将 Node 的可执行路径映射到本机安装位置，实际运行 Node 子进程。
 
 离线 smoke 通过真实 loopback HTTP 连接受控 Bay，覆盖两用户隔离、非零退出码的显式业务结果、超时、清理阻断及恢复不重跑。真实 Neo 假凭据测试与真实账号测试分别记录如下。
 
@@ -172,6 +196,15 @@ PR 的“离线测试”任务分别在 Python 3.12、3.13、3.14 上安装宿�
 - 未连接真实 QQ、生产 Neo 或云盘账号。
 - 单测另覆盖排队后凭据更新、暂停和撤权、KV 写入失败不分配、通知异常不重跑、终止和重载不重跑；随机、固定和零间隔，由最近全局完成记录驱动的任务和用户间隔及不叠加，排队过期，历史保留和配额由队列回归覆盖。
 - 新增回归在修复前复现失败、修复后通过：暂停、替换凭据和未确认暂停均不产生凭据上传或业务请求；未发送业务请求时不写入冷却或全局间隔；终止时无需重载即可发送终态。
+
+### 自动签到本地验收
+
+- Python 3.14 下全量 420 项测试通过，耗时 18.639 秒；包含三个审查缺陷的失败前/修复后回归，以及 11:01 不补跑边界。本轮源码和执行相关测试通过 Ruff 检查。旧 `tests/test_state.py`、`tests/test_storage.py` 的既有严格风格告警未做无关格式重写，不声明全仓 Ruff 全绿。
+- 独立 smoke 使用实际调度器和队列入口，经真实 loopback HTTP 连接受控 FakeBay，运行实际 wrapper 和假天翼制品：68 次 HTTP 请求，1 个定时批次，4 个用户业务执行，最大并发 1。业务结果依次为 `success`、`success`、`failed`、`already_signed`，通知状态依次为 `sent`、`suppressed`、`sent`、`sent`。
+- 同轮覆盖：第一个自动 run 被手动请求合并并复用 run_id，强制反馈；第二个默认成功静默；第三个失败发送通知；第四个在 `notify_all` 开启后已签到仍发送。两个平台来源分别投递，未串用。
+- 全量测试另覆盖同任务重叠跳过、准入提交屏障、到期分钟内重载不补跑、事件循环延迟后只准入当前命中分钟、错过分钟不补跑、关闭后重开从未来计划开始、暂停和撤权过滤、缺少制品以 `config_error` 结束、时钟回拨不重放、时区日和星期 OR 及周日 `7`、schema 2 升级后仅未开始的手动请求继续执行。
+- Sandbox、Cargo、宿主物理目录和 `cleanup_jobs` 均为 0；假凭据 canary 未出现在快照、Bay 历史或回执中。
+- 该 smoke 的 Bay 是受控替身，不是真实 Neo 部署；未连接真实 QQ 或云盘账号。
 
 ### 制品准备本地验收
 

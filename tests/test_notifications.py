@@ -14,12 +14,10 @@ storage = load_module("storage", "_notification_tests")
 
 def _item(run_id="a" * 32, **changes):
     item = {
-        "kind": "manual_checkin",
+        "kind": "checkin",
         "run_id": run_id,
         "platform_id": "qq",
         "qq_id": "10001",
-        "user_key": "qq:10001",
-        "binding_key": "qq:10001:tianyi_cloud",
         "task_id": "tianyi_cloud",
         "task_name": "天翼云盘（配置显示名）",
         "task_version": "1" * 64,
@@ -30,9 +28,33 @@ def _item(run_id="a" * 32, **changes):
         "expires_at": "2026-01-02T03:19:05+00:00",
         "sequence": 1,
         "status": "queued",
+        "source": "manual",
+        "manual_requested": True,
+        "scheduled_at": None,
+        "batch_id": None,
     }
     item.update(changes)
+    if "user_key" not in changes:
+        item["user_key"] = json.dumps(
+            [item["platform_id"], item["qq_id"]], separators=(",", ":")
+        )
+    if "binding_key" not in changes:
+        item["binding_key"] = json.dumps(
+            [item["platform_id"], item["qq_id"], item["task_id"]],
+            separators=(",", ":"),
+        )
     return item
+
+
+def _automatic(run_id="a" * 32, **changes):
+    return _item(
+        run_id,
+        source="automatic",
+        manual_requested=False,
+        scheduled_at="2026-01-02T03:00:00+00:00",
+        batch_id="b" * 32,
+        **changes,
+    )
 
 
 def _result(**changes):
@@ -46,6 +68,39 @@ def _result(**changes):
     }
     result.update(changes)
     return result
+
+
+def _status_result(status):
+    if status == "timeout":
+        return _result(
+            process_status="timeout",
+            exit_code=None,
+            business_status=status,
+            reason_code="timeout",
+        )
+    if status == "cancelled":
+        return _result(
+            process_status="cancelled",
+            exit_code=None,
+            business_status=status,
+            reason_code="cancelled",
+        )
+    if status == "config_error":
+        return _result(
+            process_status="start_error",
+            exit_code=None,
+            business_status=status,
+            reason_code="runner_error",
+        )
+    return _result(business_status=status)
+
+
+def _set_binding(snapshot, item, *, notify_all, user_key=None):
+    snapshot["bindings"][item["binding_key"]] = {
+        "user_key": item["user_key"] if user_key is None else user_key,
+        "task_id": item["task_id"],
+        "notify_all": notify_all,
+    }
 
 
 class NotificationReservationTests(unittest.TestCase):
@@ -73,6 +128,9 @@ class NotificationReservationTests(unittest.TestCase):
 
         record = snapshot["outbox"][item["run_id"]]
         self.assertEqual(record["phase"], "pending")
+        self.assertEqual(record["source"], "manual")
+        self.assertIs(record["manual_requested"], True)
+        self.assertTrue(record["message"].startswith("手动签到结果\n"))
         self.assertNotIn("_reserve", record)
         self.assertEqual(
             record["result"],
@@ -149,7 +207,7 @@ class NotificationReservationTests(unittest.TestCase):
         snapshot = state.new_snapshot()
         snapshot["outbox"] = {
             f"{index:032x}": {
-                "kind": "manual_terminal_notification",
+                "kind": "terminal_notification",
                 "phase": "sent",
             }
             for index in range(notifications.MAX_OUTBOX_ITEMS)
@@ -165,6 +223,108 @@ class NotificationReservationTests(unittest.TestCase):
         self.assertTrue(notifications.terminal_capacity(snapshot))
         notifications.reserve_terminal(snapshot, _item("f" * 32))
         self.assertEqual(len(snapshot["outbox"]), notifications.MAX_OUTBOX_ITEMS)
+
+    def test_automatic_success_uses_preference_at_terminal_snapshot(self):
+        snapshot = state.new_snapshot()
+        enabled = _automatic("1" * 32)
+        _set_binding(snapshot, enabled, notify_all=False)
+        notifications.reserve_terminal(snapshot, enabled)
+        snapshot["bindings"][enabled["binding_key"]]["notify_all"] = True
+
+        notifications.enqueue_terminal(snapshot, enabled, _result())
+
+        enabled_notice = snapshot["outbox"][enabled["run_id"]]
+        self.assertEqual(enabled_notice["phase"], "pending")
+        self.assertTrue(enabled_notice["message"].startswith("自动签到结果\n"))
+
+        disabled = _automatic("2" * 32)
+        notifications.reserve_terminal(snapshot, disabled)
+        snapshot["bindings"][disabled["binding_key"]]["notify_all"] = False
+
+        notifications.enqueue_terminal(snapshot, disabled, _result())
+
+        disabled_notice = snapshot["outbox"][disabled["run_id"]]
+        self.assertEqual(disabled_notice["phase"], "suppressed")
+        self.assertEqual(disabled_notice["result"], _result())
+        self.assertNotIn("_reserve", disabled_notice)
+        self.assertIsNone(disabled_notice["next_attempt_at"])
+
+    def test_manual_merge_updates_destination_participation_and_is_mandatory(self):
+        snapshot = state.new_snapshot()
+        automatic = _automatic()
+        notifications.reserve_terminal(snapshot, automatic)
+        merged = {
+            **automatic,
+            "origin": "qq:friend:current-origin",
+            "manual_requested": True,
+            "status": "finished",
+            "finished_at": "2026-01-02T03:04:07+00:00",
+        }
+
+        notifications.enqueue_terminal(snapshot, merged, _result())
+
+        notice = snapshot["outbox"][automatic["run_id"]]
+        self.assertEqual(notice["phase"], "pending")
+        self.assertEqual(notice["source"], "automatic")
+        self.assertIs(notice["manual_requested"], True)
+        self.assertEqual(notice["origin"], "qq:friend:current-origin")
+        self.assertTrue(notice["message"].startswith("手动签到结果\n"))
+
+    def test_manual_source_is_mandatory_without_manual_requested_flag(self):
+        snapshot = state.new_snapshot()
+        item = _item("9" * 32, manual_requested=False)
+        notifications.reserve_terminal(snapshot, item)
+
+        notifications.enqueue_terminal(snapshot, item, _status_result("already_signed"))
+
+        notice = snapshot["outbox"][item["run_id"]]
+        self.assertEqual(notice["phase"], "pending")
+        self.assertTrue(notice["message"].startswith("手动签到结果\n"))
+
+    def test_deleted_or_cross_owner_binding_falls_back_to_default_suppression(self):
+        for index, binding_change in enumerate(("deleted", "cross_owner"), start=3):
+            with self.subTest(binding_change=binding_change):
+                snapshot = state.new_snapshot()
+                item = _automatic(f"{index:032x}")
+                _set_binding(snapshot, item, notify_all=True)
+                notifications.reserve_terminal(snapshot, item)
+                if binding_change == "deleted":
+                    del snapshot["bindings"][item["binding_key"]]
+                else:
+                    snapshot["bindings"][item["binding_key"]]["user_key"] = (
+                        '["qq","someone-else"]'
+                    )
+
+                notifications.enqueue_terminal(snapshot, item, _result())
+
+                self.assertEqual(
+                    snapshot["outbox"][item["run_id"]]["phase"], "suppressed"
+                )
+
+    def test_automatic_policy_covers_every_terminal_business_status(self):
+        expected = {
+            "success": "suppressed",
+            "already_signed": "suppressed",
+            "failed": "pending",
+            "needs_auth": "pending",
+            "unknown": "pending",
+            "cancelled": "pending",
+            "timeout": "pending",
+            "config_error": "pending",
+        }
+        for index, (status, phase) in enumerate(expected.items(), start=10):
+            with self.subTest(status=status):
+                snapshot = state.new_snapshot()
+                item = _automatic(f"{index:032x}")
+                result = _status_result(status)
+                notifications.reserve_terminal(snapshot, item)
+
+                notifications.enqueue_terminal(snapshot, item, result)
+
+                notice = snapshot["outbox"][item["run_id"]]
+                self.assertEqual(notice["phase"], phase)
+                self.assertEqual(notice["result"], result)
+                self.assertNotIn("_reserve", notice)
 
 
 class ControlledKV:
@@ -478,6 +638,28 @@ class NotificationServiceTests(unittest.IsolatedAsyncioTestCase):
             self.store.snapshot()["outbox"][item["run_id"]]["phase"],
             "reserved",
         )
+
+    async def test_suppressed_notice_is_never_claimed_or_retried(self):
+        item = await self._terminal(item=_automatic())
+        before = self.store.snapshot()["outbox"][item["run_id"]]
+        self.assertEqual(before["phase"], "suppressed")
+        self.assertEqual(before["attempts"], 0)
+        self.assertEqual(before["result"], _result())
+        self.assertNotIn("_reserve", before)
+        service, sender = self._service([])
+
+        await service.initialize()
+        service.wake()
+        await asyncio.sleep(0)
+        self.clock.advance(100)
+        service.wake()
+        await asyncio.sleep(0)
+        await service.close()
+
+        after = self.store.snapshot()["outbox"][item["run_id"]]
+        self.assertEqual(after["phase"], "suppressed")
+        self.assertEqual(after["attempts"], 0)
+        self.assertEqual(sender.calls, [])
 
     async def test_unconfirmed_sending_intent_freezes_without_external_send(self):
         await self._terminal()
