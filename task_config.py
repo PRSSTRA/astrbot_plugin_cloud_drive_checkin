@@ -34,6 +34,12 @@ class UserField:
 
 
 @dataclass(frozen=True)
+class DependencyBundle:
+    url: str
+    sha256: str
+
+
+@dataclass(frozen=True)
 class TaskConfig:
     task_id: str
     name: str
@@ -112,6 +118,11 @@ _MOBILE_TASK_ID = "mobile_cloud_experimental"
 _MISSING = object()
 _SCHEMA_PATH = Path(__file__).with_name("_conf_schema.json")
 _USER_FIELDS_JSON_MAX_BYTES = 64 * 1024
+_DEPENDENCY_BUNDLE_JSON_MAX_BYTES = 4096
+_MAX_ENV_FIELDS = 64
+_MAX_ENV_FIELD_BYTES = 16 * 1024
+_MAX_ENV_TOTAL_BYTES = 64 * 1024
+
 _USER_FIELDS_JSON_MAX_DEPTH = 32
 _CRON_ERRORS = (
     CroniterBadCronError,
@@ -168,7 +179,11 @@ def _normalize_timezone(value: object) -> tuple[str, ZoneInfo]:
 
 
 def _normalize_env_name(value: object) -> str:
-    if not isinstance(value, str) or _ENV_NAME.fullmatch(value) is None:
+    if (
+        not isinstance(value, str)
+        or _ENV_NAME.fullmatch(value) is None
+        or len(value.encode("ascii")) > _MAX_ENV_FIELD_BYTES
+    ):
         raise PluginConfigError("task environment name is invalid")
     normalized = value.upper()
     if normalized in _RESERVED_ENV_NAMES or normalized.startswith(
@@ -275,6 +290,91 @@ def _normalize_sha256(value: object) -> str:
     if not isinstance(value, str) or _HEX_64.fullmatch(value) is None:
         raise PluginConfigError("task script digest is invalid")
     return value.lower()
+
+
+def _dependency_url_commit(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        raise PluginConfigError("task dependency bundle is invalid") from None
+    segments = parsed.path.split("/")
+    hostname = parsed.hostname.lower() if parsed.hostname is not None else ""
+    if hostname == "github.com" and len(segments) >= 5:
+        candidate = segments[4]
+    elif hostname == "raw.githubusercontent.com" and len(segments) >= 4:
+        candidate = segments[3]
+    else:
+        raise PluginConfigError("task dependency bundle is invalid")
+    if _HEX_40.fullmatch(candidate) is None:
+        raise PluginConfigError("task dependency bundle is invalid")
+    return candidate
+
+
+def _reject_dependency_pairs(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, item in pairs:
+        if key in result:
+            raise ValueError
+        result[key] = item
+    return result
+
+
+def dependency_bundle_reference(value: str) -> DependencyBundle | None:
+    """Parse one canonical dependency declaration; ``none`` is dependency-free."""
+
+    if value == "none":
+        return None
+    if not isinstance(value, str) or not value:
+        raise PluginConfigError("task dependency bundle is invalid")
+    try:
+        encoded = value.encode("utf-8")
+        if len(encoded) > _DEPENDENCY_BUNDLE_JSON_MAX_BYTES:
+            raise ValueError
+        declaration = json.loads(
+            value,
+            object_pairs_hook=_reject_dependency_pairs,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeError, ValueError, RecursionError, json.JSONDecodeError):
+        raise PluginConfigError("task dependency bundle is invalid") from None
+    if not isinstance(declaration, dict) or set(declaration) != {
+        "format",
+        "url",
+        "sha256",
+    }:
+        raise PluginConfigError("task dependency bundle is invalid")
+    if declaration.get("format") != "zip-v1":
+        raise PluginConfigError("task dependency bundle is invalid")
+    raw_url = declaration.get("url")
+    raw_sha256 = declaration.get("sha256")
+    if not isinstance(raw_url, str):
+        raise PluginConfigError("task dependency bundle is invalid")
+    try:
+        normalized_url, _commit = _normalize_source(
+            raw_url, _dependency_url_commit(raw_url)
+        )
+        normalized_sha256 = _normalize_sha256(raw_sha256)
+    except PluginConfigError:
+        raise PluginConfigError("task dependency bundle is invalid") from None
+    return DependencyBundle(url=normalized_url, sha256=normalized_sha256)
+
+
+def _normalize_dependency_bundle(value: object) -> str:
+    if not isinstance(value, str):
+        raise PluginConfigError("task dependency bundle is invalid")
+    if value == "":
+        return value
+    reference = dependency_bundle_reference(value)
+    if reference is None:
+        return "none"
+    return json.dumps(
+        {"format": "zip-v1", "url": reference.url, "sha256": reference.sha256},
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _cron_integer(value: str) -> int:
@@ -523,17 +623,46 @@ def _parse_user_fields(value: object) -> tuple[UserField, ...]:
 def _parse_fixed_env(value: object) -> tuple[tuple[str, str], ...]:
     if not isinstance(value, Mapping):
         raise PluginConfigError("task fixed environment must be a mapping")
+    if len(value) > _MAX_ENV_FIELDS:
+        raise PluginConfigError("task has too many environment fields")
     normalized: dict[str, str] = {}
     seen_names: set[str] = set()
+    total_bytes = 0
     for raw_name, raw_value in value.items():
         name = _normalize_env_name(raw_name)
         if name.upper() in seen_names:
             raise PluginConfigError("task fixed environment name is duplicated")
         seen_names.add(name.upper())
-        if not isinstance(raw_value, str):
+        if not isinstance(raw_value, str) or "\0" in raw_value:
             raise PluginConfigError("task fixed environment values must be strings")
+        try:
+            encoded_value = raw_value.encode("utf-8")
+        except UnicodeEncodeError:
+            raise PluginConfigError(
+                "task fixed environment values are invalid"
+            ) from None
+        if len(encoded_value) > _MAX_ENV_FIELD_BYTES:
+            raise PluginConfigError("task fixed environment value is too large")
+        total_bytes += len(encoded_value)
+        if total_bytes > _MAX_ENV_TOTAL_BYTES:
+            raise PluginConfigError("task fixed environment is too large")
         normalized[name] = raw_value
     return tuple(sorted(normalized.items()))
+
+
+def _validate_environment_declaration(
+    user_fields: Sequence[UserField], fixed_env: Sequence[tuple[str, str]]
+) -> None:
+    if len(user_fields) + len(fixed_env) > _MAX_ENV_FIELDS:
+        raise PluginConfigError("task has too many environment fields")
+    fixed_bytes = sum(len(value.encode("utf-8")) for _, value in fixed_env)
+    minimum_required_bytes = sum(
+        {"string": 1, "int": 1, "bool": 4}[field.value_type]
+        for field in user_fields
+        if field.required
+    )
+    if fixed_bytes + minimum_required_bytes > _MAX_ENV_TOTAL_BYTES:
+        raise PluginConfigError("task environment values exceed the size limit")
 
 
 def _validate_adapter_contract(
@@ -543,18 +672,26 @@ def _validate_adapter_contract(
     runtime: str,
     input_adapter: str,
     result_adapter: str,
+    dependency_bundle: str,
     user_fields: Sequence[UserField],
     experimental: bool,
 ) -> None:
     if input_adapter == "direct_env":
-        if result_adapter not in {"json_protocol", "process_only"}:
+        if (
+            result_adapter not in {"json_protocol", "process_only"}
+            or not dependency_bundle
+        ):
             raise PluginConfigError("task adapter combination is invalid")
     elif input_adapter == "tianyi_account":
-        if runtime != "python" or result_adapter != "tianyi":
+        if runtime != "python" or result_adapter != "tianyi" or dependency_bundle != "":
             raise PluginConfigError("task adapter combination is invalid")
         _require_credential_fields(user_fields, ("username", "password"))
     elif input_adapter == "mobile_single_account":
-        if runtime != "node" or result_adapter != "mobile_unverified":
+        if (
+            runtime != "node"
+            or result_adapter != "mobile_unverified"
+            or dependency_bundle != ""
+        ):
             raise PluginConfigError("task adapter combination is invalid")
         _require_credential_fields(
             user_fields, ("authorization", "phone", "auth_token")
@@ -677,6 +814,7 @@ def _parse_task(
     user_env_names = {field.env_name.upper() for field in user_fields}
     if user_env_names.intersection(name.upper() for name, _ in fixed_env):
         raise PluginConfigError("task user and fixed environment names overlap")
+    _validate_environment_declaration(user_fields, fixed_env)
 
     input_adapter = _string(_required(raw_task, "input_adapter"))
     if input_adapter not in _ALLOWED_INPUT_ADAPTERS:
@@ -684,7 +822,9 @@ def _parse_task(
     result_adapter = _string(_required(raw_task, "result_adapter"))
     if result_adapter not in _ALLOWED_RESULT_ADAPTERS:
         raise PluginConfigError("task result adapter is invalid")
-    dependency_bundle = _string(raw_task.get("dependency_bundle", ""), allow_empty=True)
+    dependency_bundle = _normalize_dependency_bundle(
+        raw_task.get("dependency_bundle", "")
+    )
     raw_timeout = raw_task.get("timeout_seconds", 0)
     if isinstance(raw_timeout, bool) or not isinstance(raw_timeout, int):
         raise PluginConfigError("task timeout is invalid")
@@ -699,6 +839,7 @@ def _parse_task(
         runtime=runtime,
         input_adapter=input_adapter,
         result_adapter=result_adapter,
+        dependency_bundle=dependency_bundle,
         user_fields=user_fields,
         experimental=experimental,
     )

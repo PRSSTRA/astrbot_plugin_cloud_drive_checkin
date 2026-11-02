@@ -35,7 +35,7 @@ _RESULT_KEYS = (
 _PREPARE = """python3 -c 'import os,stat
 os.umask(0o077)
 os.mkdir("checkin",0o700)
-for name in ("bootstrap.py","job.json","credentials.json","script.py","script.js"):
+for name in ("bootstrap.py","job.json","credentials.json","script.py","script.js","artifact.zip"):
  fd=os.open("checkin/"+name,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
  os.close(fd)
 print("ready")'"""
@@ -58,6 +58,7 @@ class PreparedExecution:
     runtime: str
     script: bytes = field(repr=False)
     environment: Mapping[str, str] = field(repr=False)
+    artifact_format: str = "script"
     result_adapter: str = "json_protocol"
     timeout_seconds: int = 180
 
@@ -98,6 +99,7 @@ def _payload(request: PreparedExecution) -> tuple[bytes, bytes]:
         or not 0 < len(request.script) <= 1024 * 1024
         or hashlib.sha256(request.script).hexdigest() != request.sha256
         or request.runtime not in {"python", "node"}
+        or request.artifact_format not in {"script", "bundle"}
         or request.result_adapter not in {"json_protocol", "process_only"}
         or type(request.timeout_seconds) is not int
         or not 1 <= request.timeout_seconds <= 240
@@ -120,6 +122,7 @@ def _payload(request: PreparedExecution) -> tuple[bytes, bytes]:
             "sha256": request.sha256,
             "timeout_seconds": request.timeout_seconds,
             "result_adapter": request.result_adapter,
+            "artifact_format": request.artifact_format,
         }
     ).encode("utf-8")
     return job, credentials
@@ -362,11 +365,14 @@ class NeoExecutor:
                     await self.client.upload(
                         sandbox_id, "checkin/job.json", job_payload
                     )
-                    script_name = (
-                        "script.py" if request.runtime == "python" else "script.js"
-                    )
+                    if request.artifact_format == "bundle":
+                        artifact_name = "artifact.zip"
+                    else:
+                        artifact_name = (
+                            "script.py" if request.runtime == "python" else "script.js"
+                        )
                     await self.client.upload(
-                        sandbox_id, "checkin/" + script_name, request.script
+                        sandbox_id, "checkin/" + artifact_name, request.script
                     )
                     self._authorize_confirmed(guard)
                     await self.client.upload(

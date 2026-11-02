@@ -155,7 +155,7 @@ class ExecutionQueueTests(unittest.IsolatedAsyncioTestCase):
             fixed_env=(),
             input_adapter="direct_env",
             result_adapter="json_protocol",
-            dependency_bundle="",
+            dependency_bundle="none",
             timeout_seconds=30,
             experimental=False,
             version="3" * 64,

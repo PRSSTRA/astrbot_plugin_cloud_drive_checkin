@@ -21,6 +21,7 @@ _TAG_BYTES = 16
 _MAX_PLAINTEXT_BYTES = 512 * 1024
 _MAX_FIELD_BYTES = 16 * 1024
 _MAX_TOTAL_VALUE_BYTES = 64 * 1024
+_MAX_ENV_FIELDS = 64
 _MAX_ENVELOPE_BYTES = _NONCE_BYTES + _MAX_PLAINTEXT_BYTES + _TAG_BYTES
 _MAX_ENVELOPE_TEXT = 4 * ((_MAX_ENVELOPE_BYTES + 2) // 3)
 _MISSING = object()
@@ -259,6 +260,35 @@ def _declared_fields(task: object) -> tuple[UserField, ...]:
     return task.user_fields
 
 
+def _fixed_environment_bytes(task: TaskConfig, user_field_count: int) -> int:
+    if type(task.fixed_env) is not tuple:
+        _fail(_INVALID_VALUES_MESSAGE)
+    if len(task.fixed_env) + user_field_count > _MAX_ENV_FIELDS:
+        _fail(_INVALID_VALUES_MESSAGE)
+    total_bytes = 0
+    for item in task.fixed_env:
+        if type(item) is not tuple or len(item) != 2:
+            _fail(_INVALID_VALUES_MESSAGE)
+        name, value = item
+        if type(name) is not str or type(value) is not str or "\0" in value:
+            _fail(_INVALID_VALUES_MESSAGE)
+        try:
+            name_bytes = name.encode("utf-8")
+            value_bytes = value.encode("utf-8")
+        except UnicodeEncodeError:
+            _fail(_INVALID_VALUES_MESSAGE)
+        if (
+            not name_bytes
+            or len(name_bytes) > _MAX_FIELD_BYTES
+            or len(value_bytes) > _MAX_FIELD_BYTES
+        ):
+            _fail(_INVALID_VALUES_MESSAGE)
+        total_bytes += len(value_bytes)
+        if total_bytes > _MAX_TOTAL_VALUE_BYTES:
+            _fail(_INVALID_VALUES_MESSAGE)
+    return total_bytes
+
+
 def validate_values(task: TaskConfig, values: dict[str, str | int | bool]) -> None:
     """Validate direct-API values against the task's declared credential fields."""
 
@@ -274,7 +304,7 @@ def validate_values(task: TaskConfig, values: dict[str, str | int | bool]) -> No
     if any(field.required and field.field_id not in values for field in fields):
         _fail(_INVALID_VALUES_MESSAGE)
 
-    total_bytes = 0
+    total_bytes = _fixed_environment_bytes(task, len(fields))
     expected_types = {"string": str, "int": int, "bool": bool}
     for field_id, value in values.items():
         expected_type = expected_types[declared[field_id].value_type]

@@ -231,6 +231,7 @@ class EnrollmentTests(unittest.IsolatedAsyncioTestCase):
         task.update(
             task_id="typed", input_adapter="direct_env", result_adapter="json_protocol"
         )
+        task["dependency_bundle"] = "none"
         task["user_fields"] = [
             {
                 "field_id": name,

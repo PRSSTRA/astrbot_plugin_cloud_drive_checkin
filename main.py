@@ -471,7 +471,7 @@ class CloudDriveCheckin(Star):
         except _PreparationAccessChanged:
             return "管理员权限或任务配置已变化，请重新发起准备。"
         except PreparationError:
-            return "制品准备失败，请检查任务配置、PyPI 网络及插件数据目录后重试。"
+            return "制品准备失败，请检查脚本与依赖声明、下载网络及插件数据目录后重试。"
         except CommitUnconfirmedError:
             return "状态写入未确认，请在插件页重载后重试。"
         except StateUnavailableError:

@@ -1,13 +1,16 @@
 import hashlib
+import io
 import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -32,18 +35,21 @@ def _prepare_job(
     result_adapter="json_protocol",
     runtime="python",
     digest=None,
+    artifact_format="script",
 ):
     directory = Path(directory)
     directory.chmod(0o700)
     script_name = "script.py" if runtime == "python" else "script.js"
+    artifact_name = "artifact.zip" if artifact_format == "bundle" else script_name
     script_bytes = script.encode("utf-8") if isinstance(script, str) else script
-    _write_private(directory / script_name, script_bytes)
+    _write_private(directory / artifact_name, script_bytes)
     job = {
         "protocol": 1,
         "runtime": runtime,
         "sha256": digest or hashlib.sha256(script_bytes).hexdigest(),
         "timeout_seconds": timeout_seconds,
         "result_adapter": result_adapter,
+        "artifact_format": artifact_format,
     }
     _write_private(
         directory / "job.json",
@@ -58,6 +64,34 @@ def _prepare_job(
         ),
     )
     return directory
+
+
+def _bundle_artifact(runtime, source, members):
+    task_name = "task.py" if runtime == "python" else "task.js"
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for member in ((task_name, source), *members):
+            name, data, *mode = member
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.create_system = 3
+            info.external_attr = (mode[0] if mode else stat.S_IFREG | 0o644) << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, data)
+    return output.getvalue()
+
+
+def _native_payloads():
+    pe = bytearray(128)
+    pe[:2] = b"MZ"
+    pe[60:64] = (64).to_bytes(4, "little")
+    pe[64:68] = b"PE\0\0"
+    return (
+        b"\x7fELF" + b"x" * 64,
+        bytes(pe),
+        b"\xfe\xed\xfa\xcf" + b"x" * 64,
+        b"\xca\xfe\xba\xbe" + b"x" * 64,
+        b"\0asm" + b"x" * 64,
+    )
 
 
 def _pid_is_gone(pid):
@@ -178,6 +212,97 @@ class BootstrapResultTests(unittest.TestCase):
         self.assertEqual(result["exit_code"], 0)
         self.assertEqual(result["business_status"], "unknown")
         self.assertEqual(result["reason_code"], "no_business_evidence")
+
+    def test_python_bundle_imports_prebuilt_module_with_literal_typed_environment(self):
+        token = " FAKE_PYTHON;'\"$()\n账户 "
+        source = (
+            b"import json, os, pinned_helper\n"
+            b"valid = (pinned_helper.VALUE == 7 and os.environ['TOKEN'] == "
+            + repr(token).encode("utf-8")
+            + b" and os.environ['COUNT'] == '42' and os.environ['ENABLED'] == 'true' and os.environ['MODE'] == 'fixed')\n"
+            b"print(json.dumps({'status': 'success' if valid else 'failed'}))\n"
+        )
+        artifact = _bundle_artifact(
+            "python",
+            source,
+            (
+                ("pinned_helper.py", b"VALUE = 7\n", stat.S_IFREG | 0o755),
+                ("config.json", b'{"enabled":true}\n'),
+                ("certificate.pem", b"-----BEGIN CERTIFICATE-----\nfixture\n"),
+                ("data.bin", b"\x01\x02\x03binary-data"),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = _prepare_job(
+                temporary,
+                artifact,
+                artifact_format="bundle",
+                environment={
+                    "TOKEN": token,
+                    "COUNT": "42",
+                    "ENABLED": "true",
+                    "MODE": "fixed",
+                },
+            )
+
+            result = bootstrap.run(directory)
+
+            runtime = directory / "runtime"
+            self.assertTrue(runtime.is_dir())
+            self.assertEqual(runtime.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(
+                (runtime / "pinned_helper.py").stat().st_mode & 0o777, 0o600
+            )
+            self.assertEqual(
+                (runtime / "data.bin").read_bytes(), b"\x01\x02\x03binary-data"
+            )
+            self.assertFalse((directory / "credentials.json").exists())
+        self.assertEqual(result["business_status"], "success")
+        self.assertNotIn(token, json.dumps(result))
+
+    @unittest.skipUnless(shutil.which("node"), "Node runtime is not installed")
+    def test_node_bundle_imports_prebuilt_module_with_literal_environment(self):
+        node = shutil.which("node")
+        real_popen = subprocess.Popen
+        token = " FAKE_NODE_BUNDLE;'\"$()\n账户 "
+        source = (
+            "const helper = require('pinned-helper');\n"
+            f"const valid = helper.value === 7 && process.env.TOKEN === {json.dumps(token)};\n"
+            "console.log(JSON.stringify({status: valid ? 'already_signed' : 'failed'}));\n"
+            "process.exitCode = 5;\n"
+        ).encode()
+        artifact = _bundle_artifact(
+            "node",
+            source,
+            (
+                (
+                    "node_modules/pinned-helper/index.js",
+                    b"module.exports = {value: 7};\n",
+                ),
+            ),
+        )
+
+        def spawn(argv, **kwargs):
+            return real_popen(
+                [node, *argv[1:]] if argv[0] == "node" else argv, **kwargs
+            )
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(bootstrap.subprocess, "Popen", side_effect=spawn),
+        ):
+            directory = _prepare_job(
+                temporary,
+                artifact,
+                artifact_format="bundle",
+                runtime="node",
+                environment={"TOKEN": token},
+            )
+            result = bootstrap.run(directory)
+
+        self.assertEqual(result["business_status"], "already_signed")
+        self.assertEqual(result["exit_code"], 5)
+        self.assertNotIn(token, json.dumps(result))
 
     def test_large_stdout_is_drained_but_never_returned(self):
         script = (
@@ -343,6 +468,38 @@ class BootstrapGuardTests(unittest.TestCase):
         self.assertEqual(result["business_status"], "config_error")
         self.assertEqual(result["reason_code"], "runner_error")
 
+    def test_unsafe_bundle_members_are_rejected_before_extraction_or_execution(self):
+        native_scenarios = tuple(
+            ((f"renamed_{index}.bin", payload),)
+            for index, payload in enumerate(_native_payloads())
+        )
+        scenarios = (
+            (("../escape.py", b"x"),),
+            (("linked.py", b"target", stat.S_IFLNK | 0o777),),
+            (("native.node", b"native"),),
+            (("large.py", b"x" * (2 * 1024 * 1024 + 1)),),
+            *native_scenarios,
+        )
+        for members in scenarios:
+            with (
+                self.subTest(path=members[0][0]),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                marker = Path(temporary) / "started"
+                source = (
+                    f"from pathlib import Path\nPath({str(marker)!r}).touch()\n"
+                ).encode()
+                artifact = _bundle_artifact("python", source, members)
+                directory = _prepare_job(temporary, artifact, artifact_format="bundle")
+
+                result = bootstrap.run(directory)
+
+                self.assertEqual(result["process_status"], "start_error")
+                self.assertEqual(result["business_status"], "config_error")
+                self.assertFalse(marker.exists())
+                self.assertFalse((directory / "runtime").exists())
+                self.assertFalse((directory / "credentials.json").exists())
+
     def test_reserved_execution_environment_is_rejected_without_starting(self):
         reserved_names = (
             "PATH",
@@ -480,6 +637,7 @@ class BootstrapGuardTests(unittest.TestCase):
             {"timeout_seconds": 0},
             {"timeout_seconds": 241},
             {"result_adapter": "other"},
+            {"artifact_format": "other"},
             {"unexpected": "field"},
         )
         for update in invalid_jobs:
