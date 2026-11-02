@@ -53,7 +53,27 @@ class FakeKV:
 
 
 class AstrBotConfig(dict):
-    pass
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.persisted_config = None
+        self.save_actions = deque()
+        self.saved_configs = []
+
+    async def save_config_async(self, replace_config=None, *, indent=2):
+        if replace_config:
+            self.update(replace_config)
+        snapshot = copy.deepcopy(dict(self))
+        action = self.save_actions.popleft() if self.save_actions else None
+        if isinstance(action, BaseException):
+            raise action
+        if isinstance(action, PutGate):
+            action.started.set()
+            await action.release.wait()
+        if action is False:
+            return False
+        self.persisted_config = snapshot
+        self.saved_configs.append(copy.deepcopy(snapshot))
+        return True
 
 
 class AstrBotContext:

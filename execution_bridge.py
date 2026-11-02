@@ -20,6 +20,7 @@ from .permissions import Identity, authorize
 from .preparation import PreparationError
 from .storage import StateUnavailableError
 from .task_config import parse_task_catalog
+from .task_control import task_is_disabling
 
 
 class ExecutionBridge:
@@ -46,6 +47,8 @@ class ExecutionBridge:
 
     def guard(self, item: dict, snapshot: dict) -> None:
         guard_cancellation(item, snapshot)
+        if task_is_disabling(snapshot, item["task_id"]):
+            raise QueueRejected("task_disabled")
         plugin = self.plugin
         if plugin._terminating:
             raise QueueRejected("service_disabled")

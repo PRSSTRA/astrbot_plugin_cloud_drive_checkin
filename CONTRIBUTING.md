@@ -18,7 +18,7 @@ python3 -m venv .venv
 
 ## 代码结构
 
-- `main.py`：Star 生命周期、指令入口、帮助、任务查询、本人状态回复、手动签到入口、调度器生命周期和管理员准备与取消入口。
+- `main.py`：Star 生命周期、指令入口、帮助、任务查询、本人状态回复、手动签到入口、调度器生命周期和管理员准备、取消与停用入口。
 - `permissions.py`：私聊事件校验、身份提取和权限判定。
 - `config.py`：权限配置的解析和 QQ 号规范化。
 - `task_config.py`：任务目录校验、Cron 计算和配置版本。
@@ -27,6 +27,7 @@ python3 -m venv .venv
 - `bindings.py`：本人绑定偏好更新、删除确认指纹和绑定与凭据的原子删除。
 - `state.py`：快照结构、JSON 校验和 schema 迁移。
 - `storage.py`：基于 Star 异步 KV 的事务写入。
+- `task_control.py`：管理员停用意图、目标活动批次取消标记、最新配置保存与恢复，以及关闭时排空配置写入。
 - `executors/client.py`：完整来源的 Neo 连接解析、异步 REST、鉴权检查和有界响应。
 - `executors/neo.py`：持久化执行意图、串行执行、资源归属检查、清理阻断与恢复。
 - `execution_config.py`：解析签到冷却、排队有效期、保留天数和执行间隔。
@@ -48,7 +49,7 @@ python3 -m venv .venv
 
 `state.py` 定义快照格式，`storage.py` 通过 `get_kv_data` 和 `put_kv_data` 操作唯一业务键 `checkin_state`。插件不创建数据库或状态文件。
 
-快照包含 `schema_version`、`revision`，以及 `users`、`bindings`、`credentials`、`batches`、`runs`、`outbox`、`cleanup_jobs`、`cooldowns`、`dedupe`、`prepared_artifacts` 集合。当前 schema 版本为 3。签到批次可以带有可选的 `cancel_requested` 布尔字段记录管理员取消意图；该字段不改变 schema 版本，也不新增集合或迁移。读取版本 1 时补充空的 `prepared_artifacts`；读取版本 2 时把旧手动批次、通知、冷却和索引改为 `checkin`、`terminal_notification`、`checkin_cooldown` 和 `checkin` 索引，旧批次补 `source="manual"`、`manual_requested=true`、空的 `scheduled_at` 和 `batch_id`，旧通知按手动来源处理。迁移保留原有业务记录，结果作为完整快照重新保存并确认后才能使用。未知版本、结构损坏或超限都会报错，不会重置或裁剪记录。默认序列化上限为 8 MiB。
+快照包含 `schema_version`、`revision`，以及 `users`、`bindings`、`credentials`、`batches`、`runs`、`outbox`、`cleanup_jobs`、`cooldowns`、`dedupe`、`prepared_artifacts` 集合。当前 schema 版本为 3。签到批次可以带有可选的 `cancel_requested` 布尔字段记录管理员取消意图；该字段不改变 schema 版本，也不新增集合或迁移。管理员停用使用同一 `dedupe` 集合中的 `task_disable:<task_id>` 意图记录，配置保存确认后删除；该记录同样不改变 schema 版本，不新增集合或迁移，也不作为第二个永久启用标记。读取版本 1 时补充空的 `prepared_artifacts`；读取版本 2 时把旧手动批次、通知、冷却和索引改为 `checkin`、`terminal_notification`、`checkin_cooldown` 和 `checkin` 索引，旧批次补 `source="manual"`、`manual_requested=true`、空的 `scheduled_at` 和 `batch_id`，旧通知按手动来源处理。迁移保留原有业务记录，结果作为完整快照重新保存并确认后才能使用。未知版本、结构损坏或超限都会报错，不会重置或裁剪记录。默认序列化上限为 8 MiB。
 
 `prepared_artifacts[task_id]` 保存 `task_version`、`source_commit`、`source_sha256`、`sha256`、`size` 和 `inputs_sha256`，不保存脚本字节、凭据或制品文件。制品文件按内容摘要存放在插件数据目录；state 层只校验快照结构，不读取或重建文件。
 
@@ -106,6 +107,12 @@ python3 -m venv .venv
 
 执行回调加载已准备制品，解密最新已确认凭据，生成 `TY_ACCOUNTS`，并以同一 run_id 调用 `NeoExecutor.execute`。凭据明文不写入批次记录，也不进入日志。
 
+### 管理员停用
+
+`TaskControlService(store, config)` 接受 `StateStore` 和带可等待 `save_config_async` 的配置映射。`disable(task_id, *, guard)` 在当前管理员和任务目录检查通过后，以 `mutate` 在同一笔状态写入中保存 `dedupe["task_disable:<task_id>"]` 意图，并为该任务所有 `queued`、`running` 签到批次设置 `cancel_requested`；状态写入确认后才重新读取最新配置，深拷贝 `tasks`，只把目标任务的 `enabled` 设为 `false`，再通过框架公共异步方法保存。保存返回 `True` 后，删除意图的同步提交再次检查最新配置；只有目标仍禁用或已移除时才删除精确匹配的意图记录。若复查发现目标已重新启用，则不提交删除，保留意图、报告 `TaskControlSaveUnconfirmed` 并继续阻断目标执行；复查线性化点之后的配置保存属于后续显式修改。
+
+`recover()` 在 Neo、队列和调度器初始化前处理遗留意图；`close()` 停止接单并等待所有已跟踪的保存与意图清理任务，调用方取消被 shield 隔离，关闭后不会留下晚到的配置写者。`disabling_task_ids(snapshot)` 和 `task_is_disabling(snapshot, task_id)` 供队列准入、执行 guard 和调度器排除停用状态使用；意图结构不合法、数量超过上限或与目标不一致时拒绝继续，不覆盖其他 `dedupe` 记录。配置保存异常、返回 `False`、最新配置无效或未体现停用时抛 `TaskControlSaveUnconfirmed`，意图保留并继续阻断目标执行。`tests/test_task_control.py` 和 `tests/test_admin_disablement.py` 覆盖该边界。
+
 ### 自动调度
 
 `CronScheduler` 只读取状态存储、队列、配置回调和时钟。初始化时先执行一次 tick，建立每个启用任务的未来计划基线，再启动单 worker 循环；默认每 1 秒检查一次。tick 在存储未就绪时清空计划并返回，不补跑；全局 `enabled` 关闭时清空计划，重新打开后从新的未来计划开始。
@@ -132,6 +139,7 @@ Neo 接口按 [Shipyard Neo `f4d248b4274c1a2f05402f75a3b39e5c19be9ff5`](https://
 - [CargoManager](https://github.com/AstrBotDevs/shipyard-neo/blob/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5/pkgs/bay/app/managers/cargo/cargo.py) 与 [Docker driver](https://github.com/AstrBotDevs/shipyard-neo/blob/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5/pkgs/bay/app/drivers/docker/docker.py)：删除引用指向的数据后才删 Cargo 记录；bind 模式必须保证该宿主路径在 Bay 内仍指向真实 Cargo，不能只检查 API 404。
 - [K8s driver](https://github.com/AstrBotDevs/shipyard-neo/blob/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5/pkgs/bay/app/drivers/k8s/k8s.py)：PVC 删除受理不等于清理完成，因此当前执行层仅接受已确认的固定 Docker 部署。
 - [AstrBot v4.29.4 Context](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.4/astrbot/core/star/context.py)：通过 `get_config()` 读取框架配置，不访问框架私有存储或借用聊天资源。
+- [AstrBot v4.29.4 astrbot_config](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.4/astrbot/core/config/astrbot_config.py)：管理员停用只调用公共异步方法 `save_config_async(replace_config)`；该方法先合并替换值，再以原子文件替换保存，返回 `False` 表示保存被更新提交取代。
 
 ### 本仓库维护的天翼脚本
 
@@ -187,7 +195,7 @@ CLI 拒绝覆盖已有输出，成功后只打印包含 `source_commit`、`sourc
 
 PR 的“离线测试”任务分别在 Python 3.12、3.13、3.14 上安装宿主 `requirements.txt`，显式安装 Node 22，并运行 `unittest discover -s tests -p 'test_*.py' -v`；“天翼脚本离线测试”在相同 Python 矩阵的独立虚拟环境中校验脚本依赖哈希并运行脚本测试。既有必需检查“提交信息规范”等待两组矩阵，仅在全部成功后校验提交历史；任一失败、取消或跳过都不能通过，无需修改现有必需检查名称。普通 PR CI 不连接真实 QQ、Neo 或云盘服务。
 
-执行层回归位于 `tests/test_neo_client.py`、`tests/test_neo_executor.py`、`tests/test_neo_lifecycle.py` 和 `tests/test_bootstrap.py`。制品构建与准备服务回归位于 `tests/test_preparation.py` 和 `tests/test_artifact_service.py`；管理员准备指令位于 `tests/test_admin_preparation.py`，schema 迁移与写入确认位于 `tests/test_state.py`、`tests/test_storage.py`。签到队列、恢复和容量位于 `tests/test_execution_queue.py`，自动计划准入、去重和生命周期位于 `tests/test_automatic_execution.py`，终态通知位于 `tests/test_notifications.py`，聊天入口和集成位于 `tests/test_manual_execution.py`，管理员取消位于 `tests/test_admin_cancellation.py`。`tests/neo_support.py` 是受控 Bay 替身，会在临时目录运行本仓库 wrapper 与假脚本；这不是产品的宿主回退路径。本地未安装 Node 时对应测试会明确跳过；CI 显式安装并检查 Node，不依赖 runner 预装。macOS 测试只将 Node 的可执行路径映射到本机安装位置，实际运行 Node 子进程。
+执行层回归位于 `tests/test_neo_client.py`、`tests/test_neo_executor.py`、`tests/test_neo_lifecycle.py` 和 `tests/test_bootstrap.py`。制品构建与准备服务回归位于 `tests/test_preparation.py` 和 `tests/test_artifact_service.py`；管理员准备指令位于 `tests/test_admin_preparation.py`，schema 迁移与写入确认位于 `tests/test_state.py`、`tests/test_storage.py`。签到队列、恢复和容量位于 `tests/test_execution_queue.py`，自动计划准入、去重和生命周期位于 `tests/test_automatic_execution.py`，终态通知位于 `tests/test_notifications.py`，聊天入口和集成位于 `tests/test_manual_execution.py`，管理员取消位于 `tests/test_admin_cancellation.py`，管理员停用位于 `tests/test_admin_disablement.py` 和 `tests/test_task_control.py`。`tests/neo_support.py` 是受控 Bay 替身，会在临时目录运行本仓库 wrapper 与假脚本；这不是产品的宿主回退路径。本地未安装 Node 时对应测试会明确跳过；CI 显式安装并检查 Node，不依赖 runner 预装。macOS 测试只将 Node 的可执行路径映射到本机安装位置，实际运行 Node 子进程。
 
 离线 smoke 通过真实 loopback HTTP 连接受控 Bay，覆盖两用户隔离、非零退出码的显式业务结果、超时、清理阻断及恢复不重跑。真实 Neo 假凭据测试与真实账号测试分别记录如下。
 
@@ -216,6 +224,15 @@ PR 的“离线测试”任务分别在 Python 3.12、3.13、3.14 上安装宿�
 - 重复取消同一 run_id 不增加 revision。终态按来源投递到原用户和第二用户各自的 owner 来源（跨平台），没有投递给管理员。
 - Sandbox、Cargo、宿主物理目录和 `cleanup_jobs` 均为 0；假凭据 canary 未出现在 KV、Bay 历史或回执中。
 - 未连接真实 Neo、真实 QQ 或云盘账号。
+
+### 管理员停用本地验收
+
+- Python 3.14 下全量 453 项测试通过，耗时 23.059 秒；`main.py`、`execution_queue.py`、`execution_bridge.py`、`scheduler.py`、`task_control.py`、`tests/astrbot_support.py`、`tests/test_task_control.py` 和 `tests/test_admin_disablement.py` 通过 scoped Ruff 检查，不声明全仓 Ruff 全绿。
+- 新增删除停用意图前等待状态锁期间重新启用的回归：修复前命令未抛错且停用意图被删除；修复后抛出 `TaskControlSaveUnconfirmed`，持久化停用意图保留。
+- 独立 smoke 使用 AstrBot v4.29.4 原始 `save_config_async`、`_prepare_config_snapshot` 和 `_write_config_snapshot`，在临时配置文件执行真实写入、fsync 和 replace；同轮经真实 loopback HTTP 连接受控 FakeBay 和实际 wrapper，共 35 次请求。
+- 真实目录路径错误导致配置保存失败时，KV 停用意图保留，目标没有上传凭据、没有执行业务并以取消结束；修复路径后重试保存 `enabled=false` 并清除停用意图；从实际配置文件重载后目标继续禁用。另一任务得到 `already_signed`，执行 1 次业务，最大并发 1。
+- 绑定和密文保持不变，两个 owner 来源分别投递；Sandbox、Cargo、物理目录和 `cleanup_jobs` 均为 0，假凭据 canary 未出现在快照、Bay 历史或回执中。
+- 该 smoke 使用受控 FakeBay 和临时配置文件，不是完整 AstrBot/QQ 部署；未连接真实 Neo、真实 QQ 或云盘账号。
 
 ### 制品准备本地验收
 
