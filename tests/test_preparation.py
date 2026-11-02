@@ -411,6 +411,19 @@ class GenericPreparationTests(unittest.TestCase):
 
         self.assertEqual(artifact.artifact_format, "bundle")
 
+    def test_dependency_file_budget_reserves_the_runtime_entry(self):
+        source = b"print(1)\n"
+        members = tuple((f"module_{index}.py", b"") for index in range(4095))
+        artifact = self.build("python", source, _bundle_bytes(members))
+        with zipfile.ZipFile(io.BytesIO(artifact.script)) as archive:
+            self.assertEqual(len(archive.infolist()), 4096)
+            self.assertEqual(archive.read("task.py"), source)
+
+        with self.assertRaises(preparation.PreparationError):
+            self.build(
+                "python", source, _bundle_bytes((*members, ("one_too_many.py", b"")))
+            )
+
     def test_unsafe_dependency_archives_and_hashes_fail_before_publication(self):
         source = b"print('not executed')\n"
         large = b"x" * (2 * 1024 * 1024 + 1)

@@ -865,6 +865,8 @@ def build_generic(
         task_name = "task.py" if runtime == "python" else "task.js"
         entries.add(task_name, source, "generic source")
         dependency_files = _dependency_bundle_files(bundle)
+        if len(dependency_files) + 1 > _MAX_MEMBERS:
+            raise PreparationError("generic prepared inputs contain too many files")
         if (
             len(source) + sum(map(len, dependency_files.values()))
             > _MAX_UNCOMPRESSED_BYTES

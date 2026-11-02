@@ -188,7 +188,7 @@ python3 scripts/prepare-tianyi.py --wheelhouse "$WORKDIR/wheels" --output "$WORK
 
 CLI 拒绝覆盖已有输出，成功后只打印包含 `source_commit`、`source_sha256`、制品 `sha256` 和 `size` 的 JSON。源码摘要与制品摘要不同：调用内部执行器时使用 `PreparedArtifact.script` 及其 `sha256`，运行时为 `python`、传输结果适配为 `json_protocol`；该 CLI 生成的制品上传成 `script.py` 后仍由原有 wrapper 校验并启动，不需要更改 Neo 执行器。
 
-通用任务不使用本地 wheelhouse CLI。运行期由同一条管理员准备路径准备：按任务配置下载固定提交的源码，按声明再下载 `zip-v1` 依赖包，校验 SHA256 后调用 `preparation.build_generic` 构建。`dependency_bundle` 为 `none` 时制品就是源码本身；否则打包 `task.py`/`task.js` 与依赖文件。`script` 形态上传源码文件，`bundle` 形态上传 `artifact.zip`，由 wrapper 校验摘要后解包到运行时目录。Python 依赖是制品根目录下可直接导入的纯 Python 模块或包，Node 依赖位于 `node_modules/`。依赖包的构建和展开都拒绝符号链接、加密成员、路径穿越、重复或仅大小写不同的路径、保留顶层名称、原生扩展，以及文件内容为 ELF、WASM、Mach-O、fat/universal 或真实 PE 的成员，即使改名为 `.bin`。普通 JSON、PEM 和非原生二进制辅助数据允许随包；包内 0755 文本等权限位不保留，运行时统一按 0600 提取。源码、依赖包和制品各不超过 1 MiB，依赖解压后合计不超过 8 MiB。构建过程不执行下载内容，也不在宿主机安装依赖。这些是支持格式限制，不宣称阻止受信管理员脚本在 sandbox 内构造原生代码。
+通用任务不使用本地 wheelhouse CLI。运行期由同一条管理员准备路径准备：按任务配置下载固定提交的源码，按声明再下载 `zip-v1` 依赖包，校验 SHA256 后调用 `preparation.build_generic` 构建。`dependency_bundle` 为 `none` 时制品就是源码本身；否则打包 `task.py`/`task.js` 与依赖文件。`script` 形态上传源码文件，`bundle` 形态上传 `artifact.zip`，由 wrapper 校验摘要后解包到运行时目录。Python 依赖是制品根目录下可直接导入的纯 Python 模块或包，Node 依赖位于 `node_modules/`。依赖包的构建和展开都拒绝符号链接、加密成员、路径穿越、重复或仅大小写不同的路径、保留顶层名称、原生扩展，以及文件内容为 ELF、WASM、Mach-O、fat/universal 或真实 PE 的成员，即使改名为 `.bin`。普通 JSON、PEM 和非原生二进制辅助数据允许随包；包内 0755 文本等权限位不保留，运行时统一按 0600 提取。源码、依赖包和制品各不超过 1 MiB，依赖解压后合计不超过 8 MiB；依赖 zip 最多 4096 个成员（含目录项），其中实际依赖文件最多 4095 个，生成的制品最多 4096 个文件（含 `task.py`/`task.js` 入口）。构建过程不执行下载内容，也不在宿主机安装依赖。这些是支持格式限制，不宣称阻止受信管理员脚本在 sandbox 内构造原生代码。
 
 运行期由 `artifact_service.PreparationService(store, data_dir, *, client=None)` 提供准备和读取：
 
@@ -206,7 +206,7 @@ CLI 拒绝覆盖已有输出，成功后只打印包含 `source_commit`、`sourc
 
 天翼制品方面，已用实际锁定 wheel 构建并完成九个禁网 HTTP 替身场景；另经现有 `NeoExecutor`、受控 Bay 和真实 wrapper 上传/执行 zipapp，观察到缺少凭据的 `config_error` 终态和资源清理。这里的 Bay 是测试替身，不是真实 Neo 部署。CI 在三个 Python 版本构建真实制品，并用有效假字段和网络审计钩子验证请求在联网前被阻止、只尝试一次、输出 `unknown` 且无 stderr。
 
-两个模板保持默认禁用。上述验收均未覆盖真实账号；通用任务也尚未获得真实 Neo 部署或真实账号的验收结果。
+两个模板保持默认禁用；天翼制品构建验收未覆盖真实账号。
 
 
 ## 测试与验证
@@ -302,6 +302,14 @@ PR 的“离线测试”任务分别在 Python 3.12、3.13、3.14 上安装宿�
 | 独立清理证明 | 每组同时确认 Sandbox/Cargo API 不存在、对应宿主 bind 目录不存在、无同名卷和关联容器；6 组全部通过 |
 
 该结果仅覆盖上述固定版本和路径对齐后的 bind 拓扑。未验证 Docker named volume、Kubernetes、完整 AstrBot/QQ 入站流水线、跨进程崩溃或真实账号签到；没有运行真实云盘脚本。新增回归测试另外覆盖了 KV 等待期间撤权和远端副作用后取消的边界。
+
+### 通用依赖包真实 Neo 假凭据验收
+
+- 目标为同一 Docker Bay 0.4.2 版本，镜像 digest 与上文记录相同；Cargo 双路径挂载已在现场确认保持。本轮未修改部署配置、未重启服务，只使用本次创建的 3 组独立 Sandbox/Cargo 和假凭据、假程序。
+- Python 任务使用真实依赖模块，Node 任务使用真实 `node_modules` 模块。两组业务结果分别为 `success`/退出码 7 和 `already_signed`/退出码 3；第三组在客户端注入清理失败后阻断新执行，恢复后只清理、不重跑业务。业务请求共 3 次，最大并发 1。
+- 3 组均确认上传凭据目录为 0700、文件为 0600 且归执行用户所有；runtime 展开后的目录为 0700、文件为 0600、owner 正确，凭据文件已解除链接。3 组 Bay history 均未出现假凭据 canary 或 API key。
+- 3 组均确认 Sandbox/Cargo API 已不存在，并通过独立 SSH 确认宿主 bind 目录、同名 volume 和关联容器均不存在。SSH 临时隧道已关闭，内存中的密钥引用已清空。
+- 原始证据保存在仓库外，未入库。Star/KV 边界仍为受控内存适配器，不是真实 AstrBot + Neo 全链路；未连接真实 QQ 或真实账号。冷启动真实 AstrBot 进程恢复缺陷正在另一分支修复，本轮不声明该场景通过。
 
 ## Git hooks
 

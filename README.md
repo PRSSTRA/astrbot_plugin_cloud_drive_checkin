@@ -88,7 +88,7 @@ git clone --branch dev/0.0.1 https://github.com/PRSSTRA/astrbot_plugin_cloud_dri
 - 支持固定天翼任务和通用任务。通用任务使用 `direct_env`，运行时为 `python` 或 `node`，结果适配器为 `json_protocol` 或 `process_only`；移动任务尚未支持。Node 任务要求所选 Neo profile 的镜像中提供 Node。匹配条件和可自定义字段见 [配置说明](docs/configuration.md#管理员准备)。
 - 通用任务的源码由 `script_url`、`source_commit`（40 位提交）和 `sha256` 锁定。`dependency_bundle` 必须显式写成 `none`，或写成字符串形式的 `{"format":"zip-v1","url":"...","sha256":"..."}`；源码和依赖是两条独立固定提交。Python 依赖须为可直接导入的纯 Python 模块或包，Node 依赖放在 `node_modules/` 下。依赖文件扩展名为原生库，或内容为 ELF、WASM、Mach-O、fat/universal、真实 PE 时会拒绝准备，即使改名为 `.bin`；普通 JSON、PEM 等辅助数据可以随包，展开后统一为 0600。这些检查是支持格式限制，不构成对脚本在 sandbox 内构造原生代码的阻止。
 - 准备只下载并校验配置中锁定的来源：天翼从 PyPI 下载锁定 wheel；通用任务下载 GitHub 固定提交的源码，必要时再下载声明的依赖包，然后在本地生成制品。准备不执行下载内容，不在宿主机安装依赖。
-- 制品按内容缓存在 AstrBot 数据目录，已发布引用的上限为 32 个文件、合计 32 MiB。单个制品不超过 1 MiB，依赖 zip 不超过 1 MiB、解压后合计不超过 8 MiB。有效缓存命中时不再下载；任务配置版本或打包输入变化后，需要重新执行准备。
+- 制品按内容缓存在 AstrBot 数据目录，已发布引用的上限为 32 个文件、合计 32 MiB。单个制品不超过 1 MiB，依赖 zip 不超过 1 MiB、解压后合计不超过 8 MiB。依赖 zip 最多 4096 个成员（含目录项），实际依赖文件最多 4095 个；制品最多 4096 个文件，含 `task.py` 或 `task.js`。有效缓存命中时不再下载；任务配置版本或打包输入变化后，需要重新执行准备。
 - 插件服务开关和任务 `enabled` 都不影响准备。准备不修改配置，不建立执行请求，也不读取凭据。
 - 准备成功后，回复包含任务 ID、制品 SHA256 和字节大小。
 - 准备失败时按回复提示处理：检查脚本、依赖、下载网络、任务配置或数据目录，状态存储未就绪或写入未确认时重载插件后重试。
