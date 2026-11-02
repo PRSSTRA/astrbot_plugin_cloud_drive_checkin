@@ -134,6 +134,12 @@ python3 -m venv .venv
 
 `NotificationService(store, send)` 在外部发送前先持久化 `phase=sending`：`send` 返回 `True` 记为 `sent`，返回 `False` 记为 `pending` 并在上限内重试，重试用尽后记为 `failed`，异常或取消记为 `unknown`，不盲目重发。默认最多 3 次尝试，重试窗口 30 秒。KV 写入失败时停止发送，但不重跑签到。通知发送失败不改变批次中的业务终态，`/签到 状态` 仍可查询，抑制状态显示为“按偏好静默”。
 
+### 框架启动就绪
+
+AstrBot 4.29.4 在插件初始化之后才完成平台适配器加载。插件把“框架平台已加载”与业务授权分开：每个 `Context` 的 `_cloud_drive_checkin_state_registry` 状态槽按 `plugin_id` 保存 `platforms_ready`，`CloudDriveCheckin._startup_ready()` 先读取该标记，再查询公共平台入口 `context.platform_manager.get_insts()`。4.29.4 在所有已配置适配器初始化后才追加 `webchat` 实例，因此看到该实例可以作为加载完成信号；AstrBot 的 `filter.on_astrbot_loaded()` 钩子同样置位标记。二者只是框架就绪标记，不参与身份授权；权限仍由普通 QQ 私聊、事件中的平台与 QQ、`aiocqhttp` 平台实例和权限配置判定。
+
+就绪前，队列 worker 的 `_step` 在到期检查、`guard` 和认领前返回，尚未过期的 `queued` 批次保持原状；队列初始化恢复和关闭对账不等待平台就绪，仍按入队时间把已过期批次记为 `queue_expired`。通知 `_claim` 在认领前返回，`pending` 记录的 `attempts` 与 `retry_deadline_at` 不变；调度器 `tick` 清空计划，`binding_plan_views` 返回 `UNREADY`。空平台列表或只加载了部分适配器不会使未过期批次被误判为 `permission_revoked`。`on_astrbot_loaded()` 置位后唤醒通知、队列和调度器；标记在同一 Context 的插件重载后保留。就绪后仍执行原有 `guard`：平台实例实际缺失、撤权、绑定暂停或删除会取消尚未发送业务请求的批次；通知发送仍要求目标 `aiocqhttp` 实例存在。调度器在就绪后重建未来计划基线，等待期间错过的计划不补跑。终止过程中到达的 `on_astrbot_loaded()` 不置位标记，也不唤醒执行组件。
+
 ### 管理员重载
 
 `/签到 管理 重载` 的入口检查在 `main.py`，目标校验和生命周期在 `reload_control.py`。每个 `Context` 的 `_cloud_drive_checkin_state_registry` 按 `plugin_id` 保存状态槽；槽内 `reload_task` 保证同一实例只有一个重载任务，`owner` 记录当前状态存储。`initialize` 用槽内 `lock` 串行化状态接管；重载的终止、解绑和加载用插件管理器的 `_pm_lock` 串行化，替换实例的公开清理不获取该锁。
@@ -271,6 +277,14 @@ PR 的“离线测试”任务分别在 Python 3.12、3.13、3.14 上安装宿�
 - 本轮未启动业务脚本，未连接 Neo 或云盘网络。子进程审计拒绝非 loopback 连接，框架自身的 LLM metadata 和图片端点访问被拒日志属于测试隔离的预期输出，不是插件失败。
 - 框架既有入站 INFO 日志保留假密码，与 README 已披露的入站记录风险一致。本次只断言状态和重载回复不回显假密码，不声明所有日志不含敏感值。
 - 范围限于上述 AstrBot 4.29.4、真实 `aiocqhttp==1.4.4` 和受控 loopback OneBot 客户端；不是真实 QQ、真实 Neo 或真实账号签到验收，也不改变此前真实 Neo 假凭据验收的结论。
+
+### 冷启动平台就绪本地验收
+
+- Python 3.14 下离线全量 506 项测试通过，耗时 21.281 秒；本轮修改的源码和相关测试通过 scoped Ruff 检查，不声明全仓 Ruff 全绿。
+- 新增初始化/关闭竞态回归：队列、通知和调度器在最后一次 `initialize` 等待期间被关闭后不再创建 worker；主实例在初始化接管等待或恢复期间被终止后，不再构造通知、队列和调度器。
+- 回归覆盖空平台和部分平台加载期间的未过期队列、关闭对账的过期取消（过期判定不依赖平台就绪）、通知尝试次数与重试截止时间、调度未来基线重建、同 Context 重载后的就绪标记，以及终止期间忽略加载完成钩子。worker 就绪前不调用 `guard`、不执行、不认领通知；WebChat 标记缓存后即使平台列表清空仍视为就绪，但目标平台实例实际缺失时未过期批次按 `permission_revoked` 取消；就绪后错过的计划分钟不补跑。
+- 原生冷恢复验收通过：AstrBot 4.29.4 通过原生 `PluginManager` 安装集成后的源码 ZIP 一次，使用原生 KV 和两个受控 loopback `aiocqhttp` 对端。两次实际进程 SIGKILL 后，加密绑定保留，已开始业务不重放，未过期排队请求继续，过期请求取消，结果不明通知不重发，本人计划查询只读；该轮发出 77 次 HTTP 请求、4 次业务执行，最大并发 1，无残留资源，出站检查未发现 canary。
+- 该验收的制品来源为受控固定版本 HTTP，Neo 使用 loopback FakeBay、实际 wrapper 与假 Python/Node 程序；Node PATH 仅在该测试中调整，不代表真实 QQ、NapCat、生产 Neo 或完整生产部署，也没有真实账号参与。
 
 ### 制品准备本地验收
 

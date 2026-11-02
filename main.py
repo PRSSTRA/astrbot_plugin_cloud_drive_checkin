@@ -174,9 +174,43 @@ class CloudDriveCheckin(Star):
 
         slot = registry.get(self.plugin_id)
         if slot is None:
-            slot = {"lock": asyncio.Lock(), "owner": None}
+            slot = {
+                "lock": asyncio.Lock(),
+                "owner": None,
+                "platforms_ready": False,
+            }
             registry[self.plugin_id] = slot
         return slot
+
+    def _ensure_initializing(self) -> None:
+        if self._terminating:
+            raise RuntimeError("plugin initialization was terminated")
+
+    def _startup_ready(self) -> bool:
+        slot = self._state_slot()
+        if slot.get("platforms_ready") is True:
+            return True
+        # AstrBot 4.29.4 appends WebChat only after all configured adapters have
+        # initialized. It marks framework readiness, never business authorization.
+        if any(
+            platform.meta().name == "webchat"
+            for platform in self.context.platform_manager.get_insts()
+        ):
+            slot["platforms_ready"] = True
+            return True
+        return False
+
+    @filter.on_astrbot_loaded()
+    async def on_astrbot_loaded(self) -> None:
+        if self._terminating:
+            return
+        self._state_slot()["platforms_ready"] = True
+        if self.notifications is not None:
+            self.notifications.wake()
+        if self.queue is not None:
+            self.queue.wake()
+        if self.scheduler is not None:
+            self.scheduler.wake()
 
     def _enrollment_guard(self, event, task_id: str, version: str) -> None:
         identity = get_private_identity(event)
@@ -813,11 +847,13 @@ class CloudDriveCheckin(Star):
     async def initialize(self) -> None:
         slot = self._state_slot()
         async with slot["lock"]:
+            self._ensure_initializing()
             owner = slot["owner"]
             if owner is not None and not owner.closed:
                 if not owner.closing:
                     raise RuntimeError("the plugin state already has an active owner")
                 await owner.close()
+                self._ensure_initializing()
                 if not owner.closed:
                     raise RuntimeError("the previous plugin state owner did not close")
 
@@ -832,8 +868,10 @@ class CloudDriveCheckin(Star):
                 slot["reload_candidate"] = self
             try:
                 await store.initialize()
+                self._ensure_initializing()
                 self.task_control = TaskControlService(store, self.config)
                 await self.task_control.recover()
+                self._ensure_initializing()
                 neo_config = self.config.get("neo_connection", {})
                 framework = (
                     self.context.get_config()
@@ -845,10 +883,15 @@ class CloudDriveCheckin(Star):
                 if connection is not None:
                     self.executor = NeoExecutor(store, NeoClient(connection))
                     await self.executor.recover()
-                self._terminating = False
+                self._ensure_initializing()
                 self.enrollment = Enrollment(store)
-                self.notifications = NotificationService(store, self._send_notice)
+                self.notifications = NotificationService(
+                    store,
+                    self._send_notice,
+                    startup_ready=self._startup_ready,
+                )
                 await self.notifications.initialize()
+                self._ensure_initializing()
                 self.queue = ExecutionQueue(
                     store,
                     execute=self.execution_bridge.execute,
@@ -857,10 +900,18 @@ class CloudDriveCheckin(Star):
                     blocked=lambda: self.executor is None or self.executor.blocked,
                     reserve=reserve_terminal,
                     terminal=self._terminal_notice,
+                    startup_ready=self._startup_ready,
                 )
                 await self.queue.initialize()
-                self.scheduler = CronScheduler(store, self.queue, lambda: self.config)
+                self._ensure_initializing()
+                self.scheduler = CronScheduler(
+                    store,
+                    self.queue,
+                    lambda: self.config,
+                    startup_ready=self._startup_ready,
+                )
                 await self.scheduler.initialize()
+                self._ensure_initializing()
             except asyncio.CancelledError:
                 if self.task_control is not None:
                     await self.task_control.close()

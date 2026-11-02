@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from unittest import mock
 
 from astrbot_support import (
     AstrBotConfig,
@@ -132,6 +133,68 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(recovered.state_store.ready)
         self.assertFalse(recovered.state_store.has_pending)
         await recovered.terminate()
+
+    async def test_terminate_while_initialize_waits_for_owner_prevents_start(self):
+        main, _ = self.load_generation("owner_wait_termination")
+        context = AstrBotContext()
+        plugin = self.make_plugin(main, context)
+        self.addAsyncCleanup(plugin.terminate)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class ClosingOwner:
+            closing = True
+            closed = False
+
+            async def close(self):
+                entered.set()
+                await release.wait()
+                self.closed = True
+
+        plugin._state_slot()["owner"] = ClosingOwner()
+        initialization = asyncio.create_task(plugin.initialize())
+        await asyncio.wait_for(entered.wait(), 1)
+        await plugin.terminate()
+        self.assertTrue(plugin._terminating)
+        release.set()
+        outcome = (await asyncio.gather(initialization, return_exceptions=True))[0]
+
+        self.assertIsInstance(outcome, BaseException)
+        self.assertTrue(plugin._terminating)
+        self.assertIsNone(plugin.state_store)
+        self.assertIsNone(plugin.notifications)
+        self.assertIsNone(plugin.queue)
+        self.assertIsNone(plugin.scheduler)
+
+    async def test_terminate_during_recovery_prevents_later_services(self):
+        main, _ = self.load_generation("recovery_termination")
+        context = AstrBotContext()
+        plugin = self.make_plugin(main, context)
+        self.addAsyncCleanup(plugin.terminate)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def gated_recovery(service):
+            entered.set()
+            await release.wait()
+
+        with mock.patch.object(main.TaskControlService, "recover", gated_recovery):
+            initialization = asyncio.create_task(plugin.initialize())
+            await asyncio.wait_for(entered.wait(), 1)
+            termination = asyncio.create_task(plugin.terminate())
+            async with asyncio.timeout(1):
+                while not plugin.state_store.closing:
+                    await asyncio.sleep(0)
+            release.set()
+            outcomes = await asyncio.gather(
+                initialization, termination, return_exceptions=True
+            )
+
+        self.assertIsInstance(outcomes[0], BaseException)
+        self.assertTrue(plugin._terminating)
+        self.assertIsNone(plugin.notifications)
+        self.assertIsNone(plugin.queue)
+        self.assertIsNone(plugin.scheduler)
 
 
 if __name__ == "__main__":

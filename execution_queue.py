@@ -267,13 +267,22 @@ class ExecutionQueue:
         blocked: Callable[[], bool],
         reserve: Callable[[dict, dict], None],
         terminal: Callable[[dict, dict, dict], None],
+        startup_ready: Callable[[], bool] = lambda: True,
     ) -> None:
-        callbacks = (execute, guard, config, blocked, reserve, terminal)
+        callbacks = (
+            execute,
+            guard,
+            config,
+            blocked,
+            reserve,
+            terminal,
+            startup_ready,
+        )
         if not isinstance(store, StateStore) or any(
             not callable(callback) for callback in callbacks
         ):
             raise TypeError("execution queue dependencies are invalid")
-        for callback in (guard, config, blocked, reserve, terminal):
+        for callback in (guard, config, blocked, reserve, terminal, startup_ready):
             if inspect.iscoroutinefunction(callback) or inspect.isasyncgenfunction(
                 callback
             ):
@@ -286,6 +295,7 @@ class ExecutionQueue:
         self._blocked = blocked
         self._reserve = reserve
         self._terminal = terminal
+        self._startup_ready = startup_ready
         self._wake_event = asyncio.Event()
         self._admission_lock = asyncio.Lock()
         self._worker: asyncio.Task | None = None
@@ -314,6 +324,14 @@ class ExecutionQueue:
     def wake(self) -> None:
         self._wake_event.set()
 
+    def _startup_is_ready(self) -> bool:
+        ready = _call_sync(self._startup_ready)
+        if type(ready) is not bool:
+            raise ExecutionBlocked(
+                "execution startup readiness callback must return a boolean"
+            )
+        return ready
+
     async def initialize(self) -> None:
         if self._closed:
             raise ExecutionBlocked("manual execution queue is closed")
@@ -328,6 +346,8 @@ class ExecutionQueue:
         await self._complete_pending_cooldowns(settings)
         await self._repair_indexes_and_prune(settings, _utc_now())
         await self._recover_before_start()
+        if self._closing or self._closed:
+            raise ExecutionBlocked("manual execution queue is closed")
 
         self._accepting = True
         self._worker = asyncio.create_task(
@@ -1517,6 +1537,9 @@ class ExecutionQueue:
             key=lambda item: item["sequence"],
         )
         if not queued:
+            return _POLL_SECONDS
+
+        if not self._startup_is_ready():
             return _POLL_SECONDS
 
         now = _utc_now()
