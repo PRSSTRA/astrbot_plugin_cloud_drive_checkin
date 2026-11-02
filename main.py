@@ -1,7 +1,7 @@
 import asyncio
 
 from astrbot.api import AstrBotConfig
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
 
 from . import bindings
@@ -9,8 +9,12 @@ from .artifact_service import PreparationBusy, PreparationService
 from .config import PluginConfigError, parse_config
 from .credentials import CredentialError
 from .enrollment import Enrollment, raw_private_text
+from .execution_bridge import ExecutionBridge, describe_execution
+from .execution_config import parse_execution_config
+from .execution_queue import ExecutionQueue, QueueRejected
 from .executors.client import NeoClient, resolve_connection
-from .executors.neo import NeoExecutor
+from .executors.neo import ExecutionBlocked, NeoExecutor
+from .notifications import NotificationService, enqueue_terminal, reserve_terminal
 from .permissions import authorize, get_private_identity
 from .preparation import PreparationError
 from .state import InvalidStateError
@@ -23,6 +27,7 @@ _PERMISSION_DENIED_MESSAGE = "无权使用签到功能。"
 _USAGE_MESSAGE = (
     "用法：/签到 帮助\n用法：/签到 任务 [任务ID]\n"
     "用法：/签到 录入 <任务ID>\n用法：/签到 我的\n用法：/签到 状态 [任务ID]"
+    "\n用法：/签到 立即 <任务ID>"
     "\n用法：/签到 暂停/恢复 <任务ID>\n用法：/签到 通知 <任务ID> 开/关"
     "\n用法：/签到 删除 <任务ID> [确认/取消]"
     "\n用法：/签到 管理 准备 <任务ID>"
@@ -38,15 +43,15 @@ class _PreparationAccessChanged(PreparationError):
 
 def _task_status(task: TaskConfig) -> str:
     if task.enabled:
-        return "配置启用（当前版本仅预览，不执行）"
-    return "配置禁用（仅预览，不执行）"
+        return "配置启用"
+    return "配置禁用"
 
 
 def _render_task_list(tasks: tuple[TaskConfig, ...]) -> str:
     if not tasks:
-        return "暂无配置的签到任务。\n当前版本仅提供预览，不执行任务。"
+        return "暂无配置的签到任务。"
 
-    lines = ["签到任务（当前版本仅提供预览，不执行任务）："]
+    lines = ["签到任务（Cron 仅预览，使用 /签到 立即 手动入队）："]
     lines.extend(
         f"- {task.task_id}｜{task.name}｜{_task_status(task)}" for task in tasks
     )
@@ -86,6 +91,7 @@ class CloudDriveCheckin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         parse_config(config)
         parse_task_catalog(config)
+        parse_execution_config(config)
         super().__init__(context)
         self.config = config
         self.state_store: StateStore | None = None
@@ -93,6 +99,10 @@ class CloudDriveCheckin(Star):
         self._delete_requests: dict[tuple[str, str, str], tuple[str, float]] = {}
         self.executor: NeoExecutor | None = None
         self.preparation: PreparationService | None = None
+        self.queue: ExecutionQueue | None = None
+        self.notifications: NotificationService | None = None
+        self.execution_bridge = ExecutionBridge(self)
+        self._shutdown_task: asyncio.Task | None = None
         self._terminating = False
 
     def _state_slot(self) -> dict:
@@ -194,7 +204,7 @@ class CloudDriveCheckin(Star):
                 return (
                     "本人绑定已暂停，全局任务配置未改变。"
                     if command == "暂停"
-                    else "本人绑定已恢复；当前仍不执行签到。"
+                    else "本人绑定已恢复。"
                 )
             if command == "通知":
                 await bindings.set_notify_all(
@@ -205,7 +215,7 @@ class CloudDriveCheckin(Star):
                     guard=guard,
                 )
                 preference = "每次结果" if option == "开" else "仅失败"
-                return f"已保存自动通知偏好：{preference}；当前尚不发送签到通知。"
+                return f"已保存自动通知偏好：{preference}；手动签到始终反馈终态。"
 
             now = asyncio.get_running_loop().time()
             self._delete_requests = {
@@ -280,24 +290,85 @@ class CloudDriveCheckin(Star):
         ):
             raise _PreparationAccessChanged("preparation authorization changed")
 
+    def _preparation_service(self) -> PreparationService:
+        store = self.state_store
+        if store is None or not store.ready:
+            raise StateUnavailableError("state store is unavailable")
+        if self.preparation is None:
+            try:
+                data_dir = StarTools.get_data_dir()
+            except (OSError, RuntimeError, ValueError):
+                raise PreparationError("plugin data directory is unavailable") from None
+            self.preparation = PreparationService(store, data_dir)
+        return self.preparation
+
+    async def _send_notice(self, origin: str, text: str) -> bool:
+        platform_id, separator, qq_id = origin.rpartition(":FriendMessage:")
+        if not separator or not qq_id.isascii() or not qq_id.isdecimal():
+            return False
+        if not any(
+            platform.meta().id == platform_id and platform.meta().name == "aiocqhttp"
+            for platform in self.context.platform_manager.get_insts()
+        ):
+            return False
+        message = MessageChain().message(text).use_t2i(False).use_markdown(False)
+        return await self.context.send_message(origin, message)
+
+    def _terminal_notice(self, snapshot, item, result):
+        enqueue_terminal(snapshot, item, result)
+        if self.notifications is not None:
+            self.notifications.wake()
+
+    async def _manual_command(self, event, identity, task) -> str:
+        try:
+            queue = self.queue
+            if queue is None or self._terminating:
+                raise StateUnavailableError("queue is unavailable")
+            artifact = await self.execution_bridge.admission(
+                identity, task, event.unified_msg_origin
+            )
+            run_id = await queue.enqueue(
+                identity=identity,
+                task=task,
+                origin=event.unified_msg_origin,
+                artifact_sha256=artifact.sha256,
+                inputs_sha256=artifact.inputs_sha256,
+            )
+            return f"签到已入队（重复请求返回同一编号）：{run_id}"
+        except QueueRejected as error:
+            messages = {
+                "permission_revoked": "执行权限已撤销。",
+                "service_disabled": "签到服务未启用。",
+                "task_disabled": "该任务未启用。",
+                "task_changed": "任务配置已变化，请重新请求。",
+                "binding_missing": "请先录入本人任务凭据。",
+                "binding_paused": "本人绑定已暂停，请先恢复。",
+                "enrollment_active": "请先完成或取消凭据录入。",
+                "credentials_missing": "凭据不可用，请检查主密钥并重新录入。",
+                "artifact_changed": "制品未准备或版本已变化，请管理员重新准备。",
+                "executor_unavailable": "Neo 执行器未就绪或资源清理未确认。",
+                "cooldown_active": "该任务仍在手动冷却期，请稍后重试。",
+                "queue_capacity": "执行队列或历史容量已满，请稍后重试。",
+            }
+            return messages.get(error.reason, "当前配置或状态不能执行该任务。")
+        except ExecutionBlocked:
+            return "执行队列暂不可用，请查询 /签到 状态 后重试。"
+        except PreparationError:
+            return "制品缓存不可用，请管理员检查数据目录并重新准备。"
+        except CommitUnconfirmedError:
+            return "状态写入未确认，请管理员重载后通过 /签到 状态 查询，勿重复提交。"
+        except StateUnavailableError:
+            return "状态存储未就绪，请管理员恢复后重试。"
+        except (PluginConfigError, InvalidStateError):
+            return "执行配置、状态结构或容量校验失败，未接受本次请求。"
+
     async def _prepare_command(self, event, identity, task: TaskConfig) -> str:
         def guard():
             self._preparation_guard(event, identity, task)
 
         try:
             guard()
-            store = self.state_store
-            if store is None or not store.ready:
-                raise StateUnavailableError("state store is unavailable")
-            if self.preparation is None:
-                try:
-                    data_dir = StarTools.get_data_dir()
-                except (OSError, RuntimeError, ValueError):
-                    raise PreparationError(
-                        "plugin data directory is unavailable"
-                    ) from None
-                self.preparation = PreparationService(store, data_dir)
-            artifact = await self.preparation.prepare(task, guard=guard)
+            artifact = await self._preparation_service().prepare(task, guard=guard)
             guard()
             return f"制品已准备：{task.task_id}\nSHA256：{artifact.sha256}\n大小：{len(artifact.script)} 字节"
         except PreparationBusy:
@@ -378,10 +449,25 @@ class CloudDriveCheckin(Star):
                 event, identity, subcommand, task_id, extra
             )
             await event.send(event.plain_result(message))
+            if self.queue is not None:
+                self.queue.wake()
             return
 
         if extra:
             await event.send(event.plain_result(_USAGE_MESSAGE))
+            return
+        if subcommand == "立即":
+            if not task_id:
+                await event.send(event.plain_result(_USAGE_MESSAGE))
+                return
+            task = next(
+                (task for task in task_catalog.tasks if task.task_id == task_id), None
+            )
+            if task is None:
+                await event.send(event.plain_result(_TASK_NOT_FOUND_MESSAGE))
+                return
+            message = await self._manual_command(event, identity, task)
+            await event.send(event.plain_result(message))
             return
         enrollment = self.enrollment
         if subcommand in {"录入", "我的", "状态"}:
@@ -409,6 +495,13 @@ class CloudDriveCheckin(Star):
             else:
                 try:
                     message = enrollment.describe(identity, task_id)
+                    execution = describe_execution(store.snapshot(), identity, task_id)
+                    if execution:
+                        message += "\n" + execution
+                    if self.queue is not None and self.queue.last_error is not None:
+                        message += "\n队列暂不可用，请管理员检查执行配置和状态。"
+                    if self.notifications is not None and self.notifications.frozen:
+                        message += "\n通知发送器已暂停，请管理员重载。"
                 except (CredentialError, StateUnavailableError):
                     message = "绑定状态不可用，请联系管理员。"
             await event.send(event.plain_result(message))
@@ -483,33 +576,95 @@ class CloudDriveCheckin(Star):
                     await self.executor.recover()
                 self._terminating = False
                 self.enrollment = Enrollment(store)
+                self.notifications = NotificationService(store, self._send_notice)
+                await self.notifications.initialize()
+                self.queue = ExecutionQueue(
+                    store,
+                    execute=self.execution_bridge.execute,
+                    guard=self.execution_bridge.guard,
+                    config=lambda: self.config,
+                    blocked=lambda: self.executor is None or self.executor.blocked,
+                    reserve=reserve_terminal,
+                    terminal=self._terminal_notice,
+                )
+                await self.queue.initialize()
             except asyncio.CancelledError:
-                store.stop_accepting()
+                if self.queue is not None:
+                    await self.queue.close()
+                if self.notifications is not None:
+                    await self.notifications.close()
                 if self.executor is not None:
                     await self.executor.close()
+                store.stop_accepting()
                 raise
             except Exception:
-                store.stop_accepting()
+                if self.queue is not None:
+                    await self.queue.close()
+                if self.notifications is not None:
+                    await self.notifications.close()
                 if self.executor is not None:
                     await self.executor.close()
+                store.stop_accepting()
                 raise
 
     async def terminate(self) -> None:
         self._terminating = True
         self._delete_requests.clear()
         store = self.state_store
-        if store is None:
+        if store is None or store.closed:
             return
         if self.enrollment is not None:
             self.enrollment.close()
+        if self._shutdown_task is None or self._shutdown_task.done():
+            self._shutdown_task = asyncio.create_task(self._shutdown())
         try:
-            if self.preparation is not None:
-                await self.preparation.close()
-        finally:
-            if self.executor is not None:
-                await self.executor.close()
-            store.stop_accepting()
+            await asyncio.shield(self._shutdown_task)
+        except asyncio.CancelledError:
+            settled = asyncio.gather(self._shutdown_task, return_exceptions=True)
+            while not settled.done():
+                try:
+                    await asyncio.shield(settled)
+                except asyncio.CancelledError:
+                    continue
+            raise
 
-            slot = self._state_slot()
-            async with slot["lock"]:
-                await store.close()
+    async def _shutdown(self) -> None:
+        store = self.state_store
+        already_closing = store.closing
+        try:
+            if self.queue is not None:
+                await self.queue.close()
+        finally:
+            try:
+                if self.preparation is not None:
+                    await self.preparation.close()
+            finally:
+                try:
+                    if self.executor is not None:
+                        await self.executor.close()
+                finally:
+                    if (
+                        self.queue is not None
+                        and not self.queue.closed
+                        or self.executor is not None
+                        and not self.executor.quiescent
+                    ):
+                        if self.notifications is not None:
+                            await self.notifications.close()
+                        raise RuntimeError("execution workers have not stopped")
+                    try:
+                        if store.has_pending and not already_closing:
+                            await store.retry_pending()
+                        if self.queue is not None and store.ready:
+                            await self.queue.reconcile_shutdown()
+                    finally:
+                        if self.notifications is not None:
+                            await self.notifications.close(drain=store.ready)
+                        store.stop_accepting()
+                        if store.has_pending and not already_closing:
+                            raise CommitUnconfirmedError(
+                                "shutdown state commit is unconfirmed"
+                            )
+                        slot = self._state_slot()
+                        async with slot["lock"]:
+                            await store.close()

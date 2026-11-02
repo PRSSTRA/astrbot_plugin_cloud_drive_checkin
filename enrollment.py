@@ -239,7 +239,7 @@ class Enrollment:
                         values=session.values,
                         guard=final_guard,
                     )
-                    return "本人绑定和凭据已加密保存；当前不执行签到。"
+                    return "本人绑定和凭据已加密保存。"
                 except CredentialError:
                     return "权限、任务或字段已变化，未保存本次凭据。发送 /取消 退出。"
                 except StateUnavailableError:

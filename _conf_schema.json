@@ -3,7 +3,7 @@
     "description": "签到服务开关",
     "type": "bool",
     "default": false,
-    "hint": "关闭时仍可查看帮助；当前版本即使开启也不会运行签到脚本。"
+    "hint": "关闭时仍可查看帮助，手动签到会被拒绝；开启后还需任务启用、已准备制品、Neo 连接和本人凭据。"
   },
   "plugin_admin_qqs": {
     "description": "插件附加管理员 QQ 列表",
@@ -29,10 +29,101 @@
     "default": 180,
     "hint": "允许 1 到 240 秒；任务中的 0 表示继承此值。"
   },
+  "manual_cooldown_seconds": {
+    "description": "同一任务手动签到冷却秒数",
+    "type": "int",
+    "default": 300,
+    "hint": "按本人任务绑定计算；从上一次实际执行与清理完成时开始，0 表示不等待。"
+  },
+  "queue_expiry_seconds": {
+    "description": "排队请求有效期秒数",
+    "type": "int",
+    "default": 900,
+    "hint": "排队超过该时长仍未开始时记为取消，不再执行；从请求入队时开始计算，0 表示入队后立即到期。"
+  },
+  "history_retention_days": {
+    "description": "执行历史保留天数",
+    "type": "int",
+    "default": 30,
+    "hint": "只清理已结束且通知已结算的记录；排队、运行和通知未完成的记录保留，0 表示下次清理时移除已结算记录。"
+  },
+  "user_interval": {
+    "description": "同一任务换用户签到间隔",
+    "type": "object",
+    "default": {
+      "mode": "random",
+      "min_seconds": 30,
+      "max_seconds": 60
+    },
+    "hint": "仅当最近完成记录为同一任务、下一条用户不同时使用；只参考最近一次全局完成记录，跳过或未执行不改变起点。支持 fixed、random 和 none，0 表示无间隔。",
+    "items": {
+      "mode": {
+        "description": "间隔模式",
+        "type": "string",
+        "default": "random",
+        "options": [
+          "fixed",
+          "random",
+          "none"
+        ]
+      },
+      "seconds": {
+        "description": "固定间隔秒数",
+        "type": "int",
+        "default": 60
+      },
+      "min_seconds": {
+        "description": "随机间隔下限秒数",
+        "type": "int",
+        "default": 30
+      },
+      "max_seconds": {
+        "description": "随机间隔上限秒数",
+        "type": "int",
+        "default": 60
+      }
+    }
+  },
+  "task_interval": {
+    "description": "切换任务签到间隔",
+    "type": "object",
+    "default": {
+      "mode": "fixed",
+      "seconds": 60
+    },
+    "hint": "下一条任务与最近完成记录不同时使用，且不叠加用户间隔；只参考最近一次全局完成记录，跳过或未执行不改变起点。支持 fixed、random 和 none，0 表示无间隔。",
+    "items": {
+      "mode": {
+        "description": "间隔模式",
+        "type": "string",
+        "default": "fixed",
+        "options": [
+          "fixed",
+          "random",
+          "none"
+        ]
+      },
+      "seconds": {
+        "description": "固定间隔秒数",
+        "type": "int",
+        "default": 60
+      },
+      "min_seconds": {
+        "description": "随机间隔下限秒数",
+        "type": "int",
+        "default": 30
+      },
+      "max_seconds": {
+        "description": "随机间隔上限秒数",
+        "type": "int",
+        "default": 60
+      }
+    }
+  },
   "neo_connection": {
     "description": "独立 Neo 执行连接",
     "type": "object",
-    "hint": "当前仅接通内部执行服务和遗留资源清理，不开放聊天签到。不会启动或修改 Neo 部署。",
+    "hint": "手动签到需要启用并通过访问检查；不会启动或修改 Neo 部署。",
     "items": {
       "enabled": {
         "description": "启用 Neo 连接与启动清理",
@@ -73,7 +164,7 @@
   "tasks": {
     "description": "签到任务模板",
     "type": "template_list",
-    "hint": "当前版本仅校验并预览任务，不会下载或执行脚本。",
+    "hint": "Cron 目前只用于预览计划；手动签到使用已准备的固定天翼制品。",
     "templates": {
       "task": {
         "name": "签到任务",
@@ -95,7 +186,7 @@
             "description": "配置启用状态",
             "type": "bool",
             "default": false,
-            "hint": "当前版本即使启用也不会执行任务。"
+            "hint": "启用后允许本人手动执行；Cron 不会自动触发签到。"
           },
           "runtime": {
             "description": "脚本运行时",
