@@ -120,7 +120,7 @@ git clone --branch dev/0.0.1 https://github.com/PRSSTRA/astrbot_plugin_cloud_dri
 - [croniter 6.2.4](https://pypi.org/project/croniter/6.2.4/) 用于 Cron 计算，许可证为 MIT。
 - [cryptography 50.0.2](https://pypi.org/project/cryptography/50.0.2/) 用于凭据认证加密，许可证为 Apache-2.0 或 BSD-3-Clause。
 - [HTTPX 0.28.1](https://pypi.org/project/httpx/0.28.1/) 用于异步访问 Neo，许可证为 BSD-3-Clause。
-- Neo 接口按 [Shipyard Neo 固定提交](https://github.com/AstrBotDevs/shipyard-neo/tree/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5) 核验，该项目以 AGPLv3 发布；当前尚未完成真实 Neo 验收。
+- Neo 接口按 [Shipyard Neo 固定提交](https://github.com/AstrBotDevs/shipyard-neo/tree/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5) 核验，该项目以 AGPLv3 发布；启用前须按配置说明验证目标部署的 Cargo 清理条件。
 - 天翼模板引用 [BlueSkyXN/189Cloud-Checkin 的固定提交](https://github.com/BlueSkyXN/189Cloud-Checkin/tree/8e02d162ec6d1b5c00736afffb727d9dcfe8ba7b)，移动模板引用 [smallfawn/QLScriptPublic 的固定提交](https://github.com/smallfawn/QLScriptPublic/tree/2d4c26fdc72c3206bb9cf9afc1fb4991d337f888)。脚本本身不在本仓库中。
 
 ## 参与开发

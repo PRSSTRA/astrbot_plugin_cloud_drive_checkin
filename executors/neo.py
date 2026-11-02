@@ -158,11 +158,18 @@ class NeoExecutor:
             for run_id, job in snapshot["cleanup_jobs"].items():
                 run = snapshot["runs"].get(run_id)
                 self._validate_job(run_id, job, run)
+                admitted = run.get("phase") == "admitted"
                 result = {key: run[key] for key in _RESULT_KEYS}
-                if not run.get("finished_at"):
+                if admitted:
+                    result = _result("cancelled", "cancelled", "cancelled")
+                elif not run.get("finished_at"):
                     result = _result("interrupted", "unknown", "no_business_evidence")
                 await self._finalize(
-                    run_id, job.get("sandbox_id"), job.get("cargo_id"), result
+                    run_id,
+                    job.get("sandbox_id"),
+                    job.get("cargo_id"),
+                    result,
+                    allocation_started=not admitted,
                 )
             self._recovered = True
 
@@ -187,6 +194,12 @@ class NeoExecutor:
                 and (type(value) is not str or not _ID.fullmatch(value))
             ):
                 raise ExecutionBlocked("cleanup resource identity is invalid")
+        if run.get("phase") == "admitted" and (
+            run.get("sandbox_id") is not None
+            or run.get("cargo_id") is not None
+            or run.get("finished_at") is not None
+        ):
+            raise ExecutionBlocked("admitted execution record is invalid")
         try:
             validate_result({key: run[key] for key in _RESULT_KEYS})
         except (KeyError, ValueError):
@@ -238,7 +251,7 @@ class NeoExecutor:
                         "cargo_id": None,
                         "started_at": _now(),
                         "finished_at": None,
-                        "phase": "creating",
+                        "phase": "admitted",
                         "cleanup_status": "pending",
                         **_result(),
                         # Counted by StateStore's byte limit; released as IDs/results grow.
@@ -256,7 +269,19 @@ class NeoExecutor:
                 sandbox_id = cargo_id = None
                 result = _result()
                 sent = False
+                allocation_started = False
                 try:
+                    # External permission/config data can change while KV awaits.
+                    _authorize(guard, self.store.snapshot())
+
+                    def creating(snapshot):
+                        _authorize(guard, snapshot)
+                        snapshot["runs"][run_id]["phase"] = "creating"
+
+                    # A confirmed creating intent must precede every allocation.
+                    await self.store.mutate(creating)
+                    _authorize(guard, self.store.snapshot())
+                    allocation_started = True
                     allocated = await self.client.create_sandbox(run_id)
                     sandbox_id, cargo_id = allocated["id"], allocated["cargo_id"]
 
@@ -312,6 +337,7 @@ class NeoExecutor:
                         snapshot["runs"][run_id]["phase"] = "executing"
 
                     await self.store.mutate(executing)
+                    _authorize(guard, self.store.snapshot())
                     sent = True
                     response = await self.client.exec(
                         sandbox_id, _EXECUTE, request.timeout_seconds + 10
@@ -334,11 +360,21 @@ class NeoExecutor:
                         "no_business_evidence",
                     )
                 except asyncio.CancelledError:
-                    result = _result("cancelled", "cancelled", "cancelled")
+                    result = (
+                        _result("interrupted", "unknown", "no_business_evidence")
+                        if sent
+                        else _result("cancelled", "cancelled", "cancelled")
+                    )
                     raise
                 finally:
                     cleanup = asyncio.create_task(
-                        self._finalize(run_id, sandbox_id, cargo_id, result)
+                        self._finalize(
+                            run_id,
+                            sandbox_id,
+                            cargo_id,
+                            result,
+                            allocation_started=allocation_started,
+                        )
                     )
                     self._cleanup.add(cleanup)
                     try:
@@ -384,8 +420,14 @@ class NeoExecutor:
         except NeoError:
             return False
 
-    async def _finalize(self, run_id, sandbox_id, cargo_id, result) -> None:
-        cleaned = await self._clean_resources(sandbox_id, cargo_id)
+    async def _finalize(
+        self, run_id, sandbox_id, cargo_id, result, *, allocation_started=True
+    ) -> None:
+        # Only durable admission or the live caller can prove no allocation.
+        # A creating intent without resource IDs remains ambiguous on recovery.
+        cleaned = not allocation_started or await self._clean_resources(
+            sandbox_id, cargo_id
+        )
         # Never replace or mutate an unconfirmed snapshot, even after physical cleanup.
         if not self.store.ready:
             return

@@ -53,6 +53,148 @@ class NeoExecutionTests(unittest.IsolatedAsyncioTestCase):
     def authorized(snapshot):
         return None
 
+    async def test_recovery_rejects_admitted_record_that_has_resource_ids(self):
+        self.bay.keep_cargo = True
+        run = await self.executor.execute(self.request(), guard=self.authorized)
+
+        def corrupt_phase(snapshot):
+            snapshot["runs"][run["run_id"]].update(phase="admitted", finished_at=None)
+
+        await self.store.mutate(corrupt_phase)
+        with self.assertRaises(neo.ExecutionBlocked):
+            await self.executor.recover()
+        self.assertIn(run["run_id"], self.store.snapshot()["cleanup_jobs"])
+        self.assertIn(run["cargo_id"], self.bay.cargos)
+        self.assertTrue(self.executor.blocked)
+
+    async def test_no_allocation_proof_survives_unrelated_unconfirmed_write(self):
+        proceed, failed = asyncio.Event(), asyncio.Event()
+        original_put = self.kv.put_kv_data
+        original_finalize = self.executor._finalize
+        fail_once = True
+
+        async def fail_unrelated_write(key, value):
+            nonlocal fail_once
+            if fail_once and "concurrent_probe" in value["users"]:
+                fail_once = False
+                self.kv.fail_at = len(self.kv.writes) + 1
+            await original_put(key, value)
+
+        async def concurrent_mutation():
+            await proceed.wait()
+            try:
+                await self.store.mutate(
+                    lambda snapshot: snapshot["users"].update(
+                        {"concurrent_probe": {"value": 1}}
+                    )
+                )
+            except storage.CommitUnconfirmedError:
+                failed.set()
+
+        async def delayed_finalize(*args, **kwargs):
+            await asyncio.wait_for(failed.wait(), 10)
+            await original_finalize(*args, **kwargs)
+
+        def revoke_after_admission(snapshot):
+            if snapshot["runs"]:
+                proceed.set()
+                raise PermissionError("authorization revoked")
+
+        self.kv.put_kv_data = fail_unrelated_write
+        self.executor._finalize = delayed_finalize
+        other = asyncio.create_task(concurrent_mutation())
+        with self.assertRaises(PermissionError):
+            await self.executor.execute(self.request(), guard=revoke_after_admission)
+        await other
+        self.assertEqual(self.bay.create_calls, 0)
+        pending = copy.deepcopy(self.kv.writes[-1])
+        self.kv.fail_at = None
+        await self.store.retry_pending()
+        self.assertEqual(self.kv.writes[-1], pending)
+        await self.executor.recover()
+        self.assertEqual(
+            self.store.snapshot()["users"]["concurrent_probe"], {"value": 1}
+        )
+        self.assertEqual(self.store.snapshot()["cleanup_jobs"], {})
+        self.assertFalse(self.executor.blocked)
+
+    async def test_revocation_during_executing_commit_prevents_business_request(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        allowed = True
+        original_put = self.kv.put_kv_data
+
+        async def delayed_put(key, value):
+            if any(run["phase"] == "executing" for run in value["runs"].values()):
+                entered.set()
+                await release.wait()
+            await original_put(key, value)
+
+        def guard(snapshot):
+            if not allowed:
+                raise PermissionError("authorization revoked")
+
+        self.kv.put_kv_data = delayed_put
+        task = asyncio.create_task(self.executor.execute(self.request(), guard=guard))
+        await asyncio.wait_for(entered.wait(), 10)
+        allowed = False
+        release.set()
+        with self.assertRaises(PermissionError):
+            await task
+        self.assertEqual(self.bay.execution_calls, 0)
+        self.assertEqual(self.store.snapshot()["cleanup_jobs"], {})
+        self.assertEqual(self.bay.cargos, {})
+
+    async def test_revocation_during_creation_intent_commit_prevents_allocation(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        allowed = True
+        original_put = self.kv.put_kv_data
+
+        async def delayed_put(key, value):
+            if any(run["phase"] == "creating" for run in value["runs"].values()):
+                entered.set()
+                await release.wait()
+            await original_put(key, value)
+
+        def guard(snapshot):
+            if not allowed:
+                raise PermissionError("authorization revoked")
+
+        self.kv.put_kv_data = delayed_put
+        task = asyncio.create_task(self.executor.execute(self.request(), guard=guard))
+        await asyncio.wait_for(entered.wait(), 10)
+        allowed = False
+        release.set()
+        with self.assertRaises(PermissionError):
+            await task
+        self.assertEqual(self.bay.create_calls, 0)
+        self.assertEqual(self.store.snapshot()["cleanup_jobs"], {})
+        self.assertFalse(self.executor.blocked)
+
+    async def test_cancelling_response_after_remote_effect_preserves_unknown_result(
+        self,
+    ):
+        effect_applied = asyncio.Event()
+        original_exec = self.client.exec
+
+        async def delayed_response(sandbox_id, command, timeout):
+            if command == "python3 checkin/bootstrap.py":
+                effect_applied.set()
+                await asyncio.Event().wait()
+            return await original_exec(sandbox_id, command, timeout)
+
+        self.client.exec = delayed_response
+        task = asyncio.create_task(
+            self.executor.execute(self.request(), guard=self.authorized)
+        )
+        await asyncio.wait_for(effect_applied.wait(), 10)
+        await self.executor.close()
+        self.assertTrue(task.cancelled())
+        run = next(iter(self.store.snapshot()["runs"].values()))
+        self.assertEqual(run["business_status"], "unknown")
+        self.assertEqual(run["process_status"], "interrupted")
+        self.assertEqual(run["cleanup_status"], "cleaned")
+        self.assertEqual(self.bay.cargos, {})
+
     async def test_actual_wrapper_result_and_cleaned_state_without_secret_disclosure(
         self,
     ):
@@ -124,7 +266,19 @@ class NeoExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_resource_id_write_failure_cleans_locally_without_overwriting_pending(
         self,
     ):
-        self.kv.fail_at = len(self.kv.writes) + 2
+        original_put = self.kv.put_kv_data
+        fail_once = True
+
+        async def fail_allocated_write(key, value):
+            nonlocal fail_once
+            if fail_once and any(
+                run["phase"] == "preparing" for run in value["runs"].values()
+            ):
+                fail_once = False
+                self.kv.fail_at = len(self.kv.writes) + 1
+            await original_put(key, value)
+
+        self.kv.put_kv_data = fail_allocated_write
         with self.assertRaises(storage.CommitUnconfirmedError):
             await self.executor.execute(self.request(), guard=self.authorized)
         pending = copy.deepcopy(self.kv.writes[-1])
@@ -172,17 +326,14 @@ class NeoExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.snapshot()["runs"], {})
 
     async def test_authorization_change_before_execution_cleans_without_running(self):
-        checks = 0
-
         def guard(snapshot):
-            nonlocal checks
-            checks += 1
-            if checks == 2:
+            if any(run["phase"] == "preparing" for run in snapshot["runs"].values()):
                 raise PermissionError("authorization changed")
 
         with self.assertRaises(PermissionError):
             await self.executor.execute(self.request(), guard=guard)
         self.assertEqual(self.bay.execution_calls, 0)
+        self.assertEqual(self.bay.create_calls, 1)
         self.assertEqual(self.store.snapshot()["cleanup_jobs"], {})
         self.assertEqual(self.bay.cargos, {})
 
@@ -195,7 +346,8 @@ class NeoExecutionTests(unittest.IsolatedAsyncioTestCase):
         await self.executor.close()
         self.assertTrue(task.cancelled())
         run = next(iter(self.store.snapshot()["runs"].values()))
-        self.assertEqual(run["business_status"], "cancelled")
+        self.assertEqual(run["process_status"], "interrupted")
+        self.assertEqual(run["business_status"], "unknown")
         self.assertEqual(run["cleanup_status"], "cleaned")
         self.assertEqual(self.bay.cargos, {})
 
