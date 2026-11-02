@@ -81,6 +81,12 @@ class AstrBotStar:
         await self.context.kv_for(self.plugin_id).put_kv_data(key, value)
 
 
+class AstrBotStarTools:
+    @classmethod
+    def get_data_dir(cls, plugin_name=None):
+        raise AssertionError("tests must supply an isolated plugin data directory")
+
+
 class AstrMessageEvent:
     pass
 
@@ -190,6 +196,7 @@ def patch_astrbot_modules():
     event.AstrMessageEvent = AstrMessageEvent
     star.Context = AstrBotContext
     star.Star = AstrBotStar
+    star.StarTools = AstrBotStarTools
     api.event = event
     api.star = star
     astrbot.api = api

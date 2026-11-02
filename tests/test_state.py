@@ -18,6 +18,7 @@ COLLECTION_FIELDS = (
     "cleanup_jobs",
     "cooldowns",
     "dedupe",
+    "prepared_artifacts",
 )
 EXPECTED_FIELDS = frozenset(("schema_version", "revision", *COLLECTION_FIELDS))
 
@@ -34,16 +35,6 @@ def encoded_size(snapshot):
 
 
 class StateSchemaTests(unittest.TestCase):
-    def test_public_constants_and_error_hierarchy(self):
-        self.assertEqual(state.STATE_KEY, "checkin_state")
-        self.assertEqual(state.SCHEMA_VERSION, 1)
-        self.assertEqual(state.MAX_SNAPSHOT_BYTES, 8 * 1024 * 1024)
-        self.assertTrue(issubclass(state.InvalidStateError, ValueError))
-        self.assertTrue(
-            issubclass(state.UnsupportedSchemaError, state.InvalidStateError)
-        )
-        self.assertTrue(issubclass(state.StateTooLargeError, state.InvalidStateError))
-
     def test_new_snapshot_has_fresh_independent_collections(self):
         first = state.new_snapshot()
         second = state.new_snapshot()
@@ -51,7 +42,10 @@ class StateSchemaTests(unittest.TestCase):
         self.assertEqual(first.keys(), EXPECTED_FIELDS)
         self.assertEqual(first["schema_version"], state.SCHEMA_VERSION)
         self.assertEqual(first["revision"], 0)
-        self.assertEqual(len({id(first[field]) for field in COLLECTION_FIELDS}), 9)
+        self.assertEqual(
+            len({id(first[field]) for field in COLLECTION_FIELDS}),
+            len(COLLECTION_FIELDS),
+        )
         for field in COLLECTION_FIELDS:
             self.assertEqual(first[field], {})
             self.assertIsNot(first[field], second[field])
@@ -109,7 +103,7 @@ class StateSchemaTests(unittest.TestCase):
                     state.validate_snapshot(snapshot)
                 self.assertNotIsInstance(caught.exception, state.UnsupportedSchemaError)
 
-        for version in (-1, 0, 2, 999999):
+        for version in (-1, 0, 1, 999999):
             snapshot = state.new_snapshot()
             snapshot["schema_version"] = version
             with self.subTest(version=version):

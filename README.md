@@ -1,6 +1,6 @@
 # 云盘签到助手
 
-AstrBot 插件，在普通 QQ 私聊中查询云盘签到任务、预览计划，并录入任务所需凭据。当前版本保存绑定和加密凭据，可暂停本人绑定、调整自动通知偏好或删除绑定，但不执行签到，也不发送结果通知。
+AstrBot 插件，在普通 QQ 私聊中查询云盘签到任务、预览计划，录入任务所需凭据，管理本人绑定。管理员可以为固定天翼任务准备离线执行制品。
 
 ## 功能
 
@@ -8,7 +8,8 @@ AstrBot 插件，在普通 QQ 私聊中查询云盘签到任务、预览计划�
 - 通过私聊向导逐个录入任务字段，凭据认证加密后保存。
 - 查看本人任务 ID、凭据是否已配置、是否暂停和自动通知偏好。
 - 管理本人绑定的暂停状态和自动通知偏好；删除绑定需在 60 秒内确认。
-- 当前版本不下载脚本，不创建定时器，不访问云盘，不执行签到，也不发送结果通知。任务显示“配置启用”只表示配置开关为真；暂停和通知偏好只保存设置。
+- 管理员准备固定天翼脚本的离线制品，并缓存到 AstrBot 数据目录。
+- 签到执行、队列和结果通知尚未接入。任务显示“配置启用”只表示配置开关为真；暂停和通知偏好只保存设置。
 
 ## 环境要求
 
@@ -19,7 +20,7 @@ AstrBot 插件，在普通 QQ 私聊中查询云盘签到任务、预览计划�
 
 ## 安装
 
-当前代码位于 `dev/0.0.1` 开发分支。本文描述的功能以该分支为准，仓库默认分支或其他安装来源不保证包含这些功能。
+本文对应 `dev/0.0.1` 开发分支，请按下面命令安装。
 
 ```bash
 cd /path/to/AstrBot/data/plugins
@@ -53,8 +54,21 @@ git clone --branch dev/0.0.1 https://github.com/PRSSTRA/astrbot_plugin_cloud_dri
 | `/签到 删除 <任务ID>` | 发起本人该任务绑定的 60 秒删除确认，不立即删除。 |
 | `/签到 删除 <任务ID> 确认` | 确认删除本人该任务的绑定和凭据密文。 |
 | `/签到 删除 <任务ID> 取消` | 放弃本人该任务的删除确认，不修改绑定。 |
+| `/签到 管理 准备 <任务ID>` | 管理员准备固定天翼任务的离线制品；不启用任务，也不执行签到。 |
 
 `/签到 我的` 和 `/签到 状态` 显示本人任务 ID、凭据是否已配置、是否暂停以及自动通知偏好，不显示字段值、密文或字段 ID 清单。
+
+## 管理员准备离线制品
+
+准备指令只对 AstrBot 管理员和 `plugin_admin_qqs` 中的账号开放，在普通 QQ 私聊中使用，每次准备一个任务。例如发送 `/签到 管理 准备 tianyi_cloud`。
+
+- 支持固定天翼任务；移动任务尚未支持。匹配条件和可自定义字段见 [配置说明](docs/configuration.md#管理员准备)。
+- 插件服务开关和任务 `enabled` 都不影响准备。准备不修改配置，不建立执行请求，也不读取凭据。
+- 首次准备从 PyPI 下载锁定依赖，校验后在本地生成制品，并缓存到 AstrBot 数据目录。有效缓存命中时不再下载；任务配置版本或打包输入变化后，需要重新执行准备。
+- 准备成功后，回复包含任务 ID、制品 SHA256 和字节大小。
+- 准备失败时按回复提示处理：检查网络、任务配置或数据目录，状态存储未就绪或写入未确认时重载插件后重试。
+
+缓存位置、准备记录和失败处理见 [配置说明](docs/configuration.md#管理员准备)。
 
 ## 凭据录入
 
@@ -64,13 +78,12 @@ git clone --branch dev/0.0.1 https://github.com/PRSSTRA/astrbot_plugin_cloud_dri
 - 如果字段值正好是 `/取消`、`/确认`、`/跳过`，或以 `/值 ` 开头，发送 `/值 原文`。插件只去掉一次最前面的 `/值 `。
 - 向导期间的消息不会交给 LLM。超时或插件重载后，未完成的录入仍会拦截你的后续私聊文本，避免密码误发给模型；发送 `/取消` 退出后，普通聊天才会恢复，然后再重新开始录入。
 - 录入内容会作为 QQ 消息传输。QQ、OneBot 实现或框架的入站记录可能保留这些消息，插件无法清除。不能接受这一风险时，不要录入密码或令牌。
-- 存储提交未确认时，插件不会报告保存成功。请让管理员恢复存储后查询本人状态；仍被向导拦截时发送 `/取消` 退出。不要重复提交。
 
 ## 绑定管理
 
 暂停、恢复、通知和删除只作用于本人绑定，不改变任务配置中的 `enabled`，也不影响其他用户。任务从任务目录移除后，原有绑定仍会保留，可以继续按任务 ID 管理或删除。
 
-暂停和恢复只修改本人绑定的暂停标记。当前版本不执行签到，标记只保存为本人偏好，暂不影响实际运行。通知偏好按任务保存：`开` 表示希望接收全部自动结果通知，`关` 表示只接收自动失败通知。当前版本不执行任务，也不发送结果通知，这里只保存偏好。
+暂停和恢复只修改本人绑定的暂停标记。通知偏好按任务保存：`开` 表示希望接收全部自动结果通知，`关` 表示只接收自动失败通知。
 
 删除分两步：
 
@@ -79,9 +92,7 @@ git clone --branch dev/0.0.1 https://github.com/PRSSTRA/astrbot_plugin_cloud_dri
 
 确认请求只对发起时的平台、QQ 和任务有效，且只能使用一次。请求只保存在运行内存中，插件重载后失效。超过 60 秒，或该绑定在确认前发生变化（例如重新录入凭据、修改暂停状态或通知偏好），原来的确认会失效，需要重新发起删除。
 
-删除会移除插件当前保存的绑定和凭据密文，不会删除 QQ、OneBot 实现或框架已保留的入站消息，也不会清理管理员制作的备份。需要清理这些记录时，由管理员按部署环境处理。
-
-存储提交未确认时，插件不会报告删除成功。确认请求在尝试提交后也会失效；请让管理员恢复存储后再查询 `/签到 状态`，不要重复提交。凭据录入向导尚未退出时，先发送 `/取消`，再执行绑定管理指令。
+删除只移除插件保存的绑定和凭据密文，QQ、OneBot 实现或框架的入站记录以及管理员制作的备份需要单独清理。凭据录入向导尚未退出时，先发送 `/取消`，再执行绑定管理指令。
 
 ## 权限
 
@@ -89,8 +100,8 @@ git clone --branch dev/0.0.1 https://github.com/PRSSTRA/astrbot_plugin_cloud_dri
 
 | 身份 | 获得方式 | 可用指令 |
 | --- | --- | --- |
-| AstrBot 管理员 | 宿主框架管理员 | 全部查询、本人录入和绑定管理 |
-| 附加管理员 | 加入 `plugin_admin_qqs` | 全部查询、本人录入和绑定管理 |
+| AstrBot 管理员 | 宿主框架管理员 | 全部查询、本人录入、绑定管理和制品准备 |
+| 附加管理员 | 加入 `plugin_admin_qqs` | 全部查询、本人录入、绑定管理和制品准备 |
 | 白名单用户 | 加入 `whitelist_qqs` | 全部查询、本人录入和绑定管理 |
 | 其他用户 | 无 | 收到无权提示 |
 
@@ -98,19 +109,23 @@ git clone --branch dev/0.0.1 https://github.com/PRSSTRA/astrbot_plugin_cloud_dri
 
 ## 配置
 
-在 AstrBot WebUI 的插件配置页维护 `enabled`、`plugin_admin_qqs`、`whitelist_qqs`、`timezone`、`timeout_seconds` 和 `tasks`。`enabled` 当前只影响帮助中显示的服务状态，不拦截查询，也不会启动签到。
+在 AstrBot WebUI 的插件配置页维护 `enabled`、`plugin_admin_qqs`、`whitelist_qqs`、`timezone`、`timeout_seconds` 和 `tasks`。`enabled` 当前只影响帮助中显示的服务状态，不拦截查询。
 
 内置模板为 `tianyi_cloud`（天翼云盘）和 `mobile_cloud_experimental`（移动云盘，实验），默认禁用。模板只在未配置 `tasks` 时提供，显式设置 `tasks=[]` 不会补回。移动模板必须保持 `enabled=false` 和 `experimental=true`。
 
-`neo_connection` 默认关闭。启用后，插件连接独立的 Docker Neo 服务并在启动时处理本插件遗留资源；不会自动部署 Neo，也不会开放聊天签到。尚未部署 Neo 时保持关闭，不影响录入和绑定管理。
+`neo_connection` 默认关闭。启用后，插件连接独立的 Docker Neo 服务并在启动时处理本插件遗留资源；不会自动部署 Neo。尚未部署 Neo 时保持关闭，不影响录入和绑定管理。
 
 完整配置表、任务字段、Cron、脚本来源、适配器和主密钥部署步骤见 [配置说明](docs/configuration.md)。
 
 ## 数据与安全
 
-业务状态保存在 AstrBot 异步 KV 中，插件不创建数据库或状态文件，只支持单进程、单实例运行。
+业务状态和准备记录保存在 AstrBot 异步 KV 中，制品缓存在 AstrBot 数据目录。插件不创建数据库或业务状态文件，只支持单进程、单实例运行。
+
+从旧版本升级会保留已有绑定、加密凭据和运行记录；天翼任务需要重新执行准备才有可用制品。
 
 所有录入字段值都会认证加密后保存，主密钥与密文分开。插件只从环境变量读取主密钥，不生成、不打印；聊天回复不展示凭据值或密文。请保管原主密钥，不要直接更换；当前不提供自动密钥迁移，密钥丢失后需要重新录入。
+
+存储写入未确认时，录入、绑定变更、删除和制品准备都不会报告成功，正在等待确认的删除请求也会失效。请管理员恢复存储后查询本人状态；仍被录入向导拦截时发送 `/取消`。不要重复提交。
 
 ## 许可证与来源
 
@@ -119,9 +134,9 @@ git clone --branch dev/0.0.1 https://github.com/PRSSTRA/astrbot_plugin_cloud_dri
 - 基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 插件接口，AstrBot 以 AGPLv3 发布。
 - [croniter 6.2.4](https://pypi.org/project/croniter/6.2.4/) 用于 Cron 计算，许可证为 MIT。
 - [cryptography 50.0.2](https://pypi.org/project/cryptography/50.0.2/) 用于凭据认证加密，许可证为 Apache-2.0 或 BSD-3-Clause。
-- [HTTPX 0.28.1](https://pypi.org/project/httpx/0.28.1/) 用于异步访问 Neo，许可证为 BSD-3-Clause。
+- [HTTPX 0.28.1](https://pypi.org/project/httpx/0.28.1/) 用于异步访问 Neo 和下载锁定 wheel，许可证为 BSD-3-Clause。
 - Neo 接口按 [Shipyard Neo 固定提交](https://github.com/AstrBotDevs/shipyard-neo/tree/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5) 核验，该项目以 AGPLv3 发布；启用前须按配置说明验证目标部署的 Cargo 清理条件。
-- 天翼脚本已引入 [third_party/tianyi](third_party/tianyi)，源自 [BlueSkyXN/189Cloud-Checkin 固定提交](https://github.com/BlueSkyXN/189Cloud-Checkin/tree/43d2e7054dba7c5c2152e9c8c88fd23e6073a45b)，保留 [Apache-2.0 许可](third_party/tianyi/LICENSE)，结构化结果等修改由本仓库维护；源码迁入不代表已接入真实执行。移动模板仍引用 [smallfawn/QLScriptPublic 固定提交](https://github.com/smallfawn/QLScriptPublic/tree/2d4c26fdc72c3206bb9cf9afc1fb4991d337f888)，未引入其脚本。
+- 天翼脚本已引入 [third_party/tianyi](third_party/tianyi)，源自 [BlueSkyXN/189Cloud-Checkin 固定提交](https://github.com/BlueSkyXN/189Cloud-Checkin/tree/43d2e7054dba7c5c2152e9c8c88fd23e6073a45b)，保留 [Apache-2.0 许可](third_party/tianyi/LICENSE)，结构化结果等修改由本仓库维护。移动模板仍引用 [smallfawn/QLScriptPublic 固定提交](https://github.com/smallfawn/QLScriptPublic/tree/2d4c26fdc72c3206bb9cf9afc1fb4991d337f888)，未引入其脚本。
 
 ## 参与开发
 

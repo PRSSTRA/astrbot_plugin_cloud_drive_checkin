@@ -122,6 +122,51 @@ class StateStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kv.get_calls, 1)
         self.assertEqual(len(kv.write_values), 1)
 
+    async def test_schema_one_migration_preserves_records_until_confirmed(self):
+        initial = state.new_snapshot()
+        initial.pop("prepared_artifacts")
+        initial["schema_version"] = 1
+        initial["revision"] = 19
+        for field in initial.keys() - {"schema_version", "revision"}:
+            initial[field] = {"existing": {"field": field, "items": [1, True, None]}}
+        kv = FakeKV(initial)
+        control = kv.queue_write(blocked=True, error=OSError("unconfirmed upgrade"))
+        store = storage.StateStore(kv)
+        pending = asyncio.create_task(store.initialize())
+        await control.started.wait()
+        self.assertFalse(store.ready)
+        self.assertEqual(kv.persisted[state.STATE_KEY], initial)
+        with self.assertRaises(storage.StateUnavailableError):
+            store.snapshot()
+        control.release.set()
+        with self.assertRaises(storage.CommitUnconfirmedError):
+            await pending
+        self.assertFalse(store.ready)
+        upgraded = await store.retry_pending()
+        self.assertEqual(kv.write_values[0], kv.write_values[1])
+        self.assertEqual(kv.persisted[state.STATE_KEY], upgraded)
+        self.assertEqual(upgraded["schema_version"], 2)
+        self.assertEqual(upgraded["prepared_artifacts"], {})
+        for field in initial.keys() - {"schema_version"}:
+            self.assertEqual(upgraded[field], initial[field])
+
+    async def test_migration_rejects_corrupt_old_snapshots_without_repair(self):
+        original = state.new_snapshot()
+        original.pop("prepared_artifacts")
+        original["schema_version"] = 1
+        for key, value in (
+            ("unexpected", {}),
+            ("bindings", []),
+            ("runs", {"x": object()}),
+        ):
+            initial = {**original, key: value}
+            kv = FakeKV(initial)
+            store = storage.StateStore(kv)
+            with self.subTest(key=key), self.assertRaises(state.InvalidStateError):
+                await store.initialize()
+            self.assertEqual(kv.write_values, [])
+            self.assertFalse(store.ready)
+
     async def test_initialize_honors_configured_snapshot_limit_before_writing(self):
         kv = FakeKV()
         store = storage.StateStore(kv, max_snapshot_bytes=1)
@@ -280,7 +325,7 @@ class StateStoreTests(unittest.IsolatedAsyncioTestCase):
         for field, value in (
             ("revision", 1),
             ("revision", False),
-            ("schema_version", 2),
+            ("schema_version", state.SCHEMA_VERSION + 1),
             ("schema_version", True),
         ):
             with self.subTest(field=field, value=value):

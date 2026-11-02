@@ -3,7 +3,7 @@ import math
 
 
 STATE_KEY = "checkin_state"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 
 _COLLECTION_FIELDS = (
@@ -16,8 +16,10 @@ _COLLECTION_FIELDS = (
     "cleanup_jobs",
     "cooldowns",
     "dedupe",
+    "prepared_artifacts",
 )
 _SNAPSHOT_FIELDS = frozenset(("schema_version", "revision", *_COLLECTION_FIELDS))
+_V1_SNAPSHOT_FIELDS = _SNAPSHOT_FIELDS - {"prepared_artifacts"}
 
 
 class InvalidStateError(ValueError):
@@ -104,3 +106,17 @@ def validate_snapshot(value, *, max_bytes=MAX_SNAPSHOT_BYTES) -> None:
 
     if len(encoded) > max_bytes:
         raise StateTooLargeError("snapshot exceeds the size limit")
+
+
+def upgrade_snapshot(value, *, max_bytes=MAX_SNAPSHOT_BYTES) -> dict:
+    """Validate and upgrade schema 1 without altering its business records."""
+    if (
+        type(value) is dict
+        and type(value.get("schema_version")) is int
+        and value["schema_version"] == 1
+    ):
+        if value.keys() != _V1_SNAPSHOT_FIELDS:
+            raise InvalidStateError("snapshot fields are invalid")
+        value = {**value, "schema_version": SCHEMA_VERSION, "prepared_artifacts": {}}
+    validate_snapshot(value, max_bytes=max_bytes)
+    return value

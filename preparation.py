@@ -60,20 +60,53 @@ class PreparedArtifact:
     sha256: str
     source_commit: str
     source_sha256: str
+    inputs_sha256: str
 
 
 @dataclass(frozen=True)
-class _Requirement:
+class TianyiRequirement:
     name: str
     version: str
     sha256: str
 
 
 @dataclass(frozen=True)
+class TianyiUserField:
+    field_id: str
+    label: str
+    env_name: str
+    value_type: str
+    required: bool
+    secret: bool
+    hint: str
+
+
+@dataclass(frozen=True)
+class TianyiTaskDeclaration:
+    task_id: str
+    runtime: str
+    script_url: str
+    source_commit: str
+    source_sha256: str
+    user_fields: tuple[TianyiUserField, ...]
+    fixed_env: tuple[tuple[str, str], ...]
+    input_adapter: str
+    result_adapter: str
+    dependency_bundle: str
+
+
+@dataclass(frozen=True)
+class TianyiPreparationInputs:
+    task: TianyiTaskDeclaration
+    requirements: tuple[TianyiRequirement, ...]
+    inputs_sha256: str
+
+
+@dataclass(frozen=True)
 class _WheelCandidate:
     path: Path
     distribution_token: str
-    requirement: _Requirement
+    requirement: TianyiRequirement
 
 
 def _canonical_distribution(value: str) -> str:
@@ -114,7 +147,7 @@ def _read_regular_file(path: Path, maximum: int, label: str) -> bytes:
                 raise PreparationError(f"cannot close {label}") from None
 
 
-def _json_object(raw: bytes, label: str) -> dict[str, object]:
+def _json_value(raw: bytes, label: str) -> object:
     def reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
         result: dict[str, object] = {}
         for key, value in pairs:
@@ -128,13 +161,17 @@ def _json_object(raw: bytes, label: str) -> dict[str, object]:
 
     try:
         decoded = raw.decode("utf-8")
-        value = json.loads(
+        return json.loads(
             decoded,
             object_pairs_hook=reject_duplicate_pairs,
             parse_constant=reject_constant,
         )
     except (UnicodeDecodeError, ValueError, RecursionError, json.JSONDecodeError):
         raise PreparationError(f"{label} is not strict JSON") from None
+
+
+def _json_object(raw: bytes, label: str) -> dict[str, object]:
+    value = _json_value(raw, label)
     if not isinstance(value, dict):
         raise PreparationError(f"{label} must contain a JSON object")
     return value
@@ -170,16 +207,19 @@ def _source_pin() -> tuple[str, str]:
     return source_commit, source_sha256
 
 
-def _requirements() -> dict[str, _Requirement]:
-    raw = _read_regular_file(
-        _ROOT / _LOCK_PATH, _MAX_REPOSITORY_FILE_BYTES, "Tianyi dependency lock"
-    )
+def _requirements(raw: bytes | None = None) -> dict[str, TianyiRequirement]:
+    if raw is None:
+        raw = _read_regular_file(
+            _ROOT / _LOCK_PATH,
+            _MAX_REPOSITORY_FILE_BYTES,
+            "Tianyi dependency lock",
+        )
     try:
         lines = raw.decode("ascii").splitlines()
     except UnicodeDecodeError:
         raise PreparationError("Tianyi dependency lock must be ASCII") from None
 
-    requirements: dict[str, _Requirement] = {}
+    requirements: dict[str, TianyiRequirement] = {}
     for line in lines:
         if not line or line.startswith("#"):
             continue
@@ -192,13 +232,190 @@ def _requirements() -> dict[str, _Requirement]:
             raise PreparationError(
                 "Tianyi dependency lock has a duplicate distribution"
             )
-        requirements[name] = _Requirement(name, version, digest)
+        requirements[name] = TianyiRequirement(name, version, digest)
 
     if len(requirements) != 7 or frozenset(requirements) != _REQUIRED_DISTRIBUTIONS:
         raise PreparationError(
             "Tianyi dependency lock must contain the seven required pins"
         )
     return requirements
+
+
+def _packaging_inputs_sha256(
+    *,
+    source: bytes,
+    entry: bytes,
+    lock: bytes,
+    vendor_license: bytes,
+    project_license: bytes,
+) -> str:
+    digest = hashlib.sha256(b"astrbot-tianyi-packaging-inputs-v1\0")
+    for label, payload in (
+        ("source", source),
+        ("entry", entry),
+        ("lock", lock),
+        ("vendor-license", vendor_license),
+        ("project-license", project_license),
+    ):
+        encoded_label = label.encode("ascii")
+        digest.update(len(encoded_label).to_bytes(2, "big"))
+        digest.update(encoded_label)
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return digest.hexdigest()
+
+
+def _tianyi_task_mapping(schema: dict[str, object]) -> dict[str, object]:
+    tasks = schema.get("tasks")
+    defaults = tasks.get("default") if isinstance(tasks, dict) else None
+    if not isinstance(defaults, list):
+        raise PreparationError("configuration schema has no task defaults")
+    matches = [
+        item
+        for item in defaults
+        if isinstance(item, dict) and item.get("task_id") == "tianyi_cloud"
+    ]
+    if len(matches) != 1:
+        raise PreparationError("configuration schema must define one tianyi_cloud task")
+    return matches[0]
+
+
+def _declaration_string(mapping: dict[str, object], key: str) -> str:
+    value = mapping.get(key)
+    if not isinstance(value, str):
+        raise PreparationError("tianyi_cloud task declaration is invalid")
+    return value
+
+
+def _task_declaration(schema: dict[str, object]) -> TianyiTaskDeclaration:
+    task = _tianyi_task_mapping(schema)
+    source_commit = _declaration_string(task, "source_commit")
+    source_sha256 = _declaration_string(task, "sha256")
+    if (
+        _HEX_40.fullmatch(source_commit) is None
+        or _HEX_64.fullmatch(source_sha256) is None
+    ):
+        raise PreparationError("tianyi_cloud source identity is invalid")
+
+    raw_user_fields = task.get("user_fields")
+    if isinstance(raw_user_fields, str):
+        try:
+            encoded_user_fields = raw_user_fields.encode("utf-8")
+        except UnicodeEncodeError:
+            raise PreparationError("tianyi_cloud user fields are invalid") from None
+        decoded_user_fields = _json_value(
+            encoded_user_fields, "tianyi_cloud user fields"
+        )
+    else:
+        decoded_user_fields = raw_user_fields
+    if not isinstance(decoded_user_fields, list):
+        raise PreparationError("tianyi_cloud user fields are invalid")
+
+    field_keys = {
+        "field_id",
+        "label",
+        "env_name",
+        "value_type",
+        "required",
+        "secret",
+        "hint",
+    }
+    user_fields: list[TianyiUserField] = []
+    for raw_field in decoded_user_fields:
+        if not isinstance(raw_field, dict) or set(raw_field) != field_keys:
+            raise PreparationError("tianyi_cloud user fields are invalid")
+        strings = (
+            raw_field.get("field_id"),
+            raw_field.get("label"),
+            raw_field.get("env_name"),
+            raw_field.get("value_type"),
+            raw_field.get("hint"),
+        )
+        required = raw_field.get("required")
+        secret = raw_field.get("secret")
+        if (
+            not all(isinstance(value, str) for value in strings)
+            or type(required) is not bool
+            or type(secret) is not bool
+        ):
+            raise PreparationError("tianyi_cloud user fields are invalid")
+        field_id, label, env_name, value_type, hint = strings
+        user_fields.append(
+            TianyiUserField(
+                field_id=field_id,
+                label=label,
+                env_name=env_name,
+                value_type=value_type,
+                required=required,
+                secret=secret,
+                hint=hint,
+            )
+        )
+
+    raw_fixed_env = task.get("fixed_env")
+    if not isinstance(raw_fixed_env, dict) or not all(
+        isinstance(name, str) and isinstance(value, str)
+        for name, value in raw_fixed_env.items()
+    ):
+        raise PreparationError("tianyi_cloud fixed environment is invalid")
+
+    return TianyiTaskDeclaration(
+        task_id="tianyi_cloud",
+        runtime=_declaration_string(task, "runtime"),
+        script_url=_declaration_string(task, "script_url"),
+        source_commit=source_commit,
+        source_sha256=source_sha256,
+        user_fields=tuple(user_fields),
+        fixed_env=tuple(sorted(raw_fixed_env.items())),
+        input_adapter=_declaration_string(task, "input_adapter"),
+        result_adapter=_declaration_string(task, "result_adapter"),
+        dependency_bundle=_declaration_string(task, "dependency_bundle"),
+    )
+
+
+def load_tianyi_inputs() -> TianyiPreparationInputs:
+    """Read and identify every repository input used by Tianyi preparation."""
+
+    schema = _json_object(
+        _read_regular_file(
+            _ROOT / _SCHEMA_PATH,
+            _MAX_REPOSITORY_FILE_BYTES,
+            "configuration schema",
+        ),
+        "configuration schema",
+    )
+    task = _task_declaration(schema)
+    source = _read_regular_file(
+        _ROOT / _SOURCE_PATH, _MAX_REPOSITORY_FILE_BYTES, "Tianyi source"
+    )
+    if hashlib.sha256(source).hexdigest() != task.source_sha256:
+        raise PreparationError("Tianyi source hash does not match configuration")
+    entry = _read_regular_file(
+        _ROOT / _ENTRY_PATH, _MAX_REPOSITORY_FILE_BYTES, "Tianyi zipapp entry"
+    )
+    lock = _read_regular_file(
+        _ROOT / _LOCK_PATH, _MAX_REPOSITORY_FILE_BYTES, "Tianyi dependency lock"
+    )
+    vendor_license = _read_regular_file(
+        _ROOT / _VENDOR_LICENSE_PATH,
+        _MAX_REPOSITORY_FILE_BYTES,
+        "vendored Tianyi license",
+    )
+    project_license = _read_regular_file(
+        _ROOT / _PROJECT_LICENSE_PATH, _MAX_REPOSITORY_FILE_BYTES, "project license"
+    )
+    requirements = _requirements(lock)
+    return TianyiPreparationInputs(
+        task=task,
+        requirements=tuple(requirements[name] for name in sorted(requirements)),
+        inputs_sha256=_packaging_inputs_sha256(
+            source=source,
+            entry=entry,
+            lock=lock,
+            vendor_license=vendor_license,
+            project_license=project_license,
+        ),
+    )
 
 
 def _wheel_filename(name: str) -> tuple[str, str, str] | None:
@@ -218,7 +435,7 @@ def _wheel_filename(name: str) -> tuple[str, str, str] | None:
 
 
 def _select_wheels(
-    wheelhouse: Path, requirements: dict[str, _Requirement]
+    wheelhouse: Path, requirements: dict[str, TianyiRequirement]
 ) -> list[_WheelCandidate]:
     if not isinstance(wheelhouse, Path):
         raise TypeError("wheelhouse must be pathlib.Path")
@@ -464,7 +681,10 @@ def build_tianyi(wheelhouse: Path) -> PreparedArtifact:
     if hashlib.sha256(source).hexdigest() != source_sha256:
         raise PreparationError("Tianyi source hash does not match configuration")
 
-    requirements = _requirements()
+    lock = _read_regular_file(
+        _ROOT / _LOCK_PATH, _MAX_REPOSITORY_FILE_BYTES, "Tianyi dependency lock"
+    )
+    requirements = _requirements(lock)
     candidates = _select_wheels(wheelhouse, requirements)
     entry = _read_regular_file(
         _ROOT / _ENTRY_PATH, _MAX_REPOSITORY_FILE_BYTES, "Tianyi zipapp entry"
@@ -493,9 +713,17 @@ def build_tianyi(wheelhouse: Path) -> PreparedArtifact:
             entries.add(path, data, f"wheel {candidate.requirement.name}")
 
     script = _archive(entries.files)
+    inputs_sha256 = _packaging_inputs_sha256(
+        source=source,
+        entry=entry,
+        lock=lock,
+        vendor_license=vendor_license,
+        project_license=project_license,
+    )
     return PreparedArtifact(
         script=script,
         sha256=hashlib.sha256(script).hexdigest(),
         source_commit=source_commit,
         source_sha256=source_sha256,
+        inputs_sha256=inputs_sha256,
     )

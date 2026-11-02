@@ -2,15 +2,17 @@ import asyncio
 
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star
+from astrbot.api.star import Context, Star, StarTools
 
 from . import bindings
+from .artifact_service import PreparationBusy, PreparationService
 from .config import PluginConfigError, parse_config
 from .credentials import CredentialError
 from .enrollment import Enrollment, raw_private_text
 from .executors.client import NeoClient, resolve_connection
 from .executors.neo import NeoExecutor
 from .permissions import authorize, get_private_identity
+from .preparation import PreparationError
 from .state import InvalidStateError
 from .storage import CommitUnconfirmedError, StateStore, StateUnavailableError
 from .task_config import TaskConfig, next_run_times, parse_task_catalog
@@ -23,10 +25,15 @@ _USAGE_MESSAGE = (
     "用法：/签到 录入 <任务ID>\n用法：/签到 我的\n用法：/签到 状态 [任务ID]"
     "\n用法：/签到 暂停/恢复 <任务ID>\n用法：/签到 通知 <任务ID> 开/关"
     "\n用法：/签到 删除 <任务ID> [确认/取消]"
+    "\n用法：/签到 管理 准备 <任务ID>"
 )
 _TASK_NOT_FOUND_MESSAGE = "未找到该签到任务。"
 _DELETE_CONFIRM_SECONDS = 60
 _MAX_DELETE_REQUESTS = 128
+
+
+class _PreparationAccessChanged(PreparationError):
+    """The administrator or task changed while preparing an artifact."""
 
 
 def _task_status(task: TaskConfig) -> str:
@@ -85,6 +92,7 @@ class CloudDriveCheckin(Star):
         self.enrollment: Enrollment | None = None
         self._delete_requests: dict[tuple[str, str, str], tuple[str, float]] = {}
         self.executor: NeoExecutor | None = None
+        self.preparation: PreparationService | None = None
         self._terminating = False
 
     def _state_slot(self) -> dict:
@@ -249,6 +257,62 @@ class CloudDriveCheckin(Star):
         except InvalidStateError:
             return "状态容量或结构校验失败，未保存本次变更。"
 
+    def _preparation_guard(self, event, identity, task: TaskConfig) -> None:
+        try:
+            permissions = parse_config(self.config)
+            access = authorize(
+                identity, astrbot_admin=event.is_admin(), config=permissions
+            )
+            catalog = parse_task_catalog(self.config)
+        except PluginConfigError:
+            raise _PreparationAccessChanged(
+                "preparation configuration changed"
+            ) from None
+        if (
+            self._terminating
+            or get_private_identity(event) != identity
+            or access is None
+            or not access.is_admin
+            or not any(
+                item.task_id == task.task_id and item.version == task.version
+                for item in catalog.tasks
+            )
+        ):
+            raise _PreparationAccessChanged("preparation authorization changed")
+
+    async def _prepare_command(self, event, identity, task: TaskConfig) -> str:
+        def guard():
+            self._preparation_guard(event, identity, task)
+
+        try:
+            guard()
+            store = self.state_store
+            if store is None or not store.ready:
+                raise StateUnavailableError("state store is unavailable")
+            if self.preparation is None:
+                try:
+                    data_dir = StarTools.get_data_dir()
+                except (OSError, RuntimeError, ValueError):
+                    raise PreparationError(
+                        "plugin data directory is unavailable"
+                    ) from None
+                self.preparation = PreparationService(store, data_dir)
+            artifact = await self.preparation.prepare(task, guard=guard)
+            guard()
+            return f"制品已准备：{task.task_id}\nSHA256：{artifact.sha256}\n大小：{len(artifact.script)} 字节"
+        except PreparationBusy:
+            return "已有制品正在准备，请稍后重试。"
+        except _PreparationAccessChanged:
+            return "管理员权限或任务配置已变化，请重新发起准备。"
+        except PreparationError:
+            return "制品准备失败，请检查任务配置、PyPI 网络及插件数据目录后重试。"
+        except CommitUnconfirmedError:
+            return "状态写入未确认，请在插件页重载后重试。"
+        except StateUnavailableError:
+            return "状态存储未就绪，请在插件页重载后重试。"
+        except InvalidStateError:
+            return "状态容量或结构校验失败，未发布本次制品。"
+
     @filter.command("签到", priority=100)
     async def checkin(
         self,
@@ -292,6 +356,22 @@ class CloudDriveCheckin(Star):
 
         if tail:
             await event.send(event.plain_result(_USAGE_MESSAGE))
+            return
+        if subcommand == "管理":
+            if not access.is_admin:
+                await event.send(event.plain_result("仅管理员可准备签到制品。"))
+                return
+            if task_id != "准备" or not extra:
+                await event.send(event.plain_result(_USAGE_MESSAGE))
+                return
+            task = next(
+                (task for task in task_catalog.tasks if task.task_id == extra), None
+            )
+            if task is None:
+                await event.send(event.plain_result(_TASK_NOT_FOUND_MESSAGE))
+                return
+            message = await self._prepare_command(event, identity, task)
+            await event.send(event.plain_result(message))
             return
         if subcommand in {"暂停", "恢复", "通知", "删除"}:
             message = await self._binding_command(
@@ -422,10 +502,14 @@ class CloudDriveCheckin(Star):
             return
         if self.enrollment is not None:
             self.enrollment.close()
-        if self.executor is not None:
-            await self.executor.close()
-        store.stop_accepting()
+        try:
+            if self.preparation is not None:
+                await self.preparation.close()
+        finally:
+            if self.executor is not None:
+                await self.executor.close()
+            store.stop_accepting()
 
-        slot = self._state_slot()
-        async with slot["lock"]:
-            await store.close()
+            slot = self._state_slot()
+            async with slot["lock"]:
+                await store.close()
