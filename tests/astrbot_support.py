@@ -59,6 +59,21 @@ class AstrBotConfig(dict):
 class AstrBotContext:
     def __init__(self):
         self._plugin_kv = {}
+        self.config = {"admins_id": []}
+        self.sent = []
+        self.platforms = [
+            SimpleNamespace(
+                meta=lambda: SimpleNamespace(id="bot-instance", name="aiocqhttp")
+            )
+        ]
+        self.platform_manager = SimpleNamespace(get_insts=lambda: self.platforms)
+
+    def get_config(self, umo=None):
+        return self.config
+
+    async def send_message(self, origin, message):
+        self.sent.append((origin, message.get_plain_text()))
+        return True
 
     def kv_for(self, plugin_id):
         return self._plugin_kv.setdefault(plugin_id, FakeKV())
@@ -85,6 +100,24 @@ class AstrBotStarTools:
     @classmethod
     def get_data_dir(cls, plugin_name=None):
         raise AssertionError("tests must supply an isolated plugin data directory")
+
+
+class MessageChain:
+    def __init__(self):
+        self.text = ""
+
+    def message(self, text):
+        self.text += text
+        return self
+
+    def use_t2i(self, value):
+        return self
+
+    def use_markdown(self, value):
+        return self
+
+    def get_plain_text(self):
+        return self.text
 
 
 class AstrMessageEvent:
@@ -194,6 +227,7 @@ def patch_astrbot_modules():
     api.AstrBotConfig = AstrBotConfig
     event.filter = filter
     event.AstrMessageEvent = AstrMessageEvent
+    event.MessageChain = MessageChain
     star.Context = AstrBotContext
     star.Star = AstrBotStar
     star.StarTools = AstrBotStarTools

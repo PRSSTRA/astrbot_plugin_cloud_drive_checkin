@@ -21,6 +21,8 @@ from .client import NeoClient, NeoError
 
 _KIND = "neo_execution"
 _ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+_RUN_ID = re.compile(r"[0-9a-f]{32}\Z")
+_MISSING = object()
 _RESULT_KEYS = (
     "protocol",
     "process_status",
@@ -138,6 +140,13 @@ class NeoExecutor:
         self._cleanup: set[asyncio.Task] = set()
         self._accepting = True
         self._recovered = False
+        self._close_task: asyncio.Task | None = None
+
+    @property
+    def quiescent(self) -> bool:
+        """True after admission stopped and all execution/cleanup tasks drained."""
+
+        return not self._accepting and not self._active and not self._cleanup
 
     @property
     def blocked(self) -> bool:
@@ -147,6 +156,11 @@ class NeoExecutor:
             or not self.store.ready
             or bool(self.store.snapshot()["cleanup_jobs"])
         )
+
+    def _authorize_confirmed(self, guard) -> None:
+        if not self.store.ready:
+            raise ExecutionBlocked("execution state is unavailable")
+        _authorize(guard, self.store.snapshot())
 
     async def recover(self) -> None:
         """Clean recorded resources and interrupt unfinished runs; never replay scripts."""
@@ -158,6 +172,7 @@ class NeoExecutor:
             for run_id, job in snapshot["cleanup_jobs"].items():
                 run = snapshot["runs"].get(run_id)
                 self._validate_job(run_id, job, run)
+                business_attempted = self._recovery_business_attempted(run)
                 admitted = run.get("phase") == "admitted"
                 result = {key: run[key] for key in _RESULT_KEYS}
                 if admitted:
@@ -170,6 +185,7 @@ class NeoExecutor:
                     job.get("cargo_id"),
                     result,
                     allocation_started=not admitted,
+                    business_attempted=business_attempted,
                 )
             self._recovered = True
 
@@ -198,6 +214,7 @@ class NeoExecutor:
             run.get("sandbox_id") is not None
             or run.get("cargo_id") is not None
             or run.get("finished_at") is not None
+            or run.get("cleanup_finished_at") is not None
         ):
             raise ExecutionBlocked("admitted execution record is invalid")
         try:
@@ -205,10 +222,32 @@ class NeoExecutor:
         except (KeyError, ValueError):
             raise ExecutionBlocked("execution result record is invalid") from None
 
+    @staticmethod
+    def _recovery_business_attempted(run: dict) -> bool:
+        value = run.get("business_attempted", _MISSING)
+        if value is not _MISSING and type(value) is not bool:
+            raise ExecutionBlocked("execution attempt state is invalid")
+        phase = run.get("phase")
+        if phase in {"admitted", "creating", "preparing"}:
+            return False
+        if phase == "executing":
+            return True
+        if phase == "finished":
+            return True if value is _MISSING else value
+        raise ExecutionBlocked("execution phase is invalid")
+
     async def execute(
-        self, request: PreparedExecution, *, guard: Callable[[dict], None]
+        self,
+        request: PreparedExecution,
+        *,
+        guard: Callable[[dict], None],
+        run_id: str | None = None,
     ) -> dict:
         job_payload, credential_payload = _payload(request)
+        if run_id is None:
+            run_id = uuid.uuid4().hex
+        elif type(run_id) is not str or _RUN_ID.fullmatch(run_id) is None:
+            raise ExecutionBlocked("execution run identity is invalid")
         owner = user_key(request.identity)
         if (
             not callable(guard)
@@ -225,7 +264,6 @@ class NeoExecutor:
                         "execution is blocked by state or pending cleanup"
                     )
                 await self.client.check_access()
-                run_id = uuid.uuid4().hex
                 connection = self.client.connection.fingerprint
 
                 def begin(snapshot):
@@ -251,8 +289,10 @@ class NeoExecutor:
                         "cargo_id": None,
                         "started_at": _now(),
                         "finished_at": None,
+                        "cleanup_finished_at": None,
                         "phase": "admitted",
                         "cleanup_status": "pending",
+                        "business_attempted": False,
                         **_result(),
                         # Counted by StateStore's byte limit; released as IDs/results grow.
                         "_reserve": " " * 8192,
@@ -272,7 +312,7 @@ class NeoExecutor:
                 allocation_started = False
                 try:
                     # External permission/config data can change while KV awaits.
-                    _authorize(guard, self.store.snapshot())
+                    self._authorize_confirmed(guard)
 
                     def creating(snapshot):
                         _authorize(guard, snapshot)
@@ -280,7 +320,7 @@ class NeoExecutor:
 
                     # A confirmed creating intent must precede every allocation.
                     await self.store.mutate(creating)
-                    _authorize(guard, self.store.snapshot())
+                    self._authorize_confirmed(guard)
                     allocation_started = True
                     allocated = await self.client.create_sandbox(run_id)
                     sandbox_id, cargo_id = allocated["id"], allocated["cargo_id"]
@@ -328,6 +368,7 @@ class NeoExecutor:
                     await self.client.upload(
                         sandbox_id, "checkin/" + script_name, request.script
                     )
+                    self._authorize_confirmed(guard)
                     await self.client.upload(
                         sandbox_id, "checkin/credentials.json", credential_payload
                     )
@@ -337,7 +378,7 @@ class NeoExecutor:
                         snapshot["runs"][run_id]["phase"] = "executing"
 
                     await self.store.mutate(executing)
-                    _authorize(guard, self.store.snapshot())
+                    self._authorize_confirmed(guard)
                     sent = True
                     response = await self.client.exec(
                         sandbox_id, _EXECUTE, request.timeout_seconds + 10
@@ -374,6 +415,7 @@ class NeoExecutor:
                             cargo_id,
                             result,
                             allocation_started=allocation_started,
+                            business_attempted=sent,
                         )
                     )
                     self._cleanup.add(cleanup)
@@ -421,7 +463,14 @@ class NeoExecutor:
             return False
 
     async def _finalize(
-        self, run_id, sandbox_id, cargo_id, result, *, allocation_started=True
+        self,
+        run_id,
+        sandbox_id,
+        cargo_id,
+        result,
+        *,
+        allocation_started=True,
+        business_attempted=False,
     ) -> None:
         # Only durable admission or the live caller can prove no allocation.
         # A creating intent without resource IDs remains ambiguous on recovery.
@@ -439,6 +488,10 @@ class NeoExecutor:
                 phase="finished",
                 finished_at=run.get("finished_at") or _now(),
                 cleanup_status="cleaned" if cleaned else "pending",
+                cleanup_finished_at=(
+                    (run.get("cleanup_finished_at") or _now()) if cleaned else None
+                ),
+                business_attempted=business_attempted,
             )
             run.pop("_reserve", None)
             if cleaned:
@@ -447,13 +500,21 @@ class NeoExecutor:
         await self.store.mutate(finish)
 
     async def close(self) -> None:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                self._close(), name="neo-executor-close"
+            )
+        await asyncio.shield(self._close_task)
+
+    async def _close(self) -> None:
         self._accepting = False
-        active = tuple(self._active)
-        for task in active:
-            task.cancel()
-        if active:
+        while self._active:
+            active = tuple(self._active)
+            for task in active:
+                task.cancel()
             await asyncio.gather(*active, return_exceptions=True)
-        if self._cleanup:
-            await asyncio.gather(*self._cleanup, return_exceptions=True)
-            self._cleanup.clear()
+        while self._cleanup:
+            cleanup = tuple(self._cleanup)
+            await asyncio.gather(*cleanup, return_exceptions=True)
+            self._cleanup.difference_update(cleanup)
         await self.client.close()

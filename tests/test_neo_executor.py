@@ -144,6 +144,74 @@ class NeoExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.snapshot()["cleanup_jobs"], {})
         self.assertEqual(self.bay.cargos, {})
 
+    async def test_revocation_after_script_upload_prevents_credential_upload(self):
+        allowed = True
+        original_upload = self.client.upload
+
+        async def revoke_after_script(sandbox_id, path, content):
+            nonlocal allowed
+            await original_upload(sandbox_id, path, content)
+            if path.endswith("script.py"):
+                allowed = False
+
+        def guard(snapshot):
+            if not allowed:
+                raise PermissionError("authorization changed")
+
+        self.client.upload = revoke_after_script
+        with self.assertRaises(PermissionError):
+            await self.executor.execute(self.request(), guard=guard)
+        self.assertNotIn("checkin/credentials.json", self.bay.upload_paths)
+        self.assertEqual(self.bay.execution_calls, 0)
+        run = next(iter(self.store.snapshot()["runs"].values()))
+        self.assertFalse(run["business_attempted"])
+
+    async def test_pending_state_before_credentials_fails_closed(self):
+        original_upload = self.client.upload
+
+        async def make_state_pending(sandbox_id, path, content):
+            await original_upload(sandbox_id, path, content)
+            if path.endswith("script.py"):
+                self.kv.fail_at = len(self.kv.writes) + 1
+                try:
+                    await self.store.mutate(
+                        lambda snapshot: snapshot["users"].update(
+                            {"pending_guard_probe": {"value": 1}}
+                        )
+                    )
+                except storage.CommitUnconfirmedError:
+                    pass
+                finally:
+                    self.kv.fail_at = None
+
+        self.client.upload = make_state_pending
+        with self.assertRaises(neo.ExecutionBlocked):
+            await self.executor.execute(self.request(), guard=self.authorized)
+        self.assertTrue(self.store.has_pending)
+        self.assertNotIn("checkin/credentials.json", self.bay.upload_paths)
+        self.assertEqual(self.bay.execution_calls, 0)
+
+    def test_recovery_attempt_fact_is_conservative_by_phase(self):
+        for phase in ("admitted", "creating", "preparing"):
+            self.assertFalse(
+                self.executor._recovery_business_attempted(
+                    {"phase": phase, "business_attempted": True}
+                )
+            )
+        self.assertTrue(
+            self.executor._recovery_business_attempted(
+                {"phase": "executing", "business_attempted": False}
+            )
+        )
+        self.assertTrue(
+            self.executor._recovery_business_attempted({"phase": "finished"})
+        )
+        self.assertFalse(
+            self.executor._recovery_business_attempted(
+                {"phase": "finished", "business_attempted": False}
+            )
+        )
+
     async def test_revocation_during_creation_intent_commit_prevents_allocation(self):
         entered, release = asyncio.Event(), asyncio.Event()
         allowed = True
@@ -193,6 +261,7 @@ class NeoExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run["business_status"], "unknown")
         self.assertEqual(run["process_status"], "interrupted")
         self.assertEqual(run["cleanup_status"], "cleaned")
+        self.assertTrue(run["business_attempted"])
         self.assertEqual(self.bay.cargos, {})
 
     async def test_actual_wrapper_result_and_cleaned_state_without_secret_disclosure(
@@ -206,6 +275,7 @@ class NeoExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run["business_status"], "needs_auth")
         self.assertEqual(run["exit_code"], 0)
         self.assertEqual(run["cleanup_status"], "cleaned")
+        self.assertTrue(run["business_attempted"])
         self.assertEqual(self.store.snapshot()["cleanup_jobs"], {})
         self.assertEqual((self.bay.sandboxes, self.bay.cargos), ({}, {}))
         self.assertNotIn("FAKE_PRIVATE_COOKIE", json.dumps(self.kv.writes))
@@ -243,6 +313,7 @@ class NeoExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.bay.keep_cargo = True
         run = await self.executor.execute(self.request(), guard=self.authorized)
         self.assertEqual(run["cleanup_status"], "pending")
+        self.assertIsNone(run["cleanup_finished_at"])
         self.assertIn(run["run_id"], self.store.snapshot()["cleanup_jobs"])
         with self.assertRaises(neo.ExecutionBlocked):
             await self.executor.execute(self.request(), guard=self.authorized)
@@ -252,6 +323,7 @@ class NeoExecutionTests(unittest.IsolatedAsyncioTestCase):
         recovered = self.store.snapshot()["runs"][run["run_id"]]
         self.assertEqual(recovered["business_status"], "needs_auth")
         self.assertEqual(recovered["cleanup_status"], "cleaned")
+        self.assertIsInstance(recovered["cleanup_finished_at"], str)
         self.assertEqual(self.bay.execution_calls, 1)
         self.assertFalse(self.executor.blocked)
 
@@ -293,6 +365,7 @@ class NeoExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.store.snapshot()["runs"][run_id]["business_status"], "unknown"
         )
+        self.assertFalse(self.store.snapshot()["runs"][run_id]["business_attempted"])
         self.assertEqual(self.store.snapshot()["cleanup_jobs"], {})
         self.assertEqual(self.bay.create_calls, 1)
 
@@ -336,6 +409,8 @@ class NeoExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bay.create_calls, 1)
         self.assertEqual(self.store.snapshot()["cleanup_jobs"], {})
         self.assertEqual(self.bay.cargos, {})
+        run = next(iter(self.store.snapshot()["runs"].values()))
+        self.assertFalse(run["business_attempted"])
 
     async def test_close_cancels_active_execution_and_waits_for_cleanup(self):
         self.bay.hold_execution = True
@@ -349,6 +424,7 @@ class NeoExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run["process_status"], "interrupted")
         self.assertEqual(run["business_status"], "unknown")
         self.assertEqual(run["cleanup_status"], "cleaned")
+        self.assertTrue(run["business_attempted"])
         self.assertEqual(self.bay.cargos, {})
 
     async def test_pending_cleanup_cannot_move_to_a_different_connection(self):
@@ -374,6 +450,46 @@ class NeoExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run["process_status"], "timeout")
         self.assertEqual(run["business_status"], "timeout")
         self.assertEqual(run["cleanup_status"], "cleaned")
+        self.assertTrue(run["business_attempted"])
+
+    async def test_caller_supplied_run_id_is_stable_and_cannot_replay(self):
+        run_id = "a" * 32
+        run = await self.executor.execute(
+            self.request(), guard=self.authorized, run_id=run_id
+        )
+        self.assertEqual(run["run_id"], run_id)
+        with self.assertRaises(neo.ExecutionBlocked):
+            await self.executor.execute(
+                self.request(), guard=self.authorized, run_id=run_id
+            )
+        self.assertEqual(self.bay.execution_calls, 1)
+
+    async def test_invalid_supplied_run_id_has_no_network_side_effect(self):
+        with self.assertRaises(neo.ExecutionBlocked):
+            await self.executor.execute(
+                self.request(), guard=self.authorized, run_id="not-a-uuidhex"
+            )
+        self.assertEqual(self.bay.create_calls, 0)
+
+    async def test_close_continues_after_waiter_cancel_and_marks_quiescent(self):
+        client_close_entered = asyncio.Event()
+        release_client_close = asyncio.Event()
+        original_close = self.client.close
+
+        async def delayed_client_close():
+            client_close_entered.set()
+            await release_client_close.wait()
+            await original_close()
+
+        self.client.close = delayed_client_close
+        close_waiter = asyncio.create_task(self.executor.close())
+        await asyncio.wait_for(client_close_entered.wait(), 10)
+        self.assertTrue(self.executor.quiescent)
+        close_waiter.cancel()
+        await asyncio.gather(close_waiter, return_exceptions=True)
+        release_client_close.set()
+        await self.executor.close()
+        self.assertTrue(self.executor.quiescent)
 
 
 if __name__ == "__main__":
