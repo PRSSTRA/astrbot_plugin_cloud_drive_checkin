@@ -29,6 +29,47 @@
     "default": 180,
     "hint": "允许 1 到 240 秒；任务中的 0 表示继承此值。"
   },
+  "neo_connection": {
+    "description": "独立 Neo 执行连接",
+    "type": "object",
+    "hint": "当前仅接通内部执行服务和遗留资源清理，不开放聊天签到。不会启动或修改 Neo 部署。",
+    "items": {
+      "enabled": {
+        "description": "启用 Neo 连接与启动清理",
+        "type": "bool",
+        "default": false
+      },
+      "docker_cleanup_confirmed": {
+        "description": "已确认固定 Docker 部署的清理语义",
+        "type": "bool",
+        "default": false,
+        "hint": "须核对文档中的 Neo 版本及 Docker 清理条件；不支持以 Cargo 404 验收 Kubernetes PVC 清理。"
+      },
+      "endpoint": {
+        "description": "备用 Bay API 地址",
+        "type": "string",
+        "default": "",
+        "hint": "优先使用框架已明确配置的完整 Neo 连接；不读取自动部署凭据文件。"
+      },
+      "profile": {
+        "description": "备用 Neo profile",
+        "type": "string",
+        "default": "python-default"
+      },
+      "access_key_env": {
+        "description": "备用 Bay 密钥环境变量名",
+        "type": "string",
+        "default": "CLOUD_DRIVE_CHECKIN_NEO_KEY",
+        "hint": "只填写环境变量名，不填写密钥值。"
+      },
+      "ttl": {
+        "description": "独立沙箱 TTL 秒数",
+        "type": "int",
+        "default": 900,
+        "hint": "允许 300 到 3600 秒；TTL 不替代清理验证。"
+      }
+    }
+  },
   "tasks": {
     "description": "签到任务模板",
     "type": "template_list",
