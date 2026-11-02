@@ -122,6 +122,8 @@ python3 -m venv .venv
 
 到期任务准入或入队时的已分类错误只记录在该任务下，其他到期任务继续；`parse_task_catalog` 整体配置无效会使 tick 失败并暂停调度；未预期内部错误会退出定时 worker。状态存储不可用时清空计划并暂停，恢复后重新建立未来基线。scheduler 的 `last_error` 由 `/签到 我的` 和 `/签到 状态` 输出提示；配置修复后或重载插件后从后续计划继续，内部错误导致的 worker 退出需要重载恢复。关闭时取消 worker，必须先于队列关闭。
 
+`binding_plan_views(identity, task_id)` 供查询指令只读观察本人绑定：只读取当前状态快照和调度器内存中的计划，不执行 tick、不改写状态，也不触发入队。绑定可参与自动触发、计划与任务版本一致、已记录上次观察时间、时钟未回拨且计划未到期时，返回 `planned` 及计划和配置时区；其余情况返回固定的 `BindingPlanState`，覆盖暂停、全局或任务禁用、停用意图、录入中、无计划、计划过期、停止、错误和未就绪。`main.py` 按任务 ID 渲染这些观察，展示的时间只表示登记的下次自动触发，不代表共享队列中的实际执行时间。
+
 ### 终态通知
 
 `notifications.enqueue_terminal(snapshot, item, result)` 与终态批次在同一修改函数中填充 `outbox[run_id]`，记录安全文本、身份、来源、是否手动参与和固定结果字段。所有被准入的用户在入队时通过 `reserve_terminal(snapshot, item)` 创建 `phase=reserved` 占位；终态时填入同一记录。
@@ -213,7 +215,7 @@ CLI 拒绝覆盖已有输出，成功后只打印包含 `source_commit`、`sourc
 
 PR 的“离线测试”任务分别在 Python 3.12、3.13、3.14 上安装宿主 `requirements.txt`，显式安装 Node 22，并运行 `unittest discover -s tests -p 'test_*.py' -v`；“天翼脚本离线测试”在相同 Python 矩阵的独立虚拟环境中校验脚本依赖哈希并运行脚本测试。既有必需检查“提交信息规范”等待两组矩阵，仅在全部成功后校验提交历史；任一失败、取消或跳过都不能通过，无需修改现有必需检查名称。普通 PR CI 不连接真实 QQ、Neo 或云盘服务。
 
-执行层回归位于 `tests/test_neo_client.py`、`tests/test_neo_executor.py`、`tests/test_neo_lifecycle.py` 和 `tests/test_bootstrap.py`。制品构建与准备服务回归位于 `tests/test_preparation.py` 和 `tests/test_artifact_service.py`；管理员准备指令位于 `tests/test_admin_preparation.py`，通用 `direct_env` 的制品准备、`script`/`bundle` 执行和类型化环境变量位于 `tests/test_generic_execution.py`，schema 迁移与写入确认位于 `tests/test_state.py`、`tests/test_storage.py`。签到队列、恢复和容量位于 `tests/test_execution_queue.py`，自动计划准入、去重和生命周期位于 `tests/test_automatic_execution.py`，终态通知位于 `tests/test_notifications.py`，聊天入口和集成位于 `tests/test_manual_execution.py`，管理员取消位于 `tests/test_admin_cancellation.py`，管理员停用位于 `tests/test_admin_disablement.py` 和 `tests/test_task_control.py`，管理员重载入口与生命周期位于 `tests/test_admin_reload.py` 和 `tests/test_reload_control.py`。`tests/neo_support.py` 是受控 Bay 替身，会在临时目录运行本仓库 wrapper 与假脚本；这不是产品的宿主回退路径。本地未安装 Node 时对应测试会明确跳过；CI 显式安装并检查 Node，不依赖 runner 预装。macOS 测试只将 Node 的可执行路径映射到本机安装位置，实际运行 Node 子进程。
+执行层回归位于 `tests/test_neo_client.py`、`tests/test_neo_executor.py`、`tests/test_neo_lifecycle.py` 和 `tests/test_bootstrap.py`。制品构建与准备服务回归位于 `tests/test_preparation.py` 和 `tests/test_artifact_service.py`；管理员准备指令位于 `tests/test_admin_preparation.py`，通用 `direct_env` 的制品准备、`script`/`bundle` 执行和类型化环境变量位于 `tests/test_generic_execution.py`，schema 迁移与写入确认位于 `tests/test_state.py`、`tests/test_storage.py`。签到队列、恢复和容量位于 `tests/test_execution_queue.py`，自动计划准入、去重、生命周期和本人计划观察位于 `tests/test_automatic_execution.py`，终态通知位于 `tests/test_notifications.py`，聊天入口和集成位于 `tests/test_manual_execution.py`，管理员取消位于 `tests/test_admin_cancellation.py`，管理员停用位于 `tests/test_admin_disablement.py` 和 `tests/test_task_control.py`，管理员重载入口与生命周期位于 `tests/test_admin_reload.py` 和 `tests/test_reload_control.py`。`tests/neo_support.py` 是受控 Bay 替身，会在临时目录运行本仓库 wrapper 与假脚本；这不是产品的宿主回退路径。本地未安装 Node 时对应测试会明确跳过；CI 显式安装并检查 Node，不依赖 runner 预装。macOS 测试只将 Node 的可执行路径映射到本机安装位置，实际运行 Node 子进程。
 
 离线 smoke 通过真实 loopback HTTP 连接受控 Bay，覆盖两用户隔离、非零退出码的显式业务结果、超时、清理阻断及恢复不重跑。真实 Neo 假凭据测试与真实账号测试分别记录如下。
 
@@ -260,6 +262,17 @@ PR 的“离线测试”任务分别在 Python 3.12、3.13、3.14 上安装宿�
 - 最终独立 smoke 使用 AstrBot v4.29.4 原始 `terminate`、`unbind`、`purge` 方法和受控 fresh import loader，加载真实插件并执行实际 `initialize`；经真实 loopback HTTP 连接受控 FakeBay，共 35 次请求，全部证据再次通过。重载 1 次，确认模块重新导入、其他插件未被触碰、旧写者关闭且新 owner 就绪。
 - 同轮得到 `cancelled` 和 `already_signed`，业务执行 1 次，最大并发 1；管理员收到 2 条回复，终态分别投递到两个不同平台的 owner 来源；绑定和密文保持不变，Sandbox、Cargo 和物理目录残留均为 0，输出未包含敏感值。
 - 该 smoke 使用受控 FakeBay、受控 fresh import loader 和真实插件初始化，不是完整 AstrBot/QQ 部署；未连接真实 Neo、真实 QQ 或云盘账号。已有历史 Neo 假凭据验收不代表本轮结果。
+
+### 本人计划原生框架 smoke
+
+- 在独立临时 venv 完整安装 AstrBot 4.29.4 和本插件 `requirements.txt`，`pip check` 无冲突。用源码 ZIP 经真实 `PluginManager.install_plugin_from_file` 安装本插件源码包；出站和 KV 业务使用原生 Star API，未注入 `tests/astrbot_support.py`。
+- 启动完整 `AstrBotCoreLifecycle`，使用真实 `aiocqhttp==1.4.4` 和 loopback OneBot Universal websocket 受控客户端，不是真实 QQ。依次发送帮助、录入假 `username`/`password` 值、确认、`/签到 我的`、管理员重载和 `/签到 状态`。
+- `我的` 和重载后的 `状态` 回复显示下次计划触发 `2027-01-01T00:00+08:00`，时区为 `Asia/Shanghai`；测试任务 Cron 为 `0 0 1 1 *`。查询前后状态快照完全相同。
+- 真实 loader 完成替换实例：旧实例状态存储已关闭，新实例状态存储就绪，凭据密文保持不变。
+- 本人计划相关 17 项回归通过（2.669 秒）；`main.py`、`scheduler.py`、`tests/test_automatic_execution.py` 通过 scoped Ruff 检查。
+- 本轮未启动业务脚本，未连接 Neo 或云盘网络。子进程审计拒绝非 loopback 连接，框架自身的 LLM metadata 和图片端点访问被拒日志属于测试隔离的预期输出，不是插件失败。
+- 框架既有入站 INFO 日志保留假密码，与 README 已披露的入站记录风险一致。本次只断言状态和重载回复不回显假密码，不声明所有日志不含敏感值。
+- 范围限于上述 AstrBot 4.29.4、真实 `aiocqhttp==1.4.4` 和受控 loopback OneBot 客户端；不是真实 QQ、真实 Neo 或真实账号签到验收，也不改变此前真实 Neo 假凭据验收的结论。
 
 ### 制品准备本地验收
 

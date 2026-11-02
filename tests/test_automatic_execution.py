@@ -1,4 +1,5 @@
 import asyncio
+import copy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
@@ -40,6 +41,37 @@ class AutomaticExecutionTests(ExecutionFixture):
             for record in self.snapshot()["dedupe"].values()
             if record.get("kind") == "scheduled_batch"
         ]
+
+    async def bind_task(
+        self,
+        task,
+        *,
+        qq="10001",
+        platform="bot-instance",
+        username="status-user",
+    ):
+        identity = self.permissions.Identity(platform, qq)
+        await self.credentials.save_binding(
+            self.plugin.state_store,
+            self.credentials.CredentialCipher.from_environment(),
+            identity=identity,
+            origin=f"{platform}:FriendMessage:{qq}",
+            task=task,
+            values={"username": username, "password": "STATUS_TEST_PASSWORD"},
+            guard=lambda: None,
+        )
+        return identity
+
+    async def personal_status(
+        self, *, task_id=None, qq="10001", platform="bot-instance"
+    ):
+        event = FakeEvent(sender_id=qq, platform_id=platform)
+        if task_id is None:
+            await self.plugin.checkin(event, "我的")
+        else:
+            await self.plugin.checkin(event, "状态", task_id)
+        self.assertTrue(event.sent)
+        return event.sent[-1].text
 
     async def settled(self, run_ids):
         await self.until(
@@ -331,3 +363,149 @@ class AutomaticExecutionTests(ExecutionFixture):
             ["2026-11-02T12:00:00+00:00"],
         )
         self.assertEqual(self.bay.execution_calls, 1)
+
+    async def test_personal_plan_view_is_owner_and_task_filtered_and_read_only(self):
+        first_identity = await self.bind()
+        secondary_raw = copy.deepcopy(self.config["tasks"][0])
+        secondary_raw.update(
+            task_id="secondary_cloud", name="第二云盘", cron="20 8 * * *"
+        )
+        self.config["tasks"].append(secondary_raw)
+        secondary = next(
+            task
+            for task in self.main.parse_task_catalog(self.config).tasks
+            if task.task_id == "secondary_cloud"
+        )
+        await self.bind_task(secondary)
+        await self.bind("10002", "other-bot", "second")
+        await self.plugin.scheduler.tick()
+
+        before = self.snapshot()
+        put_attempts = self.backend.put_attempts
+        first_all = await self.personal_status()
+        first_filtered = await self.personal_status(task_id="secondary_cloud")
+        second_all = await self.personal_status(qq="10002", platform="other-bot")
+        second_filtered = await self.personal_status(
+            task_id="secondary_cloud", qq="10002", platform="other-bot"
+        )
+
+        self.assertIn("tianyi_cloud", first_all)
+        self.assertIn("secondary_cloud", first_all)
+        self.assertIn("2026-11-02T08:20+08:00", first_filtered)
+        self.assertIn("secondary_cloud", first_filtered)
+        self.assertNotIn("tianyi_cloud", first_filtered)
+        self.assertIn("tianyi_cloud", second_all)
+        self.assertNotIn("secondary_cloud", second_all)
+        self.assertNotIn("secondary_cloud", second_filtered)
+        self.assertEqual(
+            [
+                view.task_id
+                for view in self.plugin.scheduler.binding_plan_views(first_identity)
+            ],
+            ["secondary_cloud", "tianyi_cloud"],
+        )
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.backend.put_attempts, put_attempts)
+        self.assertEqual(self.snapshot()["batches"], {})
+
+    async def test_plan_requires_current_version_clock_and_configured_timezone(self):
+        identity = await self.bind()
+        state = self.main.BindingPlanState
+
+        initial = self.plugin.scheduler.binding_plan_views(identity)
+        self.assertEqual([view.state for view in initial], [state.PLANNED])
+        self.assertEqual(initial[0].timezone, "Asia/Shanghai")
+        self.assertEqual(initial[0].planned_at.utcoffset(), timedelta(hours=8))
+        initial_text = await self.personal_status(task_id=self.task.task_id)
+        self.assertIn("Asia/Shanghai", initial_text)
+        self.assertIn("+08:00", initial_text)
+
+        self.config["timezone"] = "UTC"
+        stale = self.plugin.scheduler.binding_plan_views(identity)
+        self.assertEqual([view.state for view in stale], [state.PLAN_STALE])
+        stale_text = await self.personal_status(task_id=self.task.task_id)
+        self.assertNotRegex(stale_text, r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")
+
+        await self.plugin.scheduler.tick()
+        current = self.plugin.scheduler.binding_plan_views(identity)
+        self.assertEqual([view.state for view in current], [state.PLANNED])
+        self.assertEqual(current[0].timezone, "UTC")
+        self.assertEqual(current[0].planned_at.utcoffset(), timedelta(0))
+        current_text = await self.personal_status(task_id=self.task.task_id)
+        self.assertIn("UTC", current_text)
+        self.assertIn("+00:00", current_text)
+
+        self.clock.advance(-60)
+        reversed_clock = self.plugin.scheduler.binding_plan_views(identity)
+        self.assertEqual([view.state for view in reversed_clock], [state.PLAN_STALE])
+        reversed_text = await self.personal_status(task_id=self.task.task_id)
+        self.assertNotRegex(reversed_text, r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")
+
+    async def test_suppressed_disabled_absent_and_stopped_plans_are_not_runnable(self):
+        identity = await self.bind()
+        state = self.main.BindingPlanState
+
+        async def assert_unrunnable(expected):
+            views = self.plugin.scheduler.binding_plan_views(identity)
+            self.assertEqual([view.state for view in views], [expected])
+            text = await self.personal_status(task_id=self.task.task_id)
+            self.assertIsNone(views[0].planned_at)
+            self.assertNotRegex(text, r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")
+
+        paused = FakeEvent()
+        await self.plugin.checkin(paused, "暂停", self.task.task_id)
+        await assert_unrunnable(state.PAUSED)
+        await self.plugin.checkin(FakeEvent(), "恢复", self.task.task_id)
+
+        self.config["enabled"] = False
+        await assert_unrunnable(state.GLOBAL_DISABLED)
+        self.config["enabled"] = True
+
+        self.config["tasks"][0]["enabled"] = False
+        await assert_unrunnable(state.TASK_DISABLED)
+        self.config["tasks"][0]["enabled"] = True
+
+        configured_tasks = self.config["tasks"]
+        self.config["tasks"] = []
+        await assert_unrunnable(state.PLAN_ABSENT)
+        self.config["tasks"] = configured_tasks
+
+        intent_key = f"task_disable:{self.task.task_id}"
+        await self.plugin.state_store.mutate(
+            lambda snapshot: snapshot["dedupe"].update(
+                {
+                    intent_key: {
+                        "kind": "task_disable_intent",
+                        "task_id": self.task.task_id,
+                    }
+                }
+            )
+        )
+        await assert_unrunnable(state.DISABLING)
+        await self.plugin.state_store.mutate(
+            lambda snapshot: snapshot["dedupe"].pop(intent_key)
+        )
+
+        await self.plugin.checkin(FakeEvent(), "录入", self.task.task_id)
+        await assert_unrunnable(state.ENROLLMENT)
+        await self.plugin.capture_enrollment(FakeEvent(text="/取消"))
+
+        await self.plugin.scheduler.close()
+        await assert_unrunnable(state.STOPPED)
+
+    async def test_unready_plan_observation_keeps_confirmed_state_unchanged(self):
+        identity = await self.bind()
+        self.backend.fail_next_put()
+        await self.plugin.checkin(FakeEvent(), "暂停", self.task.task_id)
+        self.assertFalse(self.plugin.state_store.ready)
+
+        before = self.snapshot()
+        put_attempts = self.backend.put_attempts
+        views = self.plugin.scheduler.binding_plan_views(identity)
+        self.assertEqual(
+            [view.state for view in views], [self.main.BindingPlanState.UNREADY]
+        )
+        text = await self.personal_status(task_id=self.task.task_id)
+        self.assertNotRegex(text, r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.backend.put_attempts, put_attempts)
