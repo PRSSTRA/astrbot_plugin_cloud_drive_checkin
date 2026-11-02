@@ -253,7 +253,7 @@ Cron 表达式固定为五段：分钟、小时、日、月、星期。支持：
 | `tianyi_cloud` | 天翼云盘 | 每日 07:10 | `python` | `tianyi_account` / `tianyi` | `username`、`password` | 禁用 |
 | `mobile_cloud_experimental` | 移动云盘（实验） | 每日 07:20 | `node` | `mobile_single_account` / `mobile_unverified` | `authorization`、`phone`、`auth_token` | 禁用，实验状态 |
 
-天翼模板引用 [BlueSkyXN/189Cloud-Checkin 的固定提交](https://github.com/BlueSkyXN/189Cloud-Checkin/tree/8e02d162ec6d1b5c00736afffb727d9dcfe8ba7b)，移动模板引用 [smallfawn/QLScriptPublic 的固定提交](https://github.com/smallfawn/QLScriptPublic/tree/2d4c26fdc72c3206bb9cf9afc1fb4991d337f888)。本仓库没有移植这些脚本。准备启用前需要自行核实许可、依赖和实际行为。
+天翼脚本已引入本仓库的 [third_party/tianyi](../third_party/tianyi)，源自 [BlueSkyXN/189Cloud-Checkin 固定提交](https://github.com/BlueSkyXN/189Cloud-Checkin/tree/43d2e7054dba7c5c2152e9c8c88fd23e6073a45b)，保留 Apache-2.0 许可，由本仓库维护结构化结果改动。脚本专用依赖锁与宿主依赖分开，尚未接入 Neo 的依赖制品准备和业务适配，不能因已有源码和离线测试就启用真实签到。移动模板仍引用 [smallfawn/QLScriptPublic 固定提交](https://github.com/smallfawn/QLScriptPublic/tree/2d4c26fdc72c3206bb9cf9afc1fb4991d337f888)，未引入其脚本。
 
 移动任务必须保持禁用和实验状态。其他任务即使配置为启用，当前版本也不会执行。
 
