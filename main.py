@@ -21,6 +21,13 @@ from .scheduler import CronScheduler
 from .state import InvalidStateError
 from .storage import CommitUnconfirmedError, StateStore, StateUnavailableError
 from .task_config import TaskConfig, next_run_times, parse_task_catalog
+from .task_control import (
+    TaskControlError,
+    TaskControlNotFound,
+    TaskControlSaveUnconfirmed,
+    TaskControlService,
+    disabling_task_ids,
+)
 
 _STATE_REGISTRY_ATTRIBUTE = "_cloud_drive_checkin_state_registry"
 _CONFIG_ERROR_MESSAGE = "插件配置无效，请联系管理员。"
@@ -33,6 +40,7 @@ _USAGE_MESSAGE = (
     "\n用法：/签到 删除 <任务ID> [确认/取消]"
     "\n用法：/签到 管理 准备 <任务ID>"
     "\n用法：/签到 管理 取消 <run_id>"
+    "\n用法：/签到 管理 停用 <任务ID>"
 )
 _TASK_NOT_FOUND_MESSAGE = "未找到该签到任务。"
 _DELETE_CONFIRM_SECONDS = 60
@@ -43,29 +51,36 @@ class _PreparationAccessChanged(PreparationError):
     """The administrator or task changed while preparing an artifact."""
 
 
-def _task_status(task: TaskConfig) -> str:
+def _task_status(task: TaskConfig, *, disabling: bool = False) -> str:
+    if disabling:
+        return "停用保存待确认（禁止执行）"
     if task.enabled:
         return "配置启用"
     return "配置禁用"
 
 
-def _render_task_list(tasks: tuple[TaskConfig, ...]) -> str:
+def _render_task_list(
+    tasks: tuple[TaskConfig, ...], pending: set[str] | frozenset[str] = frozenset()
+) -> str:
     if not tasks:
         return "暂无配置的签到任务。"
 
     lines = ["签到任务（启用后按 Cron 入队，也可使用 /签到 立即）："]
     lines.extend(
-        f"- {task.task_id}｜{task.name}｜{_task_status(task)}" for task in tasks
+        f"- {task.task_id}｜{task.name}｜{_task_status(task, disabling=task.task_id in pending)}"
+        for task in tasks
     )
     return "\n".join(lines)
 
 
-def _render_task_detail(task: TaskConfig, timezone: str) -> str:
+def _render_task_detail(
+    task: TaskConfig, timezone: str, *, disabling: bool = False
+) -> str:
     run_times = next_run_times(task, timezone)
     lines = [
         f"任务：{task.name}",
         f"ID：{task.task_id}",
-        f"状态：{_task_status(task)}",
+        f"状态：{_task_status(task, disabling=disabling)}",
         f"Cron：{task.cron}",
         f"时区：{timezone}",
         "字段要求：",
@@ -104,6 +119,7 @@ class CloudDriveCheckin(Star):
         self.queue: ExecutionQueue | None = None
         self.notifications: NotificationService | None = None
         self.scheduler: CronScheduler | None = None
+        self.task_control: TaskControlService | None = None
         self.execution_bridge = ExecutionBridge(self)
         self._shutdown_task: asyncio.Task | None = None
         self._terminating = False
@@ -387,30 +403,31 @@ class CloudDriveCheckin(Star):
         except InvalidStateError:
             return "状态容量或结构校验失败，未发布本次制品。"
 
+    def _admin_guard(self, event, identity) -> None:
+        permissions = parse_config(self.config)
+        admins = self.context.get_config(umo=event.unified_msg_origin).get(
+            "admins_id", []
+        )
+        if not isinstance(admins, list) or any(
+            type(value) is not str for value in admins
+        ):
+            raise PluginConfigError("framework administrator configuration is invalid")
+        access = authorize(
+            identity,
+            astrbot_admin=event.is_admin() and identity.qq_id in admins,
+            config=permissions,
+        )
+        if (
+            self._terminating
+            or get_private_identity(event) != identity
+            or access is None
+            or not access.is_admin
+        ):
+            raise QueueRejected("permission_revoked")
+
     async def _cancel_command(self, event, identity, run_id: str) -> str:
         def guard():
-            permissions = parse_config(self.config)
-            admins = self.context.get_config(umo=event.unified_msg_origin).get(
-                "admins_id", []
-            )
-            if not isinstance(admins, list) or any(
-                type(value) is not str for value in admins
-            ):
-                raise PluginConfigError(
-                    "framework administrator configuration is invalid"
-                )
-            access = authorize(
-                identity,
-                astrbot_admin=event.is_admin() and identity.qq_id in admins,
-                config=permissions,
-            )
-            if (
-                self._terminating
-                or get_private_identity(event) != identity
-                or access is None
-                or not access.is_admin
-            ):
-                raise QueueRejected("permission_revoked")
+            self._admin_guard(event, identity)
 
         try:
             guard()
@@ -432,6 +449,31 @@ class CloudDriveCheckin(Star):
             return "执行队列暂不可用，未接受取消请求。"
         except (PluginConfigError, InvalidStateError):
             return "权限配置或状态校验失败，未接受取消请求。"
+
+    async def _disable_command(self, event, identity, task_id: str) -> str:
+        try:
+            self._admin_guard(event, identity)
+            if self.task_control is None:
+                raise StateUnavailableError("task control is unavailable")
+            await self.task_control.disable(
+                task_id, guard=lambda: self._admin_guard(event, identity)
+            )
+            return f"任务已停用：{task_id}。未结束运行已请求取消，最终结果仍通知运行所属用户。"
+        except QueueRejected:
+            return "管理员权限已变化，未接受停用请求。"
+        except TaskControlNotFound:
+            return _TASK_NOT_FOUND_MESSAGE
+        except TaskControlSaveUnconfirmed:
+            return "停用意图已保存，该任务禁止执行，但配置保存未确认；请重试停用或修复配置后重载插件。"
+        except CommitUnconfirmedError:
+            return "停用状态写入未确认，新执行已暂停；请管理员恢复存储后查询。"
+        except StateUnavailableError:
+            return "状态存储未就绪，未接受停用请求。"
+        except (TaskControlError, PluginConfigError, InvalidStateError):
+            return "任务配置或停用状态不可用，请管理员检查后重试。"
+        finally:
+            if self.queue is not None:
+                self.queue.wake()
 
     @filter.command("签到", priority=100)
     async def checkin(
@@ -478,6 +520,14 @@ class CloudDriveCheckin(Star):
             if task_id == "取消":
                 message = (
                     await self._cancel_command(event, identity, extra)
+                    if extra
+                    else _USAGE_MESSAGE
+                )
+                await event.send(event.plain_result(message))
+                return
+            if task_id == "停用":
+                message = (
+                    await self._disable_command(event, identity, extra)
                     if extra
                     else _USAGE_MESSAGE
                 )
@@ -572,8 +622,15 @@ class CloudDriveCheckin(Star):
             return
 
         if subcommand == "任务":
+            try:
+                pending = disabling_task_ids(store.snapshot())
+            except (StateUnavailableError, InvalidStateError, TaskControlError):
+                await event.send(
+                    event.plain_result("停用状态不可用，请管理员检查状态存储。")
+                )
+                return
             if not task_id:
-                message = _render_task_list(task_catalog.tasks)
+                message = _render_task_list(task_catalog.tasks, pending)
             else:
                 task = next(
                     (
@@ -587,7 +644,9 @@ class CloudDriveCheckin(Star):
                     await event.send(event.plain_result(_TASK_NOT_FOUND_MESSAGE))
                     return
                 try:
-                    message = _render_task_detail(task, task_catalog.timezone)
+                    message = _render_task_detail(
+                        task, task_catalog.timezone, disabling=task.task_id in pending
+                    )
                 except PluginConfigError:
                     await event.send(event.plain_result(_CONFIG_ERROR_MESSAGE))
                     return
@@ -627,6 +686,8 @@ class CloudDriveCheckin(Star):
             slot["owner"] = store
             try:
                 await store.initialize()
+                self.task_control = TaskControlService(store, self.config)
+                await self.task_control.recover()
                 neo_config = self.config.get("neo_connection", {})
                 framework = (
                     self.context.get_config()
@@ -655,6 +716,8 @@ class CloudDriveCheckin(Star):
                 self.scheduler = CronScheduler(store, self.queue, lambda: self.config)
                 await self.scheduler.initialize()
             except asyncio.CancelledError:
+                if self.task_control is not None:
+                    await self.task_control.close()
                 if self.scheduler is not None:
                     await self.scheduler.close()
                 if self.queue is not None:
@@ -666,6 +729,8 @@ class CloudDriveCheckin(Star):
                 store.stop_accepting()
                 raise
             except Exception:
+                if self.task_control is not None:
+                    await self.task_control.close()
                 if self.scheduler is not None:
                     await self.scheduler.close()
                 if self.queue is not None:
@@ -710,8 +775,12 @@ class CloudDriveCheckin(Star):
                     await self.queue.close()
         finally:
             try:
-                if self.preparation is not None:
-                    await self.preparation.close()
+                try:
+                    if self.task_control is not None:
+                        await self.task_control.close()
+                finally:
+                    if self.preparation is not None:
+                        await self.preparation.close()
             finally:
                 try:
                     if self.executor is not None:
@@ -724,6 +793,8 @@ class CloudDriveCheckin(Star):
                         and not self.executor.quiescent
                         or self.scheduler is not None
                         and not self.scheduler.closed
+                        or self.task_control is not None
+                        and not self.task_control.closed
                     ):
                         if self.notifications is not None:
                             await self.notifications.close()

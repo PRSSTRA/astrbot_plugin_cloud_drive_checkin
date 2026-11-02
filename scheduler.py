@@ -14,6 +14,7 @@ from .permissions import Identity
 from .state import InvalidStateError
 from .storage import StateStore, StateUnavailableError
 from .task_config import TaskConfig, next_run_times, parse_task_catalog
+from .task_control import disabling_task_ids
 
 _POLL_SECONDS = 1.0
 
@@ -108,7 +109,12 @@ class CronScheduler:
         if self._last_observed is not None and now < self._last_observed:
             self._plans.clear()
         self._last_observed = now
-        enabled = {task.task_id: task for task in catalog.tasks if task.enabled}
+        disabling = disabling_task_ids(self.store.snapshot())
+        enabled = {
+            task.task_id: task
+            for task in catalog.tasks
+            if task.enabled and task.task_id not in disabling
+        }
         self._plans = {key: plan for key, plan in self._plans.items() if key in enabled}
         self._errors = {
             key: error for key, error in self._errors.items() if key in enabled

@@ -20,6 +20,7 @@ from .permissions import Identity
 from .runners.bootstrap import validate_result
 from .storage import StateStore, StateUnavailableError
 from .task_config import TaskConfig
+from .task_control import task_is_disabling
 
 MAX_ACTIVE_ITEMS = 256
 MAX_BATCH_ITEMS = 1000
@@ -387,6 +388,8 @@ class ExecutionQueue:
 
         def admit(snapshot: dict) -> None:
             self._validate_snapshot(snapshot)
+            if task_is_disabling(snapshot, task.task_id):
+                raise QueueRejected(QueueReason.TASK_DISABLED)
             self._prune(
                 snapshot,
                 settings,
@@ -562,6 +565,8 @@ class ExecutionQueue:
 
         def admit(snapshot: dict) -> None:
             self._validate_snapshot(snapshot)
+            if task_is_disabling(snapshot, task.task_id):
+                raise QueueRejected(QueueReason.TASK_DISABLED)
             self._prune(
                 snapshot,
                 settings,
@@ -932,6 +937,8 @@ class ExecutionQueue:
 
     def _guard_item(self, item: dict, snapshot: dict) -> None:
         guard_cancellation(item, snapshot)
+        if task_is_disabling(snapshot, item["task_id"]):
+            raise QueueRejected(QueueReason.TASK_DISABLED)
         result = _call_sync(self._guard, dict(item), snapshot)
         if result is not None:
             raise ExecutionBlocked("execution queue guard must return None")
