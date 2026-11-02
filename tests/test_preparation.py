@@ -63,6 +63,48 @@ def _wheel_bytes(distribution, *, extra_members=()):
     return output.getvalue()
 
 
+def _bundle_bytes(members):
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, data, *mode in members:
+            info = zipfile.ZipInfo(name, date_time=(2020, 1, 2, 3, 4, 6))
+            info.create_system = 3
+            info.external_attr = (mode[0] if mode else stat.S_IFREG | 0o644) << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, data)
+    return output.getvalue()
+
+
+def _native_payloads():
+    pe = bytearray(128)
+    pe[:2] = b"MZ"
+    pe[60:64] = (64).to_bytes(4, "little")
+    pe[64:68] = b"PE\0\0"
+    return (
+        b"\x7fELF" + b"x" * 64,
+        bytes(pe),
+        b"\xfe\xed\xfa\xcf" + b"x" * 64,
+        b"\xca\xfe\xba\xbe" + b"x" * 64,
+        b"\0asm" + b"x" * 64,
+    )
+
+
+def _bundle_declaration(payload):
+    return json.dumps(
+        {
+            "format": "zip-v1",
+            "url": (
+                "https://raw.githubusercontent.com/example/dependencies/"
+                + "b" * 40
+                + "/bundle.zip"
+            ),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 class SyntheticTianyiInputs:
     def __init__(self, base):
         self.root = Path(base)
@@ -289,6 +331,133 @@ raise SystemExit(1)
             timeout=10,
         )
         self.assertEqual(result.returncode, 0)
+
+
+class GenericPreparationTests(unittest.TestCase):
+    def build(self, runtime, source, bundle, declaration=None):
+        dependency_bundle = (
+            _bundle_declaration(bundle) if declaration is None else declaration
+        )
+        dependency_sha256 = json.loads(dependency_bundle)["sha256"]
+        return preparation.build_generic(
+            runtime=runtime,
+            source=source,
+            source_commit="a" * 40,
+            source_sha256=hashlib.sha256(source).hexdigest(),
+            dependency_bundle=dependency_bundle,
+            dependency_sha256=dependency_sha256,
+            bundle=bundle,
+        )
+
+    def test_dependency_free_artifact_remains_a_raw_script(self):
+        source = b'print("{\\"status\\":\\"unknown\\"}")\n'
+
+        artifact = preparation.build_generic(
+            runtime="python",
+            source=source,
+            source_commit="a" * 40,
+            source_sha256=hashlib.sha256(source).hexdigest(),
+            dependency_bundle="none",
+            dependency_sha256=None,
+            bundle=None,
+        )
+
+        self.assertEqual(artifact.script, source)
+        self.assertEqual(artifact.artifact_format, "script")
+
+    def test_python_and_node_prebuilt_modules_are_packaged_without_execution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "host-executed"
+            cases = (
+                (
+                    "python",
+                    b"import pinned_helper\n",
+                    "pinned_helper.py",
+                    f"from pathlib import Path\nPath({str(marker)!r}).touch()\nVALUE=7\n".encode(),
+                    "task.py",
+                ),
+                (
+                    "node",
+                    b"require('pinned-helper')\n",
+                    "node_modules/pinned-helper/index.js",
+                    f"require('fs').writeFileSync({str(marker)!r}, 'x'); module.exports=7;\n".encode(),
+                    "task.js",
+                ),
+            )
+            for runtime, source, module_path, module, task_path in cases:
+                with self.subTest(runtime=runtime):
+                    bundle = _bundle_bytes(((module_path, module),))
+                    artifact = self.build(runtime, source, bundle)
+                    self.assertEqual(artifact.artifact_format, "bundle")
+                    with zipfile.ZipFile(io.BytesIO(artifact.script)) as archive:
+                        self.assertEqual(
+                            set(archive.namelist()), {task_path, module_path}
+                        )
+                        self.assertEqual(archive.read(module_path), module)
+            self.assertFalse(marker.exists())
+
+    def test_text_helpers_and_non_native_auxiliary_binary_remain_supported(self):
+        source = b"import helper\n"
+        bundle = _bundle_bytes(
+            (
+                ("helper.py", b"VALUE = 1\n", stat.S_IFREG | 0o755),
+                ("config.json", b'{"enabled":true}\n'),
+                ("certificate.pem", b"-----BEGIN CERTIFICATE-----\nfixture\n"),
+                ("data.bin", b"\x01\x02\x03binary-data"),
+            )
+        )
+
+        artifact = self.build("python", source, bundle)
+
+        self.assertEqual(artifact.artifact_format, "bundle")
+
+    def test_dependency_file_budget_reserves_the_runtime_entry(self):
+        source = b"print(1)\n"
+        members = tuple((f"module_{index}.py", b"") for index in range(4095))
+        artifact = self.build("python", source, _bundle_bytes(members))
+        with zipfile.ZipFile(io.BytesIO(artifact.script)) as archive:
+            self.assertEqual(len(archive.infolist()), 4096)
+            self.assertEqual(archive.read("task.py"), source)
+
+        with self.assertRaises(preparation.PreparationError):
+            self.build(
+                "python", source, _bundle_bytes((*members, ("one_too_many.py", b"")))
+            )
+
+    def test_unsafe_dependency_archives_and_hashes_fail_before_publication(self):
+        source = b"print('not executed')\n"
+        large = b"x" * (2 * 1024 * 1024 + 1)
+        bomb = b"x" * (2 * 1024 * 1024)
+        native_bundles = tuple(
+            _bundle_bytes(((f"renamed_{index}.bin", payload),))
+            for index, payload in enumerate(_native_payloads())
+        )
+        scenarios = (
+            _bundle_bytes((("../escape.py", b"x"),)),
+            _bundle_bytes((("task.py", b"collision"),)),
+            _bundle_bytes((("native.so", b"native"),)),
+            _bundle_bytes((("linked.py", b"target", stat.S_IFLNK | 0o777),)),
+            _bundle_bytes((("large.py", large),)),
+            _bundle_bytes(tuple((f"part{index}.bin", bomb) for index in range(5))),
+            *native_bundles,
+        )
+        for bundle in scenarios:
+            with (
+                self.subTest(bundle_sha256=hashlib.sha256(bundle).hexdigest()),
+                self.assertRaises(preparation.PreparationError),
+            ):
+                self.build("python", source, bundle)
+
+        bundle = _bundle_bytes((("helper.py", b"VALUE=1\n"),))
+        declaration = json.loads(_bundle_declaration(bundle))
+        declaration["sha256"] = "0" * 64
+        with self.assertRaises(preparation.PreparationError):
+            self.build(
+                "python",
+                source,
+                bundle,
+                json.dumps(declaration, sort_keys=True, separators=(",", ":")),
+            )
 
 
 class PreparationCliTests(unittest.TestCase):

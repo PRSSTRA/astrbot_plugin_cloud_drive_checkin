@@ -187,6 +187,75 @@ class TrackedStream(httpx.AsyncByteStream):
         self.closed = True
 
 
+class GenericArtifactRepository:
+    def __init__(self, runtime, *, dependency=True):
+        self.runtime = runtime
+        self.source_commit = "c" * 40
+        self.bundle_commit = "d" * 40
+        extension = "py" if runtime == "python" else "js"
+        self.source_url = (
+            "https://raw.githubusercontent.com/example/tasks/"
+            f"{self.source_commit}/task.{extension}"
+        )
+        self.source = (
+            b"import pinned_helper\n"
+            if runtime == "python"
+            else b"require('pinned-helper');\n"
+        )
+        self.bundle_url = (
+            "https://raw.githubusercontent.com/example/dependencies/"
+            f"{self.bundle_commit}/{runtime}.zip"
+        )
+        module_path = (
+            "pinned_helper.py"
+            if runtime == "python"
+            else "node_modules/pinned-helper/index.js"
+        )
+        module = b"VALUE = 7\n" if runtime == "python" else b"module.exports = 7;\n"
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            info, data = _zip_member(module_path, module)
+            archive.writestr(info, data)
+        self.bundle = output.getvalue() if dependency else None
+        self.dependency_bundle = "none"
+        if self.bundle is not None:
+            self.dependency_bundle = json.dumps(
+                {
+                    "format": "zip-v1",
+                    "sha256": hashlib.sha256(self.bundle).hexdigest(),
+                    "url": self.bundle_url,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+
+    def task(self, *, version=None):
+        task_version = (
+            version
+            or hashlib.sha256(
+                (self.runtime + self.dependency_bundle).encode("utf-8")
+            ).hexdigest()
+        )
+        return task_config.TaskConfig(
+            task_id=f"generic_{self.runtime}",
+            name=f"Generic {self.runtime}",
+            enabled=True,
+            runtime=self.runtime,
+            script_url=self.source_url,
+            source_commit=self.source_commit,
+            sha256=hashlib.sha256(self.source).hexdigest(),
+            cron="0 0 * * *",
+            user_fields=(),
+            fixed_env=(("MODE", "safe"),),
+            input_adapter="direct_env",
+            result_adapter="json_protocol",
+            dependency_bundle=self.dependency_bundle,
+            timeout_seconds=30,
+            experimental=False,
+            version=task_version,
+        )
+
+
 class MockPyPI:
     """Strict two-host MockTransport serving one SyntheticArtifactRepository."""
 
@@ -268,6 +337,41 @@ class MockPyPI:
             )
 
         return httpx.Response(599, request=request)
+
+
+class MockGitHub:
+    def __init__(self, repository):
+        self.repository = repository
+        self.requests = []
+        self.status = 200
+        self.corrupt_bundle = False
+
+    def client(self):
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(self), trust_env=False, follow_redirects=False
+        )
+
+    async def __call__(self, request):
+        self.requests.append(request)
+        if self.status != 200:
+            return httpx.Response(self.status, request=request)
+        if str(request.url) == self.repository.source_url:
+            payload = self.repository.source
+        elif (
+            self.repository.bundle is not None
+            and str(request.url) == self.repository.bundle_url
+        ):
+            payload = self.repository.bundle
+            if self.corrupt_bundle:
+                payload += b"corrupt"
+        else:
+            return httpx.Response(404, request=request)
+        return httpx.Response(
+            200,
+            headers={"content-length": str(len(payload))},
+            stream=TrackedStream(payload),
+            request=request,
+        )
 
 
 class ControlledStore:
@@ -394,6 +498,60 @@ class ArtifactServiceTests(unittest.IsolatedAsyncioTestCase):
         await service.close()
         self.assertFalse(self.clients[0].is_closed)
 
+    async def test_generic_python_node_and_dependency_free_cache_offline(self):
+        scenarios = (("python", True), ("node", True), ("python", False))
+        for runtime, dependency in scenarios:
+            with self.subTest(runtime=runtime, dependency=dependency):
+                repository = GenericArtifactRepository(runtime, dependency=dependency)
+                remote = MockGitHub(repository)
+                store = ControlledStore()
+                service = self.service(pypi=remote, store=store)
+                task = repository.task()
+
+                prepared = await service.prepare(task, guard=lambda: None)
+
+                self.assertEqual(len(remote.requests), 2 if dependency else 1)
+                self.assertEqual(
+                    prepared.artifact_format, "bundle" if dependency else "script"
+                )
+                self.assertEqual(
+                    hashlib.sha256(prepared.script).hexdigest(), prepared.sha256
+                )
+                record = store.snapshot()["prepared_artifacts"][task.task_id]
+                self.assertEqual(record["task_version"], task.version)
+                self.assertEqual(record["source_sha256"], task.sha256)
+                requests_before = len(remote.requests)
+                self.assertEqual(await service.load(task), prepared)
+                self.assertEqual(len(remote.requests), requests_before)
+                if dependency:
+                    with zipfile.ZipFile(io.BytesIO(prepared.script)) as archive:
+                        task_name = "task.py" if runtime == "python" else "task.js"
+                        self.assertIn(task_name, archive.namelist())
+
+                with self.assertRaises(artifact_service.PreparationError):
+                    await service.load(repository.task(version="e" * 64))
+                self.assertEqual(len(remote.requests), requests_before)
+
+    async def test_generic_hash_and_redirect_fail_before_publication(self):
+        for scenario in ("source_hash", "bundle_hash", "redirect"):
+            with self.subTest(scenario=scenario):
+                repository = GenericArtifactRepository("python")
+                task = repository.task()
+                remote = MockGitHub(repository)
+                if scenario == "source_hash":
+                    repository.source += b"corrupt"
+                elif scenario == "bundle_hash":
+                    remote.corrupt_bundle = True
+                else:
+                    remote.status = 302
+                store = ControlledStore()
+                service = self.service(pypi=remote, store=store)
+
+                with self.assertRaises(artifact_service.PreparationError):
+                    await service.prepare(task, guard=lambda: None)
+
+                self.assertEqual(store.snapshot()["prepared_artifacts"], {})
+
     async def test_only_fixed_execution_declaration_is_accepted(self):
         original = self.repository.task()
         changed_field = dataclasses.replace(
@@ -451,13 +609,15 @@ class ArtifactServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_private_dns_result_is_rejected(self):
         private_result = [(2, 1, 6, "", ("127.0.0.1", 443))]
-        with (
-            mock.patch.object(
-                artifact_service.socket, "getaddrinfo", return_value=private_result
-            ),
-            self.assertRaises(artifact_service.PreparationError),
-        ):
-            await artifact_service._resolve_public_addresses("pypi.org", 443)
+        for host in ("pypi.org", "raw.githubusercontent.com"):
+            with (
+                self.subTest(host=host),
+                mock.patch.object(
+                    artifact_service.socket, "getaddrinfo", return_value=private_result
+                ),
+                self.assertRaises(artifact_service.PreparationError),
+            ):
+                await artifact_service._resolve_public_addresses(host, 443)
         self.assertEqual(self.pypi.requests, [])
 
     async def test_network_backend_connects_to_verified_numeric_address(self):

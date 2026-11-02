@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import io
 import json
 import os
 import re
@@ -13,6 +14,7 @@ import stat
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,9 @@ _MAX_JOB_BYTES = 64 * 1024
 _MAX_CREDENTIAL_BYTES = 256 * 1024
 _MAX_SCRIPT_BYTES = 1024 * 1024
 _MAX_OUTPUT_BYTES = 64 * 1024
+_MAX_BUNDLE_MEMBER_BYTES = 2 * 1024 * 1024
+_MAX_BUNDLE_UNCOMPRESSED_BYTES = 8 * 1024 * 1024
+_MAX_BUNDLE_MEMBERS = 4096
 _MAX_ENV_FIELDS = 64
 _MAX_ENV_FIELD_BYTES = 16 * 1024
 _MAX_ENV_TOTAL_BYTES = 64 * 1024
@@ -32,6 +37,30 @@ _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z", re.ASCII)
 _HEX_64 = re.compile(r"[0-9a-fA-F]{64}\Z", re.ASCII)
 _RESERVED_ENV_NAMES = frozenset({"PATH", "HOME", "SHELL", "ENV", "BASH_ENV", "IFS"})
 _RESERVED_ENV_PREFIXES = ("PYTHON", "NODE_", "LD_", "DYLD_")
+_NATIVE_SUFFIXES = (".so", ".pyd", ".dll", ".dylib", ".node")
+_NATIVE_MAGICS = (
+    b"\x7fELF",
+    b"\x00asm",
+    b"\xfe\xed\xfa\xce",
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf",
+    b"\xcf\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe",
+    b"\xbe\xba\xfe\xca",
+    b"\xca\xfe\xba\xbf",
+    b"\xbf\xba\xfe\xca",
+)
+_BUNDLE_RESERVED_TOP_LEVEL = frozenset(
+    {
+        "artifact.zip",
+        "bootstrap.py",
+        "credentials.json",
+        "job.json",
+        "payload",
+        "script.js",
+        "script.py",
+    }
+)
 _BUSINESS_STATUSES = frozenset(
     {
         "success",
@@ -68,7 +97,14 @@ _RESULT_FIELDS = frozenset(
     }
 )
 _JOB_FIELDS = frozenset(
-    {"protocol", "runtime", "sha256", "timeout_seconds", "result_adapter"}
+    {
+        "protocol",
+        "runtime",
+        "sha256",
+        "timeout_seconds",
+        "result_adapter",
+        "artifact_format",
+    }
 )
 
 
@@ -369,6 +405,7 @@ def _parse_job(raw: bytes) -> dict[str, object]:
     digest = job.get("sha256")
     timeout_seconds = job.get("timeout_seconds")
     result_adapter = job.get("result_adapter")
+    artifact_format = job.get("artifact_format")
     if not _is_int(protocol) or protocol != _PROTOCOL:
         raise _RunnerError
     if runtime not in {"python", "node"}:
@@ -378,6 +415,8 @@ def _parse_job(raw: bytes) -> dict[str, object]:
     if not _is_int(timeout_seconds) or timeout_seconds < 1 or timeout_seconds > 240:
         raise _RunnerError
     if result_adapter not in {"json_protocol", "process_only"}:
+        raise _RunnerError
+    if artifact_format not in {"script", "bundle"}:
         raise _RunnerError
     return job
 
@@ -456,6 +495,190 @@ def _verify_script(directory_fd: int, name: str, expected_digest: str) -> None:
             os.close(script_fd)
         except OSError:
             pass
+
+
+def _bundle_member_path(name: str) -> str:
+    if (
+        not isinstance(name, str)
+        or not name
+        or "\x00" in name
+        or "\\" in name
+        or name.startswith("/")
+        or name.endswith("/")
+        or any(ord(character) < 32 for character in name)
+    ):
+        raise _RunnerError
+    parts = name.split("/")
+    if any(not part or part in {".", ".."} or ":" in part for part in parts):
+        raise _RunnerError
+    return name
+
+
+def _has_native_signature(data: bytes) -> bool:
+    if data.startswith(_NATIVE_MAGICS):
+        return True
+    if len(data) < 64 or not data.startswith(b"MZ"):
+        return False
+    pe_offset = int.from_bytes(data[60:64], "little")
+    return pe_offset <= len(data) - 4 and data[pe_offset : pe_offset + 4] == b"PE\0\0"
+
+
+def _bundle_files(raw: bytes, runtime: str) -> dict[str, bytes]:
+    if not raw or len(raw) > _MAX_SCRIPT_BYTES:
+        raise _RunnerError
+    expected_task = "task.py" if runtime == "python" else "task.js"
+    files: dict[str, bytes] = {}
+    casefolded: set[str] = set()
+    parents: set[str] = set()
+    uncompressed = 0
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw), "r") as bundle:
+            members = bundle.infolist()
+            if not members or len(members) > _MAX_BUNDLE_MEMBERS:
+                raise _RunnerError
+            for member in members:
+                path = _bundle_member_path(member.filename)
+                folded = path.casefold()
+                parts = path.split("/")
+                parent_keys = {
+                    "/".join(parts[:index]).casefold() for index in range(1, len(parts))
+                }
+                if (
+                    folded in casefolded
+                    or folded in parents
+                    or any(parent in casefolded for parent in parent_keys)
+                ):
+                    raise _RunnerError
+                first = parts[0].casefold()
+                if first in _BUNDLE_RESERVED_TOP_LEVEL:
+                    raise _RunnerError
+                if first in {"task.py", "task.js"} and path != expected_task:
+                    raise _RunnerError
+                if folded.endswith(_NATIVE_SUFFIXES):
+                    raise _RunnerError
+
+                mode = (member.external_attr >> 16) & 0xFFFF
+                if stat.S_IFMT(mode) != stat.S_IFREG or member.flag_bits & 0x1:
+                    raise _RunnerError
+                if member.compress_type != zipfile.ZIP_DEFLATED:
+                    raise _RunnerError
+                if member.file_size < 0 or member.file_size > _MAX_BUNDLE_MEMBER_BYTES:
+                    raise _RunnerError
+                uncompressed += member.file_size
+                if uncompressed > _MAX_BUNDLE_UNCOMPRESSED_BYTES:
+                    raise _RunnerError
+                data = bundle.read(member)
+                if len(data) != member.file_size:
+                    raise _RunnerError
+                if _has_native_signature(data):
+                    raise _RunnerError
+                files[path] = data
+                casefolded.add(folded)
+                parents.update(parent_keys)
+    except _RunnerError:
+        raise
+    except (OSError, RuntimeError, zipfile.BadZipFile, NotImplementedError):
+        raise _RunnerError from None
+    if expected_task not in files:
+        raise _RunnerError
+    return files
+
+
+def _open_private_directory(parent_fd: int, name: str, *, create: bool) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        if create:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+        directory_fd = os.open(name, flags, dir_fd=parent_fd)
+        metadata = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            os.close(directory_fd)
+            raise _RunnerError
+        return directory_fd
+    except _RunnerError:
+        raise
+    except (OSError, ValueError):
+        raise _RunnerError from None
+
+
+def _write_private_file(parent_fd: int, name: str, data: bytes) -> None:
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    file_fd: int | None = None
+    try:
+        file_fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
+        view = memoryview(data)
+        written = 0
+        while written < len(view):
+            count = os.write(file_fd, view[written:])
+            if count <= 0:
+                raise _RunnerError
+            written += count
+        metadata = os.fstat(file_fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+        ):
+            raise _RunnerError
+    except _RunnerError:
+        raise
+    except (OSError, OverflowError, ValueError):
+        raise _RunnerError from None
+    finally:
+        if file_fd is not None:
+            try:
+                os.close(file_fd)
+            except OSError:
+                pass
+
+
+def _write_bundle_tree(directory_fd: int, files: dict[str, bytes]) -> None:
+    runtime_fd = _open_private_directory(directory_fd, "runtime", create=True)
+    try:
+        for path in sorted(files):
+            parts = path.split("/")
+            parent_fd = os.dup(runtime_fd)
+            try:
+                for part in parts[:-1]:
+                    try:
+                        child_fd = _open_private_directory(parent_fd, part, create=True)
+                    except _RunnerError:
+                        child_fd = _open_private_directory(
+                            parent_fd, part, create=False
+                        )
+                    os.close(parent_fd)
+                    parent_fd = child_fd
+                _write_private_file(parent_fd, parts[-1], files[path])
+            finally:
+                try:
+                    os.close(parent_fd)
+                except OSError:
+                    pass
+    finally:
+        try:
+            os.close(runtime_fd)
+        except OSError:
+            pass
+
+
+def _prepare_bundle(
+    directory_fd: int, directory: Path, runtime: str, expected_digest: str
+) -> tuple[Path, Path]:
+    raw = _read_checked_file(directory_fd, "artifact.zip", _MAX_SCRIPT_BYTES)
+    if hashlib.sha256(raw).hexdigest() != expected_digest.lower():
+        raise _RunnerError
+    files = _bundle_files(raw, runtime)
+    _write_bundle_tree(directory_fd, files)
+    runtime_directory = directory / "runtime"
+    task_name = "task.py" if runtime == "python" else "task.js"
+    return runtime_directory / task_name, runtime_directory
 
 
 def _group_exists(process_group: int) -> bool:
@@ -577,21 +800,23 @@ def _reported_business_status(raw_output: bytes) -> str | None:
 
 
 def _execute(
-    directory: Path,
+    script_path: Path,
+    working_directory: Path,
     job: dict[str, object],
     declared_environment: dict[str, str],
     cancelled: list[bool],
 ) -> tuple[str, int | None, str, str]:
     runtime = job["runtime"]
-    script_name = "script.py" if runtime == "python" else "script.js"
-    script_path = str(directory / script_name)
+    script_argument = str(script_path)
     argv = (
-        [sys.executable, script_path] if runtime == "python" else ["node", script_path]
+        [sys.executable, script_argument]
+        if runtime == "python"
+        else ["node", script_argument]
     )
     child_environment = {
         "PATH": "/usr/local/bin:/usr/bin:/bin",
         "LANG": "C.UTF-8",
-        "HOME": str(directory),
+        "HOME": str(working_directory),
     }
     child_environment.update(declared_environment)
 
@@ -604,7 +829,7 @@ def _execute(
         try:
             process = subprocess.Popen(
                 argv,
-                cwd=str(directory),
+                cwd=str(working_directory),
                 env=child_environment,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -708,10 +933,18 @@ def run(directory: Path) -> dict[str, object]:
             )
         job = _parse_job(_read_checked_file(directory_fd, "job.json", _MAX_JOB_BYTES))
         declared_environment = _parse_environment(credentials_raw)
-        script_name = "script.py" if job["runtime"] == "python" else "script.js"
-        _verify_script(directory_fd, script_name, str(job["sha256"]))
+        runtime = str(job["runtime"])
+        if job["artifact_format"] == "bundle":
+            script_path, working_directory = _prepare_bundle(
+                directory_fd, directory, runtime, str(job["sha256"])
+            )
+        else:
+            script_name = "script.py" if runtime == "python" else "script.js"
+            _verify_script(directory_fd, script_name, str(job["sha256"]))
+            script_path = directory / script_name
+            working_directory = directory
         process_status, exit_code, business_status, reason_code = _execute(
-            directory, job, declared_environment, cancelled
+            script_path, working_directory, job, declared_environment, cancelled
         )
         return _envelope(
             process_status,
