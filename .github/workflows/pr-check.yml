@@ -62,9 +62,33 @@ jobs:
       - name: 运行全量离线测试
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v
 
+  tianyi:
+    name: 天翼脚本离线测试 (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.12', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: 创建脚本专用测试环境并校验依赖哈希
+        working-directory: third_party/tianyi
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --require-hashes --only-binary=:all: -r requirements.lock
+      - name: 运行天翼脚本禁网回归
+        working-directory: third_party/tianyi
+        run: .venv/bin/python -m unittest discover -s tests -v
+
   commit-msg:
     name: 提交信息规范
-    needs: tests
+    needs: [tests, tianyi]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -72,7 +96,8 @@ jobs:
       - name: 要求所有运行时测试通过
         env:
           TEST_RESULT: ${{ needs.tests.result }}
-        run: test "$TEST_RESULT" = success
+          TIANYI_RESULT: ${{ needs.tianyi.result }}
+        run: test "$TEST_RESULT" = success && test "$TIANYI_RESULT" = success
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0

@@ -79,11 +79,29 @@ Neo 接口按 [Shipyard Neo `f4d248b4274c1a2f05402f75a3b39e5c19be9ff5`](https://
 - [K8s driver](https://github.com/AstrBotDevs/shipyard-neo/blob/f4d248b4274c1a2f05402f75a3b39e5c19be9ff5/pkgs/bay/app/drivers/k8s/k8s.py)：PVC 删除受理不等于清理完成，因此当前执行层仅接受已确认的固定 Docker 部署。
 - [AstrBot v4.29.4 Context](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.4/astrbot/core/star/context.py)：通过 `get_config()` 读取框架配置，不访问框架私有存储或借用聊天资源。
 
+### 本仓库维护的天翼脚本
+
+`third_party/tianyi/index.py` 和上游回归测试来自 [BlueSkyXN/189Cloud-Checkin 的 `43d2e7054dba7c5c2152e9c8c88fd23e6073a45b`](https://github.com/BlueSkyXN/189Cloud-Checkin/tree/43d2e7054dba7c5c2152e9c8c88fd23e6073a45b)，保留该目录下的 Apache-2.0 `LICENSE`。本地修改新增 `reason_code`、区分认证要求与未知结果，保留原有 `status/counts` 和通知行为；源码头标明来源及修改。后续修改在当前插件仓库提交 PR，不依赖上游接收修改。
+
+设备验证结果 `-133` 参考 [OpenList `e72822f` 的 PC 登录客户端](https://github.com/OpenListTeam/OpenList/blob/e72822f5390f4272c9fe9da8cabba3c1a270182f/drivers/189pc/utils.go)（AGPL-3.0）的协议解释，未移植其实现。验证码标志和设备结果尚未用真实账号验收；不识别验证码、不发短信、不增加业务重试。`reason_code` 契约见 `main_handler` 文档字符串；`failed` 汇总仍包含需要认证和未知结果，不能据此认定密码失效。
+
+脚本专用依赖锁为 `third_party/tianyi/requirements.lock`，包含七个固定版本纯 Python wheel 的 SHA256，测试目标为 Python 3.12–3.14。没有移入上游的旧依赖压缩包，也不把 requests、rsa 安装到 AstrBot 宿主。以下命令仅运行禁网测试替身，不是宿主执行真实签到的入口：
+
+```bash
+cd third_party/tianyi
+python3 -m venv .venv
+.venv/bin/python -m pip install --require-hashes --only-binary=:all: -r requirements.lock
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+脚本的 Neo 依赖制品上传、管理员准备入口和输入/结果适配尚未接入，迁入源码不代表任务已可执行。两个模板继续默认禁用。
+
+
 ## 测试与验证
 
 提交前至少运行上面的离线测试。涉及框架接口、OneBot 事件、KV 写入确认或调度时间的改动，需要补充对应的回归测试；不要用占位实现、吞异常或弱化断言通过测试。
 
-PR 的“离线测试”任务分别在 Python 3.12、3.13、3.14 上安装 `requirements.txt`，显式安装 Node 22，并运行 `unittest discover -s tests -p 'test_*.py' -v`。既有必需检查“提交信息规范”等待全部矩阵结果，仅在测试全部成功后校验提交历史；测试失败、取消或跳过都不能通过该检查，无需修改现有必需检查名称。本地通过不代表真实 QQ、Neo 或云盘签到已经验证，普通 PR CI 不连接这些服务。
+PR 的“离线测试”任务分别在 Python 3.12、3.13、3.14 上安装宿主 `requirements.txt`，显式安装 Node 22，并运行 `unittest discover -s tests -p 'test_*.py' -v`；“天翼脚本离线测试”在相同 Python 矩阵的独立虚拟环境中校验脚本依赖哈希并运行脚本测试。既有必需检查“提交信息规范”等待两组矩阵，仅在全部成功后校验提交历史；任一失败、取消或跳过都不能通过，无需修改现有必需检查名称。普通 PR CI 不连接真实 QQ、Neo 或云盘服务。
 
 执行层回归位于 `tests/test_neo_client.py`、`tests/test_neo_executor.py`、`tests/test_neo_lifecycle.py` 和 `tests/test_bootstrap.py`。`tests/neo_support.py` 是受控 Bay 替身，会在临时目录运行本仓库 wrapper 与假脚本；这不是产品的宿主回退路径。本地未安装 Node 时对应测试会明确跳过；CI 显式安装并检查 Node，不依赖 runner 预装。macOS 测试只将 Node 的可执行路径映射到本机安装位置，实际运行 Node 子进程。
 
