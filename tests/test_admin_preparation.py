@@ -13,7 +13,12 @@ from astrbot_support import (
     patch_astrbot_modules,
 )
 from state_support import load_module
-from test_artifact_service import MockPyPI, SyntheticArtifactRepository
+from test_artifact_service import (
+    GenericArtifactRepository,
+    MockGitHub,
+    MockPyPI,
+    SyntheticArtifactRepository,
+)
 
 
 class AdminPreparationTests(unittest.IsolatedAsyncioTestCase):
@@ -168,6 +173,44 @@ class AdminPreparationTests(unittest.IsolatedAsyncioTestCase):
         restored = await self.plugin.preparation.load(self.current_task())
         self.assertEqual(restored.script, artifact.script)
         self.assertIn(artifact.sha256, event.sent[-1].text)
+        self.assertEqual(len(remote.requests), requests_before)
+
+    async def test_administrator_prepares_generic_bundle_then_cache_is_offline(self):
+        repository = GenericArtifactRepository("python")
+        task = repository.task()
+        self.config["tasks"] = [
+            {
+                "task_id": task.task_id,
+                "name": task.name,
+                "enabled": False,
+                "runtime": task.runtime,
+                "script_url": task.script_url,
+                "source_commit": task.source_commit,
+                "sha256": task.sha256,
+                "cron": task.cron,
+                "user_fields": [],
+                "fixed_env": dict(task.fixed_env),
+                "input_adapter": task.input_adapter,
+                "result_adapter": task.result_adapter,
+                "dependency_bundle": task.dependency_bundle,
+                "timeout_seconds": task.timeout_seconds,
+                "experimental": False,
+            }
+        ]
+        remote = MockGitHub(repository)
+        client = remote.client()
+        self.addAsyncCleanup(client.aclose)
+        self.install_service(client)
+
+        event = FakeEvent()
+        await self.plugin.checkin(event, "管理", "准备", task.task_id)
+
+        prepared = await self.plugin.preparation.load(self.current_task())
+        self.assertEqual(prepared.artifact_format, "bundle")
+        self.assertEqual(len(remote.requests), 2)
+        self.assertIn(prepared.sha256, event.sent[-1].text)
+        requests_before = len(remote.requests)
+        await self.plugin.checkin(FakeEvent(), "管理", "准备", task.task_id)
         self.assertEqual(len(remote.requests), requests_before)
 
     async def change_during_download(self, change):

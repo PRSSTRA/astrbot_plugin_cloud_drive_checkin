@@ -258,7 +258,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
                     "fixed_env": {"SAFE_OPTION": "FIXED_EXECUTION_VALUE"},
                     "input_adapter": "direct_env",
                     "result_adapter": "process_only",
-                    "dependency_bundle": "DEPENDENCY_EXECUTION_VALUE",
+                    "dependency_bundle": "none",
                     "timeout_seconds": 0,
                     "experimental": False,
                 }

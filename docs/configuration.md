@@ -50,7 +50,7 @@ QQ 号必须是正整数，或由数字组成、不含空白、符号和前导�
 
 活动排队最多 256 条，签到批次和通知各最多 1000 条。达到上限时插件拒绝新请求，不删除排队、运行或未结算通知记录来腾出空间；保留策略只清理已结束且通知已结算的记录。
 
-签到执行只接受已启用、已准备且为固定天翼声明的任务。移动模板不能执行，即使已录入凭据。
+签到执行只接受已启用、已准备，且属于受支持声明形态的任务：固定天翼声明（`tianyi_account` / `tianyi`），或 `direct_env` 搭配 `json_protocol`、`process_only` 的通用 Python/Node 任务。移动模板不能执行，即使已录入凭据。
 
 ## Neo 连接
 
@@ -134,7 +134,7 @@ PY
 - `/签到 录入 <任务ID>` 可以录入任意已配置任务，包括 `enabled=false` 的任务。录入本身不执行任务。
 - 整段录入限时 5 分钟。每条消息作为一个字段输入，插件只接受全部由文本段组成的私聊消息；图片、引用、文件和其他非文本段会被拒绝。
 - 字符串按原文保存，不裁剪空白、引号或换行。整数使用十进制写法，可以带正负号，不能包含空白。布尔值输入 `true` 或 `false`，不区分大小写。
-- 必填字符串不能为空。含 NUL 的值会被拒绝。录入时按 UTF-8 文本计算大小，单字段不超过 16 KiB，全部字段合计不超过 64 KiB。
+- 必填字符串不能为空。含 NUL 的值会被拒绝。录入时字符串按 UTF-8 字节计算，单个用户值不超过 16 KiB；所有已录入值按执行时序列化后与 `fixed_env` 值合计不超过 64 KiB。
 - 可选字段可以发送 `/跳过`，必填字段不能跳过。全部字段完成后发送 `/确认` 保存；未完成时发送 `/确认` 不会提交。
 - 发送 `/取消` 放弃本次录入并清除未提交内容。
 - 字段值正好是 `/取消`、`/确认`、`/跳过`，或以 `/值 ` 开头时，发送 `/值 原文`。插件只去掉一次最前面的 `/值 `。
@@ -170,7 +170,7 @@ PY
 - 任务的已准备制品与当前配置版本、打包输入指纹一致。
 - 提交者已有该任务完整绑定、最新已确认凭据，绑定未暂停，且不在凭据录入向导中。
 - 部署主密钥可用，用于解密本人凭据。
-- 任务使用固定天翼声明；移动模板不能执行。
+- 任务属于受支持的执行形态：已准备的天翼声明，或 `direct_env` 搭配 `json_protocol`、`process_only` 的通用 Python/Node 任务；移动模板不能执行。
 
 接收后先持久化排队记录，再返回 run_id。同一用户在同一任务上的请求尚未结束时，重复提交返回原 run_id，不新建请求；若未结束的是该任务自动生成的请求，本次手动提交会加入原请求并标记手动参与，结束后发送手动终态。冷却未结束时拒绝，也不创建请求。冷却、用户间隔和任务间隔的默认值与计算方式见[执行设置](#执行设置)。
 
@@ -231,16 +231,38 @@ PY
 /签到 管理 准备 tianyi_cloud
 ```
 
-- 支持与仓库固定天翼执行声明逐项一致的任务。可以自定义任务 ID、名称、Cron、启用状态、超时和实验标记；以下字段必须与仓库天翼默认声明一致：`runtime` 为 `python`，`script_url`、`source_commit`、`sha256` 为固定值，`input_adapter` 为 `tianyi_account`，`result_adapter` 为 `tianyi`，`dependency_bundle` 和 `fixed_env` 为空，`user_fields` 的顺序、数量及每项的 `field_id`、`label`、`env_name`、`value_type`、`required`、`secret`、`hint` 完全相同（当前为 `username`、`password`）。任一不一致都会拒绝准备。移动任务尚未支持。
-- 插件服务开关和任务 `enabled` 都不影响准备，默认禁用的天翼模板也可以准备。准备只生成并缓存制品，不修改任务配置，不创建执行请求，也不读取凭据。
-- 首次构建或缓存失效时需要网络。插件异步读取 PyPI 的版本元数据，只从 `files.pythonhosted.org` 下载 `third_party/tianyi/requirements.lock` 锁定的 wheel，校验版本和 SHA256 后在本地生成 zipapp。
+固定天翼声明：与仓库固定天翼执行声明逐项一致的任务。可以自定义任务 ID、名称、Cron、启用状态、超时和实验标记；以下字段必须与仓库天翼默认声明一致：`runtime` 为 `python`，`script_url`、`source_commit`、`sha256` 为固定值，`input_adapter` 为 `tianyi_account`，`result_adapter` 为 `tianyi`，`dependency_bundle` 和 `fixed_env` 为空，`user_fields` 的顺序、数量及每项的 `field_id`、`label`、`env_name`、`value_type`、`required`、`secret`、`hint` 完全相同（当前为 `username`、`password`）。任一不一致都会拒绝准备。
+
+通用任务：`input_adapter` 为 `direct_env`，`runtime` 为 `python` 或 `node`，`result_adapter` 为 `json_protocol` 或 `process_only`。移动任务尚未支持。源码和依赖都由任务配置锁定：
+
+- `script_url` 与 `source_commit`：固定 40 位提交的 HTTPS GitHub 地址，`sha256` 是源码内容的 SHA256。URL 规则与[脚本来源](#脚本来源)相同。
+- `dependency_bundle`：必须显式填写字符串 `none`，或填写下面这段 JSON 文本。插件不会把空字符串当作无依赖。
+
+```json
+{"format":"zip-v1","url":"https://raw.githubusercontent.com/<owner>/<repo>/<40位提交>/<路径>","sha256":"<64位小写十六进制>"}
+```
+
+`url` 使用固定 40 位提交的 HTTPS GitHub 地址，地址规则与 `script_url` 相同；`sha256` 锁定依赖 zip 的内容。插件把它规范化为 `raw.githubusercontent.com` 形式，只接受 `format`、`url`、`sha256` 三个键且 `format` 必须为 `zip-v1`，并会以规范化结果参与配置版本计算。源码和依赖是两条独立锁定，可以来自不同仓库或不同提交。
+
+准备只从 `raw.githubusercontent.com` 下载这两个地址，校验 SHA256 后在本地打包；不执行下载内容，不在宿主机安装依赖，也不运行包管理器。
+
+依赖为 `none` 时，制品就是源码文件本身（`script.py` 或 `script.js`），执行时直接上传源码。依赖为 zip-v1 时，制品是 zip：`task.py`（Python）或 `task.js`（Node）位于根目录，依赖文件按原路径加入。Python 依赖必须是能从制品根目录直接导入的纯 Python 模块或包；Node 依赖放在 `node_modules/` 下供 `require` 解析。
+
+依赖包中的符号链接、加密成员、绝对路径、路径穿越、重复或仅大小写不同的路径、保留顶层名称，以及 `.so`、`.pyd`、`.dll`、`.dylib`、`.node` 扩展名都会被拒绝。准备和运行时还会检查文件内容：ELF、WASM、Mach-O、fat/universal 或真实 PE 文件头会被拒绝，即使文件改名为 `.bin`。普通 JSON、PEM 和其他非原生二进制辅助数据可以随包分发。包内权限位不保留，展开时统一为 0600 文件，运行时目录为 0700。
+
+这些检查是准备和运行时的支持格式限制，不构成对受信管理员脚本在 sandbox 内自行编码或构造原生代码的阻止。
+
+源码不超过 1 MiB，依赖 zip 不超过 1 MiB，生成的制品不超过 1 MiB；依赖 zip 最多 4096 个成员，单成员不超过 2 MiB，解压后合计不超过 8 MiB。
+
+- 插件服务开关和任务 `enabled` 都不影响准备，默认禁用的模板也可以准备。准备只生成并缓存制品，不修改任务配置，不创建执行请求，也不读取凭据。
+- 首次构建或缓存失效时需要网络。天翼任务异步读取 PyPI 的版本元数据，只从 `files.pythonhosted.org` 下载 `third_party/tianyi/requirements.lock` 锁定的 wheel，校验版本和 SHA256 后在本地生成 zipapp；通用任务从 `raw.githubusercontent.com` 下载锁定的源码，按声明再下载依赖包，校验后在本地生成源码或 zip 制品。
 - 制品按内容缓存在 AstrBot 插件数据目录的 `prepared_artifacts/<制品sha256>.pyz`。数据目录为 `data/plugin_data/astrbot_plugin_cloud_drive_checkin`，由 `StarTools.get_data_dir()` 创建。准备完成后会清理未被准备记录引用的制品。已发布引用集合去重后的上限为 32 个文件、合计 32 MiB；超出时准备失败，配额不包含目录中的临时副本或其他文件。
 - 准备成功后返回任务 ID、制品 SHA256 和字节大小。
 - 准备记录保存在 `checkin_state` 快照的 `prepared_artifacts[task_id]` 中，包含任务配置版本、源码 commit 与摘要、制品摘要与大小、打包输入指纹。
-- 任务配置版本、打包输入指纹和缓存文件摘要都与记录一致时，准备直接使用缓存，不再下载。任务配置版本或打包输入（源码、入口、依赖锁、许可）变化后，旧缓存不再命中，需要再次执行准备；插件不会在后台更新制品。
+- 任务配置版本、打包输入指纹和缓存文件摘要都与记录一致时，准备直接使用缓存，不再下载。任务配置版本或打包输入（源码、入口、运行时、依赖声明或依赖锁、许可）变化后，旧缓存不再命中，需要再次执行准备；插件不会在后台更新制品。
 - 同一时间只处理一个准备请求，并发请求会收到繁忙提示，稍后重试。下载、校验或状态写入失败时，本次准备不报告成功。权限或任务配置在准备期间变化时，重新发起准备。状态存储未就绪或写入未确认时，按回复提示在插件页重载后重试；不要手工修改缓存或 KV。缓存文件缺失或被改动时，再次准备会按失效处理并重建。
 
-准备不启用任务，也不加入执行队列。手动签到只使用已准备且与当前任务版本、打包输入指纹一致的制品；未准备、缓存失效或记录不匹配时拒绝请求。自动计划遇到同样情况时以配置错误结束并发送自动失败通知。任务配置版本变化后需要重新准备，再等待后续自动计划。
+准备不启用任务，也不加入执行队列。手动签到只使用已准备且与当前任务版本、打包输入指纹一致的制品；未准备、缓存失效或记录不匹配时拒绝请求。执行阶段只读取缓存中的制品，不下载、不重新构建，也不在宿主机运行脚本。自动计划遇到同样情况时以配置错误结束并发送自动失败通知。任务配置版本变化后需要重新准备，再等待后续自动计划。
 
 ## 管理员取消
 
@@ -311,13 +333,13 @@ PY
 | `runtime` | string | `python` 或 `node` |
 | `script_url` | string | 固定提交的 HTTPS GitHub 脚本地址，规则见下文 |
 | `source_commit` | string | 40 位十六进制提交；必须与 `script_url` 中的提交一致 |
-| `sha256` | string | 64 位十六进制预期内容摘要；只做声明校验，天翼准备要求与仓库固定值一致 |
+| `sha256` | string | 64 位十六进制预期内容摘要；天翼准备要求与仓库固定值一致，通用任务准备要求下载源码的实际摘要与它一致 |
 | `cron` | string | 五段 Cron 表达式，用于预览和自动计划，规则见下文 |
 | `user_fields` | array 或 JSON 文本 | 用户字段元数据数组；WebUI 中使用 JSON 文本编辑器 |
 | `fixed_env` | object | 固定的非秘密环境变量，名称到字符串值的映射 |
 | `input_adapter` | string | `direct_env`、`tianyi_account` 或 `mobile_single_account` |
 | `result_adapter` | string | `json_protocol`、`process_only`、`tianyi` 或 `mobile_unverified` |
-| `dependency_bundle` | string | 依赖包声明，可以为空；只作配置声明，插件不会据此在宿主机安装依赖 |
+| `dependency_bundle` | string | `direct_env` 必须为 `none` 或 zip-v1 声明；天翼和移动声明必须为空。插件只在准备时校验并打包，不在宿主机安装依赖 |
 | `timeout_seconds` | int | `0` 继承全局值；其他值允许 1 到 240 |
 | `experimental` | bool | 实验任务标记，默认 `false` |
 
@@ -343,6 +365,20 @@ PY
 PATH HOME SHELL ENV BASH_ENV IFS
 PYTHON* NODE_* LD_* DYLD_*
 ```
+
+`fixed_env` 的键同样按上面的环境变量名规则校验，值必须是字符串，保留声明的大小写。用户字段和 `fixed_env` 之间不能有仅大小写不同的同名变量，任一重复都会使任务配置无效。
+
+变量按声明的大小写注入。`string` 按原文传递；`int` 以十进制文本传递；`bool` 输入时接受不区分大小写的 `true` 或 `false`，执行时统一传递小写 `true` 或 `false`。
+
+环境变量在配置校验和每次执行时都受数量与大小限制：
+
+- `user_fields` 数量与 `fixed_env` 键数量合计不超过 64。
+- 变量名（ASCII）和单个值（UTF-8）各不超过 16 KiB；值中的 NUL 会被拒绝。
+- `fixed_env` 的值合计不超过 64 KiB。
+- 静态校验还要求 `fixed_env` 值合计加上所有必填字段的最小序列化值（字符串和整数按 1 字节，布尔按 4 字节）不超过 64 KiB。
+- 录入保存时，按类型序列化后的实际用户值与 `fixed_env` 值合计不超过 64 KiB；单个用户值同样不超过 16 KiB。
+
+合计只计算变量值，不计算变量名。
 
 `user_fields` 既可以直接传数组，也可以传 UTF-8 JSON 文本。JSON 文本上限为 64 KiB，嵌套深度最多 32 层，不接受 `NaN` 等非标准 JSON 常量。一个任务最多 32 个用户字段。
 
@@ -378,7 +414,7 @@ GitHub 页面地址会规范化为 `raw.githubusercontent.com` 形式。URL 必�
 - 空路径段、`.`、`..`、反斜杠和经过过度百分号编码的路径；
 - `github.com` 上不是 `blob` 的地址，或缺少脚本路径的地址。
 
-脚本地址只做静态校验，插件不按该地址下载脚本。天翼准备使用仓库内的 `third_party/tianyi/index.py`，任务中的 `sha256` 只作声明校验，不能证明远端内容已经核对。
+脚本地址只做静态校验。天翼准备不按该地址下载脚本，使用仓库内的 `third_party/tianyi/index.py`，任务中的 `sha256` 只作声明校验，不能证明远端内容已经核对。通用任务准备会从规范化后的地址下载源码，并要求内容摘要等于任务声明的 `sha256`。
 
 ## Cron
 
@@ -402,11 +438,17 @@ Cron 表达式固定为五段：分钟、小时、日、月、星期。支持：
 
 | 输入适配器 | 运行时 | 结果适配器 | 额外要求 |
 | --- | --- | --- | --- |
-| `direct_env` | 任意 | `json_protocol` 或 `process_only` | 无 |
+| `direct_env` | `python` 或 `node` | `json_protocol` 或 `process_only` | `dependency_bundle` 必须为 `none` 或 zip-v1 声明 |
 | `tianyi_account` | `python` | `tianyi` | 必须有 `username`、`password` 字段，类型为 `string`，且 `required=true`、`secret=true` |
 | `mobile_single_account` | `node` | `mobile_unverified` | 必须有 `authorization`、`phone`、`auth_token` 字段，类型为 `string`，且 `required=true`、`secret=true` |
 
-`tianyi` 结果适配器只能与 `tianyi_account` 搭配，`mobile_unverified` 只能与 `mobile_single_account` 搭配。
+`tianyi` 结果适配器只能与 `tianyi_account` 搭配，`mobile_unverified` 只能与 `mobile_single_account` 搭配。`direct_env` 任务按 `runtime` 执行 Python 或 Node；子进程只获得固定的 `PATH`、`HOME`、`LANG` 和本次声明的环境变量，凭据文件在启动前移除，不作为命令行参数传入。
+
+通用任务的结果按保守规则记录：
+
+- `json_protocol` 只读取子进程 stdout 中一个完整 JSON 对象的 `status`，且只接受已知业务状态。其他字段、自由文本、stderr 和多余输出都不会成为业务结果。
+- `process_only` 不解析业务结果，业务状态记为 `unknown`，进程退出码单独记录。
+- 输出超过 64 KiB、超时、启动失败或没有有效结果时，按 `unknown`、`timeout` 或 `config_error` 等状态记录，不推测业务是否已经发生。
 
 以下任一条件成立时，任务必须保持 `enabled=false` 且 `experimental=true`：
 

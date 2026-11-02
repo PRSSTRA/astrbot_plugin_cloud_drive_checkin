@@ -29,7 +29,7 @@ def raw_task(task_id="task_one", *, enabled=True, name=None):
         "fixed_env": {},
         "input_adapter": "direct_env",
         "result_adapter": "json_protocol",
-        "dependency_bundle": "",
+        "dependency_bundle": "none",
         "timeout_seconds": 30,
         "experimental": False,
     }

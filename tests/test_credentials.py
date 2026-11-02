@@ -3,6 +3,7 @@ import copy
 import json
 import os
 import unittest
+from dataclasses import replace
 from datetime import datetime
 from unittest.mock import patch
 
@@ -73,7 +74,7 @@ def _task(*, task_id="example_task", version="task-version-1", fields=None):
         fixed_env=(),
         input_adapter="direct_env",
         result_adapter="json_protocol",
-        dependency_bundle="",
+        dependency_bundle="none",
         timeout_seconds=0,
         experimental=False,
         version=version,
@@ -312,6 +313,21 @@ class ValueValidationTests(unittest.TestCase):
             credentials.validate_values(task, {"field_0": "界" * 5462})
         with self.assertRaises(credentials.CredentialError):
             credentials.validate_values(task, {**at_limit, "field_4": "x"})
+
+    def test_fixed_and_user_values_share_runner_total_budget(self):
+        task = replace(
+            _task(fields=(_field(),)),
+            fixed_env=(
+                ("FIXED_0", "x" * (16 * 1024)),
+                ("FIXED_1", "x" * (16 * 1024)),
+                ("FIXED_2", "x" * (16 * 1024)),
+                ("FIXED_3", "x" * (16 * 1024 - 4)),
+            ),
+        )
+
+        credentials.validate_values(task, {"account": "xxxx"})
+        with self.assertRaises(credentials.CredentialError):
+            credentials.validate_values(task, {"account": "xxxxx"})
 
 
 class SaveBindingTests(unittest.IsolatedAsyncioTestCase):
