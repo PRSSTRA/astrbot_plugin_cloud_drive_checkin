@@ -32,6 +32,7 @@ _USAGE_MESSAGE = (
     "\n用法：/签到 暂停/恢复 <任务ID>\n用法：/签到 通知 <任务ID> 开/关"
     "\n用法：/签到 删除 <任务ID> [确认/取消]"
     "\n用法：/签到 管理 准备 <任务ID>"
+    "\n用法：/签到 管理 取消 <run_id>"
 )
 _TASK_NOT_FOUND_MESSAGE = "未找到该签到任务。"
 _DELETE_CONFIRM_SECONDS = 60
@@ -386,6 +387,52 @@ class CloudDriveCheckin(Star):
         except InvalidStateError:
             return "状态容量或结构校验失败，未发布本次制品。"
 
+    async def _cancel_command(self, event, identity, run_id: str) -> str:
+        def guard():
+            permissions = parse_config(self.config)
+            admins = self.context.get_config(umo=event.unified_msg_origin).get(
+                "admins_id", []
+            )
+            if not isinstance(admins, list) or any(
+                type(value) is not str for value in admins
+            ):
+                raise PluginConfigError(
+                    "framework administrator configuration is invalid"
+                )
+            access = authorize(
+                identity,
+                astrbot_admin=event.is_admin() and identity.qq_id in admins,
+                config=permissions,
+            )
+            if (
+                self._terminating
+                or get_private_identity(event) != identity
+                or access is None
+                or not access.is_admin
+            ):
+                raise QueueRejected("permission_revoked")
+
+        try:
+            guard()
+            if self.queue is None:
+                raise StateUnavailableError("execution queue is unavailable")
+            status = await self.queue.request_cancel(run_id, guard=guard)
+            return {
+                "requested": "取消请求已记录；最终结果将通知运行所属用户，请通过本人状态查询。",
+                "finished": "该运行已结束，未修改结果或重新发送通知。",
+                "not_found": "未找到该运行，请检查 run_id。",
+            }[status]
+        except QueueRejected:
+            return "管理员权限已变化，未接受取消请求。"
+        except CommitUnconfirmedError:
+            return "取消写入未确认，新执行已暂停；请管理员恢复存储后查询，勿重复提交。"
+        except StateUnavailableError:
+            return "状态存储未就绪，未接受取消请求。"
+        except ExecutionBlocked:
+            return "执行队列暂不可用，未接受取消请求。"
+        except (PluginConfigError, InvalidStateError):
+            return "权限配置或状态校验失败，未接受取消请求。"
+
     @filter.command("签到", priority=100)
     async def checkin(
         self,
@@ -421,19 +468,29 @@ class CloudDriveCheckin(Star):
             await event.send(event.plain_result(_PERMISSION_DENIED_MESSAGE))
             return
 
+        if tail:
+            await event.send(event.plain_result(_USAGE_MESSAGE))
+            return
+        if subcommand == "管理":
+            if not access.is_admin:
+                await event.send(event.plain_result("仅管理员可执行此管理操作。"))
+                return
+            if task_id == "取消":
+                message = (
+                    await self._cancel_command(event, identity, extra)
+                    if extra
+                    else _USAGE_MESSAGE
+                )
+                await event.send(event.plain_result(message))
+                return
+
         try:
             task_catalog = parse_task_catalog(self.config)
         except PluginConfigError:
             await event.send(event.plain_result(_CONFIG_ERROR_MESSAGE))
             return
 
-        if tail:
-            await event.send(event.plain_result(_USAGE_MESSAGE))
-            return
         if subcommand == "管理":
-            if not access.is_admin:
-                await event.send(event.plain_result("仅管理员可准备签到制品。"))
-                return
             if task_id != "准备" or not extra:
                 await event.send(event.plain_result(_USAGE_MESSAGE))
                 return

@@ -65,6 +65,7 @@ class QueueReason(str, Enum):
     QUEUE_CAPACITY = "queue_capacity"
     INTERRUPTED = "interrupted"
     EXECUTION_ERROR = "execution_error"
+    ADMIN_CANCELLED = "admin_cancelled"
 
 
 class QueueRejected(ExecutionBlocked):
@@ -94,6 +95,22 @@ class _DuplicateAdmission(Exception):
 class _DuplicateOccurrence(Exception):
     def __init__(self, run_ids: list[str]) -> None:
         self.run_ids = run_ids
+
+
+class _CancellationUnchanged(Exception):
+    def __init__(self, status: str) -> None:
+        self.status = status
+
+
+def guard_cancellation(item: Mapping[str, object], snapshot: dict) -> None:
+    """Reject a committed cancellation at queue and credential-transfer boundaries."""
+    current = snapshot["batches"].get(item.get("run_id"))
+    if (
+        isinstance(current, dict)
+        and current.get("kind") == _KIND
+        and current.get("cancel_requested", False) is True
+    ):
+        raise QueueRejected(QueueReason.ADMIN_CANCELLED)
 
 
 def _utc_now() -> datetime:
@@ -812,6 +829,39 @@ class ExecutionQueue:
             "scheduled_at": scheduled_at,
         }
 
+    async def request_cancel(self, run_id: str, *, guard: Callable[[], None]) -> str:
+        """Persist intent only; the worker owns stopping, cleanup and final results."""
+        if self._closing or self._closed or not self.store.ready:
+            raise ExecutionBlocked("execution cancellation is unavailable")
+        if _call_sync(guard) is not None:
+            raise ExecutionBlocked("cancellation guard must return None")
+        if type(run_id) is not str or _HEX_32.fullmatch(run_id) is None:
+            return "not_found"
+
+        def cancel(snapshot: dict) -> None:
+            if _call_sync(guard) is not None:
+                raise ExecutionBlocked("cancellation guard must return None")
+            if self._closing or self._closed:
+                raise ExecutionBlocked("execution cancellation is unavailable")
+            item = snapshot["batches"].get(run_id)
+            if type(item) is not dict or item.get("kind") != _KIND:
+                raise _CancellationUnchanged("not_found")
+            self._validate_item(run_id, item)
+            if item["status"] == "finished":
+                raise _CancellationUnchanged("finished")
+            if item.get("cancel_requested") is True:
+                raise _CancellationUnchanged("requested")
+            item["cancel_requested"] = True
+            # Admission reserved room for terminal/control state, including at quota.
+            item["_reserve"] = item["_reserve"][:-64]
+
+        try:
+            await self.store.mutate(cancel)
+        except _CancellationUnchanged as unchanged:
+            return unchanged.status
+        self.wake()
+        return "requested"
+
     async def close(self) -> None:
         if self._close_task is None:
             self._close_task = asyncio.create_task(
@@ -881,6 +931,7 @@ class ExecutionQueue:
         return parse_execution_config(raw)
 
     def _guard_item(self, item: dict, snapshot: dict) -> None:
+        guard_cancellation(item, snapshot)
         result = _call_sync(self._guard, dict(item), snapshot)
         if result is not None:
             raise ExecutionBlocked("execution queue guard must return None")
@@ -960,6 +1011,7 @@ class ExecutionQueue:
             or status not in {"queued", "running", "finished"}
             or source not in {"manual", "automatic"}
             or type(item.get("manual_requested")) is not bool
+            or type(item.get("cancel_requested", False)) is not bool
         ):
             raise ExecutionBlocked("check-in execution state is invalid")
         if source == "manual":
@@ -1573,6 +1625,7 @@ class ExecutionQueue:
                 raise ExecutionBlocked(
                     "manual execution queue item was already claimed"
                 )
+            guard_cancellation(item, snapshot)
             item["status"] = "running"
 
         confirmed = await self.store.mutate(claim)
@@ -1810,10 +1863,22 @@ class ExecutionQueue:
                 return
             if current.get("status") not in {"queued", "running"}:
                 raise ExecutionBlocked("manual execution queue item is invalid")
+            run = snapshot["runs"].get(current["run_id"])
+            final_result = dict(normalized)
+            if current.get("cancel_requested") is True:
+                rejection = QueueRejected(QueueReason.ADMIN_CANCELLED)
+                if self._run_business_attempted(run):
+                    # Use the authoritative executor result, not an earlier guard
+                    # rejection merged while cancellation/cleanup was in flight.
+                    if self._run_has_terminal_result(run):
+                        final_result = self._run_result(run)
+                    final_result["queue_reason"] = rejection.reason
+                else:
+                    final_result = _queue_result(rejection)
 
             current["status"] = "finished"
             current["finished_at"] = _timestamp(finished)
-            current["result"] = dict(normalized)
+            current["result"] = final_result
             current.pop("pending_queue_reason", None)
             current.pop("pending_business_status", None)
             current.pop("_reserve", None)
@@ -1821,7 +1886,6 @@ class ExecutionQueue:
             dedupe = snapshot["dedupe"].get(_dedupe_key(current))
             if type(dedupe) is dict and dedupe.get("run_id") == current["run_id"]:
                 snapshot["dedupe"].pop(_dedupe_key(current), None)
-            run = snapshot["runs"].get(current["run_id"])
             if self._run_business_attempted(run):
                 if self._run_is_terminal_clean(snapshot, current["run_id"], run):
                     self._write_cooldowns(
@@ -1843,7 +1907,7 @@ class ExecutionQueue:
                     spacing.pop("target_kind", None)
                     spacing.pop("target_expires_at", None)
             callback_result = _call_sync(
-                self._terminal, snapshot, current, dict(normalized)
+                self._terminal, snapshot, current, dict(final_result)
             )
             if callback_result is not None:
                 raise ExecutionBlocked("terminal callback must return None")
