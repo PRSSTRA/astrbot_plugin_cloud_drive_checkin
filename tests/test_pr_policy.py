@@ -1,9 +1,9 @@
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parents[1]
 POLICY = ROOT / "scripts" / "check-pr-policy.sh"
@@ -40,6 +40,8 @@ class PullRequestPolicyTests(unittest.TestCase):
         self.git("init", "--quiet", "--initial-branch=dev/0.0.1")
         self.git("config", "user.name", "Policy Test")
         self.git("config", "user.email", "policy@example.invalid")
+        (self.repo / ".gitignore").write_bytes((ROOT / ".gitignore").read_bytes())
+        self.git("add", ".gitignore")
         self.base_sha = self.commit("不符合新规范的历史基线")
 
     def git(self, *arguments):
@@ -63,6 +65,7 @@ class PullRequestPolicyTests(unittest.TestCase):
             env=self.git_env,
             capture_output=True,
             text=True,
+            check=False,
         )
 
     def test_old_baseline_is_ignored_and_legal_commits_pass(self):
@@ -86,9 +89,7 @@ class PullRequestPolicyTests(unittest.TestCase):
 
     def test_every_illegal_commit_is_reported(self):
         first_invalid = self.commit("构建(hooks): 缺少正文")
-        second_invalid = self.commit(
-            "fix(api): Update policy\n\n补充接口策略说明。"
-        )
+        second_invalid = self.commit("fix(api): Update policy\n\n补充接口策略说明。")
 
         result = self.run_policy("commits", self.base_sha, second_invalid)
 
@@ -100,7 +101,7 @@ class PullRequestPolicyTests(unittest.TestCase):
         agent_file = self.repo / ".omp" / "agents" / "local.md"
         agent_file.parent.mkdir(parents=True)
         agent_file.write_text("local only\n", encoding="utf-8")
-        self.git("add", ".omp/agents/local.md")
+        self.git("add", "-f", ".omp/agents/local.md")
         self.git("commit", "--quiet", "-m", VALID_MESSAGE)
         head_sha = self.git("rev-parse", "HEAD")
 
@@ -112,9 +113,7 @@ class PullRequestPolicyTests(unittest.TestCase):
 
     def test_title_mode_uses_the_real_hook(self):
         title_file = self.temp_path / "title.txt"
-        title_file.write_text(
-            "构建(hooks): 完善工作树与提交校验\n", encoding="utf-8"
-        )
+        title_file.write_text("构建(hooks): 完善工作树与提交校验\n", encoding="utf-8")
         valid = self.run_policy("title", str(title_file))
 
         title_file.write_text("构建(hooks): Update policy\n", encoding="utf-8")
@@ -150,6 +149,132 @@ class PullRequestPolicyTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("不支持的目标分支", result.stderr)
+
+    def content_check(self):
+        return subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "check-repository-content.py"),
+                "index",
+            ],
+            cwd=self.repo,
+            env=self.git_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_forced_generated_paths_are_rejected_even_from_a_subdirectory(self):
+        paths = [
+            "bundle.pyz",
+            "deps/wheel.whl",
+            "legacy.zip",
+            ".env.local",
+            "credentials.json",
+            "master-key.env",
+            "pkg/__pycache__/cached.pyc",
+            ".venv/bin/python",
+            "node_modules/pkg/index.js",
+            "odd\nname.pyz",
+        ]
+        for name in paths:
+            target = self.repo / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("fake fixture only\n", encoding="utf-8")
+            self.git("add", "-f", "--", name)
+        subdirectory = self.repo / "subdir"
+        subdirectory.mkdir()
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "check-repository-content.py"),
+                "index",
+            ],
+            cwd=subdirectory,
+            env=self.git_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        for name in paths:
+            self.assertIn(repr(name), result.stderr)
+
+    def test_removed_artifact_is_still_rejected_in_pr_history(self):
+        artifact = self.repo / "bundle.pyz"
+        artifact.write_bytes(b"fake artifact")
+        self.git("add", "-f", "bundle.pyz")
+        introduced = self.commit(VALID_MESSAGE)
+        self.git("rm", "bundle.pyz")
+        removed = self.commit(SECOND_VALID_MESSAGE)
+        self.assertEqual(self.content_check().returncode, 0)
+        result = self.run_policy("commits", self.base_sha, removed)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(introduced[:12], result.stderr)
+
+    def test_unstaged_ignore_changes_do_not_relax_staged_policy(self):
+        (self.repo / "credentials.json").write_text("{}", encoding="utf-8")
+        self.git("add", "-f", "credentials.json")
+        (self.repo / ".gitignore").write_text("", encoding="utf-8")
+        self.assertNotEqual(self.content_check().returncode, 0)
+
+    def test_source_licenses_locks_and_sanitized_env_examples_remain_allowed(self):
+        for name in (
+            "third_party/example/LICENSE",
+            "third_party/example/requirements.lock",
+            "tests/test_fixture.py",
+            ".env.example",
+        ):
+            path = self.repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("sanitized fixture\n", encoding="utf-8")
+            self.git("add", "--", name)
+        (self.repo / ".git" / "info" / "exclude").write_text(
+            "tests/\n", encoding="utf-8"
+        )
+        result = self.content_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_tianyi_configuration_is_checked_without_executing_or_echoing_it(self):
+        path = self.repo / "third_party" / "tianyi" / "index.py"
+        path.parent.mkdir(parents=True)
+        empty = "accounts = []\nTG_BOT_TOKEN = ''\nTG_CHAT_ID = ''\n"
+        path.write_text(empty, encoding="utf-8")
+        self.git("add", "third_party/tianyi/index.py")
+        self.assertEqual(self.content_check().returncode, 0)
+        for name, value in (
+            ("accounts", "[{'username': 'FAKE_VALUE'}]"),
+            ("TG_BOT_TOKEN", "'FAKE_VALUE'"),
+            ("TG_CHAT_ID", "'FAKE_VALUE'"),
+        ):
+            with self.subTest(name=name):
+                lines = {"accounts": "[]", "TG_BOT_TOKEN": "''", "TG_CHAT_ID": "''"}
+                lines[name] = value
+                path.write_text(
+                    "\n".join(key + " = " + val for key, val in lines.items()),
+                    encoding="utf-8",
+                )
+                self.git("add", "third_party/tianyi/index.py")
+                result = self.content_check()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("FAKE_VALUE", result.stdout + result.stderr)
+        marker = self.repo / "executed"
+        path.write_text(
+            "accounts = open('executed', 'w')\nTG_BOT_TOKEN = ''\nTG_CHAT_ID = ''\n",
+            encoding="utf-8",
+        )
+        self.git("add", "third_party/tianyi/index.py")
+        self.assertNotEqual(self.content_check().returncode, 0)
+        self.assertFalse(marker.exists())
+
+    def test_missing_or_symlinked_policy_file_is_not_accepted(self):
+        self.git("rm", ".gitignore")
+        self.assertNotEqual(self.content_check().returncode, 0)
+        external = self.temp_path / "outside-ignore"
+        external.write_text("", encoding="utf-8")
+        (self.repo / ".gitignore").symlink_to(external)
+        self.git("add", ".gitignore")
+        self.assertNotEqual(self.content_check().returncode, 0)
 
 
 if __name__ == "__main__":

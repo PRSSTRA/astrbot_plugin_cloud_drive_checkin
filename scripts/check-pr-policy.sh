@@ -84,8 +84,8 @@ check_commits() {
   while IFS= read -r sha; do
     [[ -n "$sha" ]] || continue
     short_sha=$(git rev-parse --short=12 "$sha")
-    if [[ -n "$(git ls-tree -r --name-only "$sha" -- .omp/agents)" ]]; then
-      printf '错误：提交 %s 跟踪了禁止入库的 .omp/agents/ 内容。\n' "$short_sha" >&2
+    if ! python3 "$ROOT_DIR/scripts/check-repository-content.py" tree "$sha"; then
+      printf '错误：提交 %s 含有不符合入库规则的内容。\n' "$short_sha" >&2
       failed=1
     fi
     git show -s --format=%B "$sha" > "$message_file"

@@ -44,6 +44,11 @@ if ((${#hooks[@]} == 0)); then
   exit 1
 fi
 
+if [[ ! -r "$repo_root/scripts/check-repository-content.py" ]]; then
+  printf '%s\n' '错误：缺少共享入库检查脚本，无法安装。' >&2
+  exit 1
+fi
+
 chmod +x "${hooks[@]}"
 git -C "$repo_root" config --local core.hooksPath .githooks
 
