@@ -85,6 +85,37 @@ jobs:
       - name: 运行天翼脚本禁网回归
         working-directory: third_party/tianyi
         run: .venv/bin/python -m unittest discover -s tests -v
+      - name: 准备锁定 wheel 并构建独立制品
+        run: |
+          python3 -m pip download --require-hashes --only-binary=:all: --dest "$RUNNER_TEMP/tianyi-wheels" -r third_party/tianyi/requirements.lock
+          python3 scripts/prepare-tianyi.py --wheelhouse "$RUNNER_TEMP/tianyi-wheels" --output "$RUNNER_TEMP/tianyi.pyz"
+      - name: 禁网运行实际制品并检查结果
+        run: |
+          python3 -I - "$RUNNER_TEMP/tianyi.pyz" <<'PY'
+          import contextlib
+          import io
+          import json
+          import os
+          import runpy
+          import sys
+
+          attempts = []
+          def deny_network(event, arguments):
+              if event in {"socket.connect", "socket.getaddrinfo", "socket.sendto"}:
+                  attempts.append(event)
+                  raise RuntimeError("artifact smoke forbids network")
+          sys.addaudithook(deny_network)
+          os.environ["TY_ACCOUNTS"] = json.dumps([{"username": "FAKE_USER", "password": "FAKE_PASSWORD"}])
+          os.environ["TG_BOT_TOKEN"] = ""
+          os.environ["TG_CHAT_ID"] = ""
+          output, errors = io.StringIO(), io.StringIO()
+          with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+              runpy.run_path(sys.argv[1], run_name="__main__")
+          assert len(attempts) == 1, "expected one blocked request, no retry"
+          assert json.loads(output.getvalue()) == {"status": "unknown"}
+          assert errors.getvalue() == ""
+          print("artifact dependencies loaded; network denied; safe unknown result")
+          PY
 
   commit-msg:
     name: 提交信息规范

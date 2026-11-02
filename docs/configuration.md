@@ -253,9 +253,9 @@ Cron 表达式固定为五段：分钟、小时、日、月、星期。支持：
 | `tianyi_cloud` | 天翼云盘 | 每日 07:10 | `python` | `tianyi_account` / `tianyi` | `username`、`password` | 禁用 |
 | `mobile_cloud_experimental` | 移动云盘（实验） | 每日 07:20 | `node` | `mobile_single_account` / `mobile_unverified` | `authorization`、`phone`、`auth_token` | 禁用，实验状态 |
 
-天翼脚本已引入本仓库的 [third_party/tianyi](../third_party/tianyi)，源自 [BlueSkyXN/189Cloud-Checkin 固定提交](https://github.com/BlueSkyXN/189Cloud-Checkin/tree/43d2e7054dba7c5c2152e9c8c88fd23e6073a45b)，保留 Apache-2.0 许可，由本仓库维护结构化结果改动。脚本专用依赖锁与宿主依赖分开，尚未接入 Neo 的依赖制品准备和业务适配，不能因已有源码和离线测试就启用真实签到。移动模板仍引用 [smallfawn/QLScriptPublic 固定提交](https://github.com/smallfawn/QLScriptPublic/tree/2d4c26fdc72c3206bb9cf9afc1fb4991d337f888)，未引入其脚本。
+天翼脚本已引入本仓库的 [third_party/tianyi](../third_party/tianyi)，源自 [BlueSkyXN/189Cloud-Checkin 固定提交](https://github.com/BlueSkyXN/189Cloud-Checkin/tree/43d2e7054dba7c5c2152e9c8c88fd23e6073a45b)，保留 Apache-2.0 许可，由本仓库维护结构化结果改动。脚本专用依赖锁与宿主依赖分开；已有[离线制品准备工具和单账号结果入口](../CONTRIBUTING.md#离线制品准备)，但管理员准备指令及绑定/队列执行尚未接线，不能据此启用真实签到。移动模板仍引用 [smallfawn/QLScriptPublic 固定提交](https://github.com/smallfawn/QLScriptPublic/tree/2d4c26fdc72c3206bb9cf9afc1fb4991d337f888)，未引入其脚本。
 
-天翼默认模板的下载来源已切换到本仓库合并提交 `fcc3857d3fe801a5181c2c8e0472d7bb67faaa99` 的 `third_party/tianyi/index.py`，SHA256 为 `3c9d4a41f2f4dd718e80352fcf417e324a728df3406c0a333ab4c09f80fb48ec`，不再下载旧上游脚本。本次不自动改写用户已保存的 `tasks`，也不启用模板；脚本依赖锁不等同于已经准备好的 Neo 运行制品。
+天翼默认模板的下载来源已切换到本仓库合并提交 `fcc3857d3fe801a5181c2c8e0472d7bb67faaa99` 的 `third_party/tianyi/index.py`，SHA256 为 `3c9d4a41f2f4dd718e80352fcf417e324a728df3406c0a333ab4c09f80fb48ec`，不再下载旧上游脚本。本次不自动改写用户已保存的 `tasks`，也不启用模板；锁文件必须经过实际制品构建，生成的制品另有内容摘要，不能与这里的源码摘要混用。
 
 移动任务必须保持禁用和实验状态。其他任务即使配置为启用，当前版本也不会执行。
 

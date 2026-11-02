@@ -60,7 +60,7 @@ python3 -m venv .venv
 
 ## 内部执行接口
 
-`NeoExecutor.execute(PreparedExecution(...), guard=...)` 接收已经准备好的脚本字节、SHA256、固定来源 commit、任务版本、身份和本次环境变量。调用方负责脚本来源及依赖制品验收，并在同步 `guard(snapshot)` 中重新检查权限和版本；拒绝时抛异常，放行时返回 `None`。执行器本身不下载脚本、不安装依赖、不提供 shell 聊天入口。天翼输入/结果适配、管理员准备入口、队列和通知还没有接入。
+`NeoExecutor.execute(PreparedExecution(...), guard=...)` 接收已经准备好的脚本字节、SHA256、固定来源 commit、任务版本、身份和本次环境变量。调用方负责脚本来源及依赖制品验收，并在同步 `guard(snapshot)` 中重新检查权限和版本；拒绝时抛异常，放行时返回 `None`。执行器本身不下载脚本、不安装依赖、不提供 shell 聊天入口。天翼离线制品及其单账号结果入口已实现；管理员准备指令、绑定到执行请求的转换、队列和通知还没有接入。
 
 执行器在 `checkin_state.runs` 和 `cleanup_jobs` 中记录 `kind=neo_execution` 的状态。先持久化 `phase=admitted` 表示尚未尝试分配，再单独确认 `phase=creating` 的创建意图，之后才能调用 Neo；创建和执行意图的写入返回后均再次同步检查授权。恢复时仅对结构合法、没有资源 ID 的 `admitted` 记录确定取消并解除阻断；`creating` 或之后的阶段不能凭缺少 ID 推断未创建。这样，即使无分配证明的终态写入被另一笔未确认提交阻挡，精确重试后仍可从持久化阶段恢复。每个运行预留 8 KiB 的快照空间用于资源 ID 和终态，最多保留 1000 个运行条目，容量不足拒绝新增；自动历史裁剪尚未接入。记录不保存脚本内容、环境变量或原始输出。
 
@@ -94,7 +94,25 @@ python3 -m venv .venv
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-脚本的 Neo 依赖制品上传、管理员准备入口和输入/结果适配尚未接入，迁入源码不代表任务已可执行。两个模板继续默认禁用。
+#### 离线制品准备
+
+`preparation.build_tianyi(wheelhouse)` 校验本仓库固定天翼源码的 SHA256，以及七个 wheel 的版本、内容摘要和纯 Python 布局，生成包含源码、依赖、结果入口及许可的独立 zipapp。构建过程不下载、不安装依赖、不执行天翼源码，也不读取用户凭据；拒绝路径穿越、成员冲突、符号链接、原生扩展和不支持的 wheel `.data` 布局。制品不能超过现有执行器的 1 MiB 限制，同一输入与压缩运行环境下重复构建得到相同字节。
+
+在仓库根目录执行以下开发准备命令；wheel 和制品留在临时目录，不纳入 Git：
+
+```bash
+WORKDIR=$(mktemp -d)
+python3 -m pip download --require-hashes --only-binary=:all: --dest "$WORKDIR/wheels" -r third_party/tianyi/requirements.lock
+python3 scripts/prepare-tianyi.py --wheelhouse "$WORKDIR/wheels" --output "$WORKDIR/tianyi.pyz"
+```
+
+CLI 拒绝覆盖已有输出，成功后只打印包含 `source_commit`、`source_sha256`、制品 `sha256` 和 `size` 的 JSON。源码摘要与制品摘要不同：调用内部执行器时使用 `PreparedArtifact.script` 及其 `sha256`，运行时为 `python`、传输结果适配为 `json_protocol`；制品上传成 `script.py` 后仍由原有 wrapper 校验并启动，不需要更改 Neo 执行器。
+
+制品入口只接受单账号 `TY_ACCOUNTS` JSON，保留用户名/密码原值，强制禁用上游 Telegram，并且只调用一次 `main_handler`。它丢弃上游输出，严格核对单条结果、计数、`ok` 和 `reason_code`，只输出安全 `status`；验证码/设备验证为 `needs_auth`，接口明确拒绝为 `failed`，矛盾或缺失证据为 `unknown`，不自动重跑。不要在宿主向制品注入真实凭据运行签到。
+
+已用实际锁定 wheel 构建制品并完成九个禁网 HTTP 替身场景；另经现有 `NeoExecutor`、受控 Bay 和真实 wrapper 上传/执行 zipapp，观察到缺少凭据的 `config_error` 终态和资源清理。这里的 Bay 是测试替身，不是真实 Neo 部署。CI 在三个 Python 版本构建真实制品，并用有效假字段和网络审计钩子验证请求在联网前被阻止、只尝试一次、输出 `unknown` 且无 stderr。
+
+管理员准备指令、持久制品缓存和绑定/队列到执行器的接线仍未完成。两个模板继续默认禁用，本轮没有真实账号或真实 Neo 制品验收。
 
 
 ## 测试与验证
