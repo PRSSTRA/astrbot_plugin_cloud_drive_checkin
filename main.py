@@ -17,6 +17,12 @@ from .executors.neo import ExecutionBlocked, NeoExecutor
 from .notifications import NotificationService, enqueue_terminal, reserve_terminal
 from .permissions import authorize, get_private_identity
 from .preparation import PreparationError
+from .reload_control import (
+    ReloadError,
+    check_reload_target,
+    cleanup_reload_replacement,
+    reload_plugin,
+)
 from .scheduler import CronScheduler
 from .state import InvalidStateError
 from .storage import CommitUnconfirmedError, StateStore, StateUnavailableError
@@ -41,6 +47,7 @@ _USAGE_MESSAGE = (
     "\n用法：/签到 管理 准备 <任务ID>"
     "\n用法：/签到 管理 取消 <run_id>"
     "\n用法：/签到 管理 停用 <任务ID>"
+    "\n用法：/签到 管理 重载"
 )
 _TASK_NOT_FOUND_MESSAGE = "未找到该签到任务。"
 _DELETE_CONFIRM_SECONDS = 60
@@ -403,7 +410,7 @@ class CloudDriveCheckin(Star):
         except InvalidStateError:
             return "状态容量或结构校验失败，未发布本次制品。"
 
-    def _admin_guard(self, event, identity) -> None:
+    def _admin_guard(self, event, identity, *, allow_stopping: bool = False) -> None:
         permissions = parse_config(self.config)
         admins = self.context.get_config(umo=event.unified_msg_origin).get(
             "admins_id", []
@@ -418,7 +425,7 @@ class CloudDriveCheckin(Star):
             config=permissions,
         )
         if (
-            self._terminating
+            (self._terminating and not allow_stopping)
             or get_private_identity(event) != identity
             or access is None
             or not access.is_admin
@@ -475,6 +482,91 @@ class CloudDriveCheckin(Star):
             if self.queue is not None:
                 self.queue.wake()
 
+    async def _reload_command(
+        self, event, identity, *, invalid_arguments: bool = False
+    ) -> None:
+        try:
+            self._admin_guard(event, identity, allow_stopping=True)
+        except QueueRejected:
+            await event.send(event.plain_result("仅当前管理员可重载本插件。"))
+            return
+        except PluginConfigError:
+            await event.send(event.plain_result(_CONFIG_ERROR_MESSAGE))
+            return
+        if invalid_arguments:
+            await event.send(event.plain_result(_USAGE_MESSAGE))
+            return
+        slot = self._state_slot()
+        active = slot.get("reload_task")
+        if active is not None and not active.done():
+            await event.send(
+                event.plain_result("本插件已有重载请求正在处理，请等待结果。")
+            )
+            return
+        if self._terminating or self.state_store is None or self.state_store.closed:
+            await event.send(
+                event.plain_result(
+                    "当前实例已停止或未初始化，请在 AstrBot 插件页重载。"
+                )
+            )
+            return
+        try:
+            check_reload_target(self)
+        except ReloadError:
+            await event.send(
+                event.plain_result(
+                    "框架重载接口或本插件注册状态不兼容，请在 AstrBot 插件页处理。"
+                )
+            )
+            return
+
+        async def perform() -> None:
+            try:
+                await event.send(
+                    event.plain_result("已接受本插件重载请求，将停止旧实例后重新加载。")
+                )
+                try:
+                    await reload_plugin(
+                        self, guard=lambda: self._admin_guard(event, identity)
+                    )
+                except (ReloadError, QueueRejected, PluginConfigError):
+                    message = "重载未完成，请在 AstrBot 插件页检查并重载。"
+                else:
+                    message = "本插件重载完成；未开始且未过期的请求按恢复规则继续，已开始的签到不会重跑。"
+                await event.send(event.plain_result(message))
+            except asyncio.CancelledError:
+                cleanup = asyncio.create_task(
+                    cleanup_reload_replacement(self), name="checkin-reload-cleanup"
+                )
+                slot["reload_cleanup_task"] = cleanup
+                settled = asyncio.gather(cleanup, return_exceptions=True)
+                while not settled.done():
+                    try:
+                        await asyncio.shield(settled)
+                    except asyncio.CancelledError:
+                        continue
+                cleanup.result()
+                raise
+
+        task = asyncio.create_task(perform(), name="checkin-admin-reload")
+        slot["reload_task"] = task
+
+        def finished(completed: asyncio.Task) -> None:
+            if slot.get("reload_task") is completed:
+                for key in (
+                    "reload_task",
+                    "reload_target",
+                    "reload_previous_owner",
+                    "reload_candidate",
+                    "reload_cleanup_task",
+                ):
+                    slot.pop(key, None)
+            if not completed.cancelled():
+                completed.exception()
+
+        task.add_done_callback(finished)
+        await asyncio.shield(task)
+
     @filter.command("签到", priority=100)
     async def checkin(
         self,
@@ -489,6 +581,11 @@ class CloudDriveCheckin(Star):
 
         identity = get_private_identity(event)
         if identity is None:
+            return
+        if subcommand == "管理" and task_id == "重载":
+            await self._reload_command(
+                event, identity, invalid_arguments=bool(extra or tail)
+            )
             return
 
         store = self.state_store
@@ -684,6 +781,12 @@ class CloudDriveCheckin(Star):
             store = StateStore(self)
             self.state_store = store
             slot["owner"] = store
+            if (
+                slot.get("reload_task") is not None
+                and slot.get("reload_previous_owner") is owner
+                and "reload_candidate" not in slot
+            ):
+                slot["reload_candidate"] = self
             try:
                 await store.initialize()
                 self.task_control = TaskControlService(store, self.config)
@@ -746,22 +849,45 @@ class CloudDriveCheckin(Star):
         self._terminating = True
         self._delete_requests.clear()
         store = self.state_store
-        if store is None or store.closed:
+        if store is None:
             return
-        if self.enrollment is not None:
-            self.enrollment.close()
-        if self._shutdown_task is None or self._shutdown_task.done():
-            self._shutdown_task = asyncio.create_task(self._shutdown())
+        slot = self._state_slot()
+        reload_task = slot.get("reload_task")
+        if (
+            reload_task is asyncio.current_task()
+            or slot.get("reload_cleanup_task") is asyncio.current_task()
+            or reload_task is None
+            or reload_task.done()
+        ):
+            reload_task = None
+        else:
+            # Cancel before starting shutdown, but join after both have drained:
+            # an owning reload may itself be awaiting the same shutdown task.
+            reload_task.cancel()
+        shutdown = None
+        if not store.closed:
+            if self.enrollment is not None:
+                self.enrollment.close()
+            if self._shutdown_task is None or self._shutdown_task.done():
+                self._shutdown_task = asyncio.create_task(self._shutdown())
+            shutdown = self._shutdown_task
+        waiting = [task for task in (shutdown, reload_task) if task is not None]
+        if not waiting:
+            return
+        settled = asyncio.gather(*waiting, return_exceptions=True)
         try:
-            await asyncio.shield(self._shutdown_task)
+            await asyncio.shield(settled)
         except asyncio.CancelledError:
-            settled = asyncio.gather(self._shutdown_task, return_exceptions=True)
             while not settled.done():
                 try:
                     await asyncio.shield(settled)
                 except asyncio.CancelledError:
                     continue
             raise
+        if shutdown is not None:
+            shutdown.result()
+        if reload_task is not None and not reload_task.cancelled():
+            reload_task.result()
 
     async def _shutdown(self) -> None:
         store = self.state_store

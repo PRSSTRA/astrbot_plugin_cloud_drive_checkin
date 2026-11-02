@@ -81,6 +81,7 @@ class AstrBotContext:
         self._plugin_kv = {}
         self.config = {"admins_id": []}
         self.sent = []
+        self.stars = []
         self.platforms = [
             SimpleNamespace(
                 meta=lambda: SimpleNamespace(id="bot-instance", name="aiocqhttp")
@@ -90,6 +91,12 @@ class AstrBotContext:
 
     def get_config(self, umo=None):
         return self.config
+
+    def get_all_stars(self):
+        return self.stars
+
+    def get_registered_star(self, star_name):
+        return next((star for star in self.stars if star.name == star_name), None)
 
     async def send_message(self, origin, message):
         self.sent.append((origin, message.get_plain_text()))
