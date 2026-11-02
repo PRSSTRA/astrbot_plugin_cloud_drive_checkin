@@ -145,6 +145,7 @@ class PreparationTests(unittest.TestCase):
 
         self.assertEqual(first, second)
         self.assertEqual(first.sha256, hashlib.sha256(first.script).hexdigest())
+        self.assertRegex(first.inputs_sha256, r"[0-9a-f]{64}\Z")
         self.assertLessEqual(len(first.script), 1024 * 1024)
 
         with zipfile.ZipFile(io.BytesIO(first.script)) as archive:

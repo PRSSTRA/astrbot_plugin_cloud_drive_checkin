@@ -9,7 +9,14 @@ import math
 from collections.abc import Callable
 from typing import Any
 
-from .state import MAX_SNAPSHOT_BYTES, STATE_KEY, InvalidStateError, new_snapshot, validate_snapshot
+from .state import (
+    MAX_SNAPSHOT_BYTES,
+    STATE_KEY,
+    InvalidStateError,
+    new_snapshot,
+    upgrade_snapshot,
+    validate_snapshot,
+)
 
 
 class StateUnavailableError(RuntimeError):
@@ -96,7 +103,7 @@ class StateStore:
 
             loaded = await self._kv.get_kv_data(STATE_KEY, _MISSING)
             candidate = new_snapshot() if loaded is _MISSING else loaded
-            validate_snapshot(candidate, max_bytes=self._max_snapshot_bytes)
+            candidate = upgrade_snapshot(candidate, max_bytes=self._max_snapshot_bytes)
 
             # Detach from any object retained by the host KV cache.
             self._pending = copy.deepcopy(candidate)

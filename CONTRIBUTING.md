@@ -18,7 +18,7 @@ python3 -m venv .venv
 
 ## 代码结构
 
-- `main.py`：Star 生命周期、指令入口、帮助、任务查询和本人状态回复。
+- `main.py`：Star 生命周期、指令入口、帮助、任务查询、本人状态回复和管理员准备入口。
 - `permissions.py`：私聊事件校验、身份提取和权限判定。
 - `config.py`：权限配置的解析和 QQ 号规范化。
 - `task_config.py`：任务目录校验、Cron 计算和配置版本。
@@ -29,6 +29,10 @@ python3 -m venv .venv
 - `storage.py`：基于 Star 异步 KV 的事务写入。
 - `executors/client.py`：完整来源的 Neo 连接解析、异步 REST、鉴权检查和有界响应。
 - `executors/neo.py`：持久化执行意图、串行执行、资源归属检查、清理阻断与恢复。
+- `preparation.py`：从本地源码、许可和锁定 wheel 离线构建天翼 zipapp，校验输入与制品。
+- `artifact_service.py`：下载锁定 wheel、校验缓存、构建制品，并把准备记录写入 KV。
+- `scripts/prepare-tianyi.py`：使用本地 wheelhouse 生成制品的开发命令。
+- `runners/tianyi_entry.py`：制品内的单账号入口，核对结果后只输出安全状态。
 - `runners/bootstrap.py`：上传到 Neo 的独立 wrapper；消费凭据文件，以 argv 启动子进程并只返回安全结果信封。
 
 向导字段原文只保存在进程内会话中，持久化前加密。明文凭据不得进入日志、回执、shell 或命令行参数。
@@ -39,7 +43,9 @@ python3 -m venv .venv
 
 `state.py` 定义快照格式，`storage.py` 通过 `get_kv_data` 和 `put_kv_data` 操作唯一业务键 `checkin_state`。插件不创建数据库或状态文件。
 
-快照包含 `schema_version`、`revision`，以及 `users`、`bindings`、`credentials`、`batches`、`runs`、`outbox`、`cleanup_jobs`、`cooldowns`、`dedupe` 集合。只接受 schema 版本 1 和合法 JSON 数据，默认序列化上限为 8 MiB。未知版本、结构损坏或超限都会报错，不会重置或裁剪记录。
+快照包含 `schema_version`、`revision`，以及 `users`、`bindings`、`credentials`、`batches`、`runs`、`outbox`、`cleanup_jobs`、`cooldowns`、`dedupe`、`prepared_artifacts` 集合。当前 schema 版本为 2；读取版本 1 时补充空的 `prepared_artifacts` 后迁移，原有记录保持不变。迁移结果要作为完整快照重新保存并确认后才能使用。未知版本、结构损坏或超限都会报错，不会重置或裁剪记录。默认序列化上限为 8 MiB。
+
+`prepared_artifacts[task_id]` 保存 `task_version`、`source_commit`、`source_sha256`、`sha256`、`size` 和 `inputs_sha256`，不保存脚本字节、凭据或制品文件。制品文件按内容摘要存放在插件数据目录；state 层只校验快照结构，不读取或重建文件。
 
 集合内业务记录由对应业务操作定义。状态层不执行入队、历史保留策略或凭据加密；调用方不得写入明文凭据。`metadata.yaml` 的 author 和 name 决定框架 KV 命名空间，开始保存业务数据后必须保持稳定。
 
@@ -60,7 +66,7 @@ python3 -m venv .venv
 
 ## 内部执行接口
 
-`NeoExecutor.execute(PreparedExecution(...), guard=...)` 接收已经准备好的脚本字节、SHA256、固定来源 commit、任务版本、身份和本次环境变量。调用方负责脚本来源及依赖制品验收，并在同步 `guard(snapshot)` 中重新检查权限和版本；拒绝时抛异常，放行时返回 `None`。执行器本身不下载脚本、不安装依赖、不提供 shell 聊天入口。天翼离线制品及其单账号结果入口已实现；管理员准备指令、绑定到执行请求的转换、队列和通知还没有接入。
+`NeoExecutor.execute(PreparedExecution(...), guard=...)` 接收已经准备好的脚本字节、SHA256、固定来源 commit、任务版本、身份和本次环境变量。调用方负责脚本来源及依赖制品验收，并在同步 `guard(snapshot)` 中重新检查权限和版本；拒绝时抛异常，放行时返回 `None`。执行器本身不下载脚本、不安装依赖、不提供 shell 聊天入口。天翼离线制品及其单账号结果入口已实现，管理员准备指令和持久制品缓存已接入；绑定到执行请求的转换、队列和通知还没有接入。
 
 执行器在 `checkin_state.runs` 和 `cleanup_jobs` 中记录 `kind=neo_execution` 的状态。先持久化 `phase=admitted` 表示尚未尝试分配，再单独确认 `phase=creating` 的创建意图，之后才能调用 Neo；创建和执行意图的写入返回后均再次同步检查授权。恢复时仅对结构合法、没有资源 ID 的 `admitted` 记录确定取消并解除阻断；`creating` 或之后的阶段不能凭缺少 ID 推断未创建。这样，即使无分配证明的终态写入被另一笔未确认提交阻挡，精确重试后仍可从持久化阶段恢复。每个运行预留 8 KiB 的快照空间用于资源 ID 和终态，最多保留 1000 个运行条目，容量不足拒绝新增；自动历史裁剪尚未接入。记录不保存脚本内容、环境变量或原始输出。
 
@@ -83,9 +89,9 @@ Neo 接口按 [Shipyard Neo `f4d248b4274c1a2f05402f75a3b39e5c19be9ff5`](https://
 
 `third_party/tianyi/index.py` 和上游回归测试来自 [BlueSkyXN/189Cloud-Checkin 的 `43d2e7054dba7c5c2152e9c8c88fd23e6073a45b`](https://github.com/BlueSkyXN/189Cloud-Checkin/tree/43d2e7054dba7c5c2152e9c8c88fd23e6073a45b)，保留该目录下的 Apache-2.0 `LICENSE`。本地修改新增 `reason_code`、区分认证要求与未知结果，保留原有 `status/counts` 和通知行为；源码头标明来源及修改。后续修改在当前插件仓库提交 PR，不依赖上游接收修改。
 
-设备验证结果 `-133` 参考 [OpenList `e72822f` 的 PC 登录客户端](https://github.com/OpenListTeam/OpenList/blob/e72822f5390f4272c9fe9da8cabba3c1a270182f/drivers/189pc/utils.go)（AGPL-3.0）的协议解释，未移植其实现。验证码标志和设备结果尚未用真实账号验收；不识别验证码、不发短信、不增加业务重试。`reason_code` 契约见 `main_handler` 文档字符串；`failed` 汇总仍包含需要认证和未知结果，不能据此认定密码失效。
+设备验证结果 `-133` 参考 [OpenList `e72822f` 的 PC 登录客户端](https://github.com/OpenListTeam/OpenList/blob/e72822f5390f4272c9fe9da8cabba3c1a270182f/drivers/189pc/utils.go)（AGPL-3.0）的协议解释，未移植其实现。验证码标志和设备结果尚未用真实账号验收；不识别验证码、不发短信、不增加业务重试。`reason_code` 契约见 `main_handler` 文档字符串；`failed` 汇总同时包含需要认证和结果未知的情况，判断凭据问题前需查看 `reason_code`。
 
-脚本专用依赖锁为 `third_party/tianyi/requirements.lock`，包含七个固定版本纯 Python wheel 的 SHA256，测试目标为 Python 3.12–3.14。没有移入上游的旧依赖压缩包，也不把 requests、rsa 安装到 AstrBot 宿主。以下命令仅运行禁网测试替身，不是宿主执行真实签到的入口：
+脚本专用依赖锁为 `third_party/tianyi/requirements.lock`，包含七个固定版本纯 Python wheel 的 SHA256，测试目标为 Python 3.12 到 3.14。没有移入上游的旧依赖压缩包，也不把 requests、rsa 安装到 AstrBot 宿主。以下命令仅运行禁网测试替身，不是宿主执行真实签到的入口：
 
 ```bash
 cd third_party/tianyi
@@ -108,11 +114,23 @@ python3 scripts/prepare-tianyi.py --wheelhouse "$WORKDIR/wheels" --output "$WORK
 
 CLI 拒绝覆盖已有输出，成功后只打印包含 `source_commit`、`source_sha256`、制品 `sha256` 和 `size` 的 JSON。源码摘要与制品摘要不同：调用内部执行器时使用 `PreparedArtifact.script` 及其 `sha256`，运行时为 `python`、传输结果适配为 `json_protocol`；制品上传成 `script.py` 后仍由原有 wrapper 校验并启动，不需要更改 Neo 执行器。
 
+运行期由 `artifact_service.PreparationService(store, data_dir, *, client=None)` 提供准备和读取：
+
+| 接口 | 行为 |
+| --- | --- |
+| `await prepare(task, *, guard)` | 先检查有效缓存，命中时不访问网络；否则下载锁定 wheel、构建制品、写入内容寻址缓存和 KV 记录 |
+| `await load(task)` | 只读取并校验任务版本、输入指纹、记录和文件摘要，不下载、不构建、不执行 |
+| `await close()` | 取消未完成的准备和读取操作，等待自身操作与线程退出，再关闭自有客户端 |
+
+`PreparedArtifact` 包含 `script`、`sha256`、`source_commit`、`source_sha256` 和 `inputs_sha256`；`script` 不出现在 `repr` 中。
+
+`guard` 在耗时阶段结束后、同步 KV 修改函数内和返回前重新检查，撤权或任务变化会中止准备。文件与网络操作不放在 KV 锁内。`PreparationError` 表示任务声明不匹配、输入、下载或缓存校验拒绝；`PreparationBusy` 继承 `PreparationError`，表示已有准备在进行；`StateUnavailableError` 和 `CommitUnconfirmedError` 按存储规则上抛。注入的 `client` 归调用方管理；生产路径使用服务自建客户端，禁用环境代理，只通过 HTTPS 连接 PyPI 与 `files.pythonhosted.org`，并校验目标解析为公网地址。只有自建客户端会在 `close()` 时关闭。
+
 制品入口只接受单账号 `TY_ACCOUNTS` JSON，保留用户名/密码原值，强制禁用上游 Telegram，并且只调用一次 `main_handler`。它丢弃上游输出，严格核对单条结果、计数、`ok` 和 `reason_code`，只输出安全 `status`；验证码/设备验证为 `needs_auth`，接口明确拒绝为 `failed`，矛盾或缺失证据为 `unknown`，不自动重跑。不要在宿主向制品注入真实凭据运行签到。
 
 已用实际锁定 wheel 构建制品并完成九个禁网 HTTP 替身场景；另经现有 `NeoExecutor`、受控 Bay 和真实 wrapper 上传/执行 zipapp，观察到缺少凭据的 `config_error` 终态和资源清理。这里的 Bay 是测试替身，不是真实 Neo 部署。CI 在三个 Python 版本构建真实制品，并用有效假字段和网络审计钩子验证请求在联网前被阻止、只尝试一次、输出 `unknown` 且无 stderr。
 
-管理员准备指令、持久制品缓存和绑定/队列到执行器的接线仍未完成。两个模板继续默认禁用，本轮没有真实账号或真实 Neo 制品验收。
+两个模板保持默认禁用；目前没有真实账号或真实 Neo 制品验收结果。
 
 
 ## 测试与验证
@@ -121,9 +139,17 @@ CLI 拒绝覆盖已有输出，成功后只打印包含 `source_commit`、`sourc
 
 PR 的“离线测试”任务分别在 Python 3.12、3.13、3.14 上安装宿主 `requirements.txt`，显式安装 Node 22，并运行 `unittest discover -s tests -p 'test_*.py' -v`；“天翼脚本离线测试”在相同 Python 矩阵的独立虚拟环境中校验脚本依赖哈希并运行脚本测试。既有必需检查“提交信息规范”等待两组矩阵，仅在全部成功后校验提交历史；任一失败、取消或跳过都不能通过，无需修改现有必需检查名称。普通 PR CI 不连接真实 QQ、Neo 或云盘服务。
 
-执行层回归位于 `tests/test_neo_client.py`、`tests/test_neo_executor.py`、`tests/test_neo_lifecycle.py` 和 `tests/test_bootstrap.py`。`tests/neo_support.py` 是受控 Bay 替身，会在临时目录运行本仓库 wrapper 与假脚本；这不是产品的宿主回退路径。本地未安装 Node 时对应测试会明确跳过；CI 显式安装并检查 Node，不依赖 runner 预装。macOS 测试只将 Node 的可执行路径映射到本机安装位置，实际运行 Node 子进程。
+执行层回归位于 `tests/test_neo_client.py`、`tests/test_neo_executor.py`、`tests/test_neo_lifecycle.py` 和 `tests/test_bootstrap.py`。制品构建与准备服务回归位于 `tests/test_preparation.py` 和 `tests/test_artifact_service.py`；管理员准备指令位于 `tests/test_admin_preparation.py`，schema 迁移与写入确认位于 `tests/test_state.py`、`tests/test_storage.py`。`tests/neo_support.py` 是受控 Bay 替身，会在临时目录运行本仓库 wrapper 与假脚本；这不是产品的宿主回退路径。本地未安装 Node 时对应测试会明确跳过；CI 显式安装并检查 Node，不依赖 runner 预装。macOS 测试只将 Node 的可执行路径映射到本机安装位置，实际运行 Node 子进程。
 
 离线 smoke 通过真实 loopback HTTP 连接受控 Bay，覆盖两用户隔离、非零退出码的显式业务结果、超时、清理阻断及恢复不重跑。真实 Neo 假凭据测试与真实账号测试分别记录如下。
+
+### 制品准备本地验收
+
+- Python 3.14 下全量 328 项测试通过；`main.py`、`preparation.py`、`artifact_service.py` 及相关新测试通过 Ruff 检查。
+- 真实 PyPI smoke 使用实际 `/签到 管理 准备` 入口和生产自建 HTTP 客户端：14 次 GET（7 次元数据、7 次 wheel），生成制品 614156 字节，SHA256 为 `f22f8b6bbbc7eb0777b23f28e1b987da9839e6b9504e46a4d9508c7c3eb5393c`。
+- 同一服务实例再次准备命中缓存，插件对象重载后再次准备也未新增请求；schema 2 准备记录在重载后保留。
+- AstrBot 事件和 KV 使用受控替身；文件读写和 PyPI HTTP/TLS 为真实连接。没有执行天翼源码、签到、Neo 或真实账号。
+- 审查发现的压缩响应处理和 `InvalidURL` 错误边界已修复：修复前先复现，修复后回归。客户端读取 raw 流、协商 identity，并在读取正文前拒绝压缩响应。
 
 ### 真实 Neo 假凭据验收
 
@@ -187,7 +213,7 @@ python3 scripts/check-repository-content.py index
 python3 scripts/check-repository-content.py tree COMMIT_SHA
 ```
 
-这些检查不是通用秘密扫描器。允许路径中的真实凭据、原始私聊/验收记录、动态写入配置等仍须内容审查；测试假值不得连接真实服务，也不能对整个 `tests/` 目录豁免。
+这些检查覆盖已定义的路径规则和天翼声明，允许路径中的真实凭据、原始私聊/验收记录、动态写入配置等仍须人工内容审查；测试假值不得连接真实服务，也不能对整个 `tests/` 目录豁免。
 
 ## 提交信息
 
