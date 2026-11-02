@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import Enum
+from zoneinfo import ZoneInfo
 
 from .config import PluginConfigError, parse_config
 from .credentials import CredentialError, binding_key, user_key
@@ -14,9 +18,36 @@ from .permissions import Identity
 from .state import InvalidStateError
 from .storage import StateStore, StateUnavailableError
 from .task_config import TaskConfig, next_run_times, parse_task_catalog
-from .task_control import disabling_task_ids
+from .task_control import TaskControlError, disabling_task_ids
 
 _POLL_SECONDS = 1.0
+_TASK_ID_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+class BindingPlanState(Enum):
+    """Consumer-visible state of one binding's automatic trigger plan."""
+
+    PLANNED = "planned"
+    PAUSED = "paused"
+    GLOBAL_DISABLED = "global_disabled"
+    TASK_DISABLED = "task_disabled"
+    DISABLING = "disabling"
+    ENROLLMENT = "enrollment"
+    PLAN_ABSENT = "plan_absent"
+    PLAN_STALE = "plan_stale"
+    STOPPED = "stopped"
+    ERROR = "error"
+    UNREADY = "unready"
+
+
+@dataclass(frozen=True)
+class BindingPlanView:
+    """Immutable scheduler observation for one identity-owned binding."""
+
+    task_id: str
+    state: BindingPlanState
+    planned_at: datetime | None = None
+    timezone: str | None = None
 
 
 def _utc_now() -> datetime:
@@ -54,6 +85,110 @@ class CronScheduler:
     @property
     def last_error(self) -> Exception | None:
         return self._last_error or next(iter(self._errors.values()), None)
+
+    def binding_plan_views(
+        self, identity: Identity, task_id: str = ""
+    ) -> tuple[BindingPlanView, ...]:
+        """Observe current plans for one identity without scheduling or state writes."""
+
+        snapshot = self.store.snapshot()
+        owner_key = user_key(identity)
+        bindings: list[tuple[str, bool]] = []
+        for key, record in snapshot["bindings"].items():
+            if not isinstance(record, dict) or record.get("user_key") != owner_key:
+                continue
+            bound_task = record.get("task_id")
+            paused = record.get("paused", False)
+            if (
+                not isinstance(bound_task, str)
+                or _TASK_ID_PATTERN.fullmatch(bound_task) is None
+                or key != binding_key(identity, bound_task)
+                or type(paused) is not bool
+            ):
+                raise CredentialError("invalid binding record")
+            if not task_id or task_id == bound_task:
+                bindings.append((bound_task, paused))
+        bindings.sort(key=lambda item: item[0])
+        if not bindings:
+            return ()
+
+        def uniform(state: BindingPlanState) -> tuple[BindingPlanView, ...]:
+            return tuple(
+                BindingPlanView(task_id=bound_task, state=state)
+                for bound_task, _ in bindings
+            )
+
+        if not self.store.ready:
+            return uniform(BindingPlanState.UNREADY)
+        if self._closing or self._closed:
+            return uniform(BindingPlanState.STOPPED)
+        worker = self._worker
+        if worker is None:
+            return uniform(BindingPlanState.UNREADY)
+        if worker.done():
+            worker_error = None if worker.cancelled() else worker.exception()
+            state = (
+                BindingPlanState.ERROR
+                if self.last_error is not None or worker_error is not None
+                else BindingPlanState.STOPPED
+            )
+            return uniform(state)
+
+        try:
+            raw = self._config()
+            permission = parse_config(raw)
+            catalog = parse_task_catalog(raw)
+            disabling = disabling_task_ids(snapshot)
+        except (PluginConfigError, InvalidStateError, TaskControlError):
+            return uniform(BindingPlanState.ERROR)
+        if not permission.enabled:
+            return uniform(BindingPlanState.GLOBAL_DISABLED)
+
+        now = self._clock().astimezone(UTC)
+        tasks = {task.task_id: task for task in catalog.tasks}
+        owner = snapshot["users"].get(owner_key)
+        enrolling = isinstance(owner, dict) and "enrollment" in owner
+        last_observed = self._last_observed
+        clock_reversed = last_observed is not None and now < last_observed
+        views = []
+        timezone = ZoneInfo(catalog.timezone)
+        for bound_task, paused in bindings:
+            task = tasks.get(bound_task)
+            if task is None:
+                state = BindingPlanState.PLAN_ABSENT
+            elif bound_task in disabling:
+                state = BindingPlanState.DISABLING
+            elif not task.enabled:
+                state = BindingPlanState.TASK_DISABLED
+            elif paused:
+                state = BindingPlanState.PAUSED
+            elif enrolling:
+                state = BindingPlanState.ENROLLMENT
+            elif self._last_error is not None or bound_task in self._errors:
+                state = BindingPlanState.ERROR
+            else:
+                plan = self._plans.get(bound_task)
+                if plan is None:
+                    state = BindingPlanState.PLAN_ABSENT
+                elif (
+                    plan[0] != task.version
+                    or last_observed is None
+                    or clock_reversed
+                    or plan[1] <= now
+                ):
+                    state = BindingPlanState.PLAN_STALE
+                else:
+                    views.append(
+                        BindingPlanView(
+                            task_id=bound_task,
+                            state=BindingPlanState.PLANNED,
+                            planned_at=plan[1].astimezone(timezone),
+                            timezone=catalog.timezone,
+                        )
+                    )
+                    continue
+            views.append(BindingPlanView(task_id=bound_task, state=state))
+        return tuple(views)
 
     async def initialize(self) -> None:
         if self._closed:
