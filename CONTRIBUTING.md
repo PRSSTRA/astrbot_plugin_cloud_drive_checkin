@@ -272,6 +272,20 @@ PR 的“离线测试”任务分别在 Python 3.12、3.13、3.14 上安装宿�
 - 框架既有入站 INFO 日志保留假密码，与 README 已披露的入站记录风险一致。本次只断言状态和重载回复不回显假密码，不声明所有日志不含敏感值。
 - 范围限于上述 AstrBot 4.29.4、真实 `aiocqhttp==1.4.4` 和受控 loopback OneBot 客户端；不是真实 QQ、真实 Neo 或真实账号签到验收，也不改变此前真实 Neo 假凭据验收的结论。
 
+### 通用任务原生框架与冷启动验收
+
+在独立临时 venv 中安装 AstrBot 4.29.4 和本插件 `requirements.txt`，把集成后的插件源码打成 ZIP，然后在仓库根目录执行：
+
+```bash
+python scripts/verify-native.py --archive /tmp/plugin.zip
+```
+
+- 前提：当前环境能导入 `AstrBot==4.29.4`；`node` 在 `PATH` 中；未使用 `-O` 或 `PYTHONOPTIMIZE`，验收依赖断言。源码 ZIP 由执行者准备，仓库不提供打包脚本。
+- harness 用真实 `PluginManager.install_plugin_from_file` 安装源码 ZIP（1 次），启动真实 `AstrBotCoreLifecycle` 并使用原生 Star KV；两个真实 `aiocqhttp` 客户端通过受控 loopback 连接，不是真实 QQ。
+- 制品来源为受控的固定提交 HTTP 传输，Neo 为 loopback FakeBay；运行真实 wrapper 和假 Python/Node 程序，不连接真实云盘。FakeBay 不是操作系统或网络沙箱，只应运行受信插件归档。
+- 结果为 77 次 HTTP 请求、4 次业务请求，最大并发 1，Sandbox/Cargo 与临时目录残留 0，出站消息未出现 canary。两次真实 SIGKILL 后，凭据密文保留；已开始的业务不重放，排队请求继续，过期请求取消，发送结果不明的通知不重发；本人计划只读。Node 程序的 PATH 仅在测试 wrapper 中按宿主机位置调整，不是产品行为。
+- 边界：本轮没有真实 QQ、真实账号或真实 Neo，也没有声明公网 GitHub 下载成功。一次在 Mac 上的公开 GitHub 下载尝试在公共 DNS 后以直接连接错误失败，未因此改变验收条件或放宽校验。真实 Neo 的 3 组验收是独立记录，不能与本条互相替代。
+
 ### 制品准备本地验收
 
 - Python 3.14 下全量 328 项测试通过；`main.py`、`preparation.py`、`artifact_service.py` 及相关新测试通过 Ruff 检查。

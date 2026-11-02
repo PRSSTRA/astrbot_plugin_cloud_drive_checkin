@@ -5,8 +5,13 @@ import copy
 import email.policy
 import hashlib
 import json
+import os
+import shlex
 import shutil
+import signal
+import sys
 import tempfile
+from contextlib import suppress
 from email.parser import BytesParser
 from pathlib import Path
 
@@ -55,9 +60,59 @@ class FakeBay:
         self.cleanup_started = asyncio.Event()
         self.release_cleanup = asyncio.Event()
         self.token = "FAKE_NEO_ACCESS_KEY_NOT_A_REAL_CREDENTIAL"
+        self.processes = {}
 
-    def close(self):
+    async def close(self):
+        for process in tuple(self.processes):
+            await self._stop(process)
         self.root.cleanup()
+
+    async def _stop(self, process):
+        """Terminate only the process groups descended from an owned command."""
+        groups = {process.pid}
+        try:
+            if process.returncode is None:
+                inspector = await asyncio.create_subprocess_exec(
+                    "/bin/ps",
+                    "-e",
+                    "-o",
+                    "pid=",
+                    "-o",
+                    "ppid=",
+                    "-o",
+                    "pgid=",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                output, _error = await inspector.communicate()
+                if inspector.returncode:
+                    raise RuntimeError(
+                        "cannot inspect controlled subprocess descendants"
+                    )
+                rows = [tuple(map(int, line.split())) for line in output.splitlines()]
+                descendants = {process.pid}
+                while True:
+                    found = {
+                        pid for pid, parent, _group in rows if parent in descendants
+                    }
+                    if found <= descendants:
+                        break
+                    descendants.update(found)
+                groups.update(
+                    group for pid, _parent, group in rows if pid in descendants
+                )
+        finally:
+            for group in groups:
+                if group > 0 and group != os.getpgrp():
+                    with suppress(ProcessLookupError):
+                        os.killpg(group, signal.SIGKILL)
+            await process.wait()
+            self.processes.pop(process, None)
+
+    async def _stop_sandbox(self, sandbox_id):
+        for process, owner in tuple(self.processes.items()):
+            if owner == sandbox_id:
+                await self._stop(process)
 
     @staticmethod
     def missing():
@@ -122,6 +177,7 @@ class FakeBay:
                         503, json={"error": {"code": "storage_unavailable"}}
                     )
                 cargo = self.cargos.pop(resource_id)
+                await self._stop_sandbox(cargo["managed_by_sandbox_id"])
                 directory = Path(self.root.name) / cargo["managed_by_sandbox_id"]
                 shutil.rmtree(directory, ignore_errors=True)
                 return httpx.Response(204)
@@ -136,6 +192,7 @@ class FakeBay:
                 self.cleanup_started.set()
                 if self.hold_cleanup:
                     await self.release_cleanup.wait()
+                await self._stop_sandbox(resource_id)
                 del self.sandboxes[resource_id]
                 if not self.keep_cargo:
                     self.cargos.pop(sandbox["cargo_id"], None)
@@ -178,13 +235,25 @@ class FakeBay:
                     await self.release_execution.wait()
             self.live_executions += 1
             self.max_executions = max(self.max_executions, self.live_executions)
+            process = None
             try:
-                process = await asyncio.create_subprocess_shell(
-                    body["command"],
+                arguments = shlex.split(body["command"])
+                if arguments[0] == "python3":
+                    arguments[0] = sys.executable
+                process = await asyncio.create_subprocess_exec(
+                    *arguments,
                     cwd=directory,
+                    env={
+                        "PATH": "/usr/local/bin:/usr/bin:/bin",
+                        "LANG": "C.UTF-8",
+                        "HOME": str(directory),
+                        "TMPDIR": str(directory),
+                    },
+                    start_new_session=True,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
+                self.processes[process] = resource_id
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(), body["timeout"] + 5
                 )
@@ -196,6 +265,8 @@ class FakeBay:
                 }
                 self.history.append({"command": body["command"], **response})
             finally:
+                if process is not None:
+                    await self._stop(process)
                 self.live_executions -= 1
             if is_business and self.ambiguous_execution:
                 raise httpx.ReadTimeout("simulated lost exec response", request=request)

@@ -57,7 +57,7 @@ class ExecutionFixture(unittest.IsolatedAsyncioTestCase):
             encoding="utf-8",
         )
         self.bay = FakeBay()
-        self.addCleanup(self.bay.close)
+        self.addAsyncCleanup(self.bay.close)
         environment = mock.patch.dict(
             os.environ,
             {
