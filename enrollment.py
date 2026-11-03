@@ -4,7 +4,6 @@ import asyncio
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 
 from .credentials import (
     CredentialCipher,
@@ -135,10 +134,7 @@ class Enrollment:
                 platform_id=identity.platform_id,
                 qq_id=identity.qq_id,
                 unified_msg_origin=origin,
-                enrollment={
-                    "task_id": task.task_id,
-                    "started_at": datetime.now(UTC).isoformat(),
-                },
+                enrollment={},
             )
             snapshot["users"][key] = record
 

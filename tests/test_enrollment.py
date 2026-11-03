@@ -139,17 +139,32 @@ class EnrollmentTests(unittest.IsolatedAsyncioTestCase):
     async def test_timeout_and_reload_keep_late_credentials_out_of_llm(self):
         self.plugin.enrollment.timeout_seconds = 0
         await self.start()
+        owner_key = self.crypto.user_key(self.identity)
+        self.assertEqual(
+            self.plugin.state_store.snapshot()["users"][owner_key]["enrollment"], {}
+        )
         late = await self.input("late-sensitive-value")
         self.assertTrue(late.stopped)
         self.assertFalse(late.llm_enabled)
         await self.plugin.terminate()
         self.plugin = await self.new_plugin()
+        self.assertEqual(self.plugin.enrollment.sessions, {})
+        self.assertEqual(
+            self.plugin.state_store.snapshot()["users"][owner_key]["enrollment"], {}
+        )
+        self.assertTrue(self.plugin.enrollment.active(self.identity))
         after_reload = await self.input("another-late-sensitive-value")
         self.assertTrue(after_reload.stopped)
         self.assertFalse(after_reload.llm_enabled)
         self.assertEqual(self.plugin.state_store.snapshot()["credentials"], {})
         await self.input("/取消")
         self.assertFalse(self.plugin.enrollment.active(self.identity))
+        self.assertNotIn(
+            "enrollment", self.plugin.state_store.snapshot()["users"][owner_key]
+        )
+        normal = await self.input("ordinary-chat")
+        self.assertFalse(normal.stopped)
+        self.assertTrue(normal.llm_enabled)
 
     async def test_revocation_or_task_change_clears_uncommitted_values(self):
         await self.start()
