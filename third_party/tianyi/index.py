@@ -21,19 +21,12 @@ TG_BOT_TOKEN = ""
 TG_CHAT_ID = ""
 
 # 调试配置
-DEBUG_MODE = False          # 是否启用调试模式（打印详细过程日志，如 Step 1, Step 2...）
 PRINT_RESPONSE_BODY = False  # 只打印白名单字段，避免登录票据进入日志
 
 # ==================== 配置区结束 ====================
 
 BI_RM = list("0123456789abcdefghijklmnopqrstuvwxyz")
 B64MAP = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-
-
-def debug_log(message):
-    """调试日志输出"""
-    if DEBUG_MODE:
-        print(f"[DEBUG] {message}")
 
 
 def print_response(response, label="Response"):
@@ -271,16 +264,6 @@ def login(username, password):
         if isinstance(exc, LoginError):
             raise
         raise LoginError("{}：{}".format(stage, type(exc).__name__)) from None
-
-
-def get_capacity(s):
-    """只读查询，用于验证登录和 Web Session 鉴权。"""
-    r = s.get(WEB_URL + "/api/portal/getUserSizeInfo.action",
-              params={"sessionKey": s.cloud189_session_key}, timeout=TIMEOUT)
-    data = response_json(r, "容量查询")
-    if not isinstance(data.get("cloudCapacityInfo"), dict):
-        raise LoginError("容量查询失败，未获得有效业务会话")
-    return data["cloudCapacityInfo"]
 
 
 def error_text(exc):
