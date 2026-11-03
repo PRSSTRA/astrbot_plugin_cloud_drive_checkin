@@ -99,8 +99,11 @@ class GitHookTests(unittest.TestCase):
         path.write_text(content, encoding="utf-8")
         self.run_git(cwd, "add", relative_path.as_posix())
 
-    def test_real_commit_passes_in_linked_worktree_and_main_worktree_is_blocked(self):
-        self.stage_file(self.linked_worktree, Path("linked.txt"))
+    def test_task_branch_commits_only_in_linked_worktrees(self):
+        linked_head = self.run_git(
+            self.linked_worktree, "rev-parse", "HEAD"
+        ).stdout.strip()
+        self.stage_file(self.linked_worktree, Path("linked-task.txt"))
         linked_result = self.run_git(
             self.linked_worktree,
             "commit",
@@ -111,8 +114,15 @@ class GitHookTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(linked_result.returncode, 0, linked_result.stderr)
+        self.assertNotEqual(
+            self.run_git(self.linked_worktree, "rev-parse", "HEAD").stdout.strip(),
+            linked_head,
+        )
 
-        self.stage_file(self.main_worktree, Path("main.txt"))
+        main_head = self.run_git(
+            self.main_worktree, "rev-parse", "HEAD"
+        ).stdout.strip()
+        self.stage_file(self.main_worktree, Path("main-task.txt"))
         main_result = self.run_git(
             self.main_worktree,
             "commit",
@@ -123,10 +133,126 @@ class GitHookTests(unittest.TestCase):
             check=False,
         )
         self.assertNotEqual(main_result.returncode, 0)
-        self.assertIn("主工作目录", main_result.stderr)
+        self.assertEqual(
+            self.run_git(self.main_worktree, "rev-parse", "HEAD").stdout.strip(),
+            main_head,
+        )
+
+    def test_dev_commits_succeed_in_main_and_linked_worktrees(self):
+        cases = (
+            ("main", self.main_worktree, "dev/main-worktree"),
+            ("linked", self.linked_worktree, "dev/linked-worktree"),
+        )
+        for label, worktree, branch in cases:
+            with self.subTest(worktree=label):
+                self.run_git(worktree, "switch", "-c", branch)
+                self.stage_file(worktree, Path(f"{label}-dev.txt"))
+                result = self.run_git(
+                    worktree,
+                    "commit",
+                    "-m",
+                    VALID_TITLE,
+                    "-m",
+                    VALID_BODY,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("警告", result.stderr)
+
+    def test_dev_commits_still_require_a_message_body_in_both_worktrees(self):
+        cases = (
+            ("main", self.main_worktree, "dev/main-worktree"),
+            ("linked", self.linked_worktree, "dev/linked-worktree"),
+        )
+        for label, worktree, branch in cases:
+            with self.subTest(worktree=label):
+                self.run_git(worktree, "switch", "-c", branch)
+                self.stage_file(worktree, Path(f"{label}-missing-body.txt"))
+                result = self.run_git(
+                    worktree,
+                    "commit",
+                    "-m",
+                    VALID_TITLE,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("正文", result.stderr)
+
+    def test_dev_commits_keep_content_checks_in_both_worktrees(self):
+        cases = (
+            ("main", self.main_worktree, "dev/main-worktree"),
+            ("linked", self.linked_worktree, "dev/linked-worktree"),
+        )
+        for label, worktree, branch in cases:
+            with self.subTest(worktree=label):
+                self.run_git(worktree, "switch", "-c", branch)
+                self.stage_file(worktree, Path(f"{label}-allowed.txt"))
+                local_file = worktree / ".omp" / "session.txt"
+                local_file.parent.mkdir()
+                local_file.write_text("local only\n", encoding="utf-8")
+                self.run_git(worktree, "add", "-f", ".omp/session.txt")
+
+                blocked_result = self.run_git(
+                    worktree,
+                    "commit",
+                    "-m",
+                    VALID_TITLE,
+                    "-m",
+                    VALID_BODY,
+                    check=False,
+                )
+                self.assertNotEqual(blocked_result.returncode, 0)
+                self.assertIn(".omp/", blocked_result.stderr)
+
+                self.run_git(worktree, "rm", "--cached", ".omp/session.txt")
+                allowed_result = self.run_git(
+                    worktree,
+                    "commit",
+                    "-m",
+                    VALID_TITLE,
+                    "-m",
+                    VALID_BODY,
+                    check=False,
+                )
+                self.assertEqual(allowed_result.returncode, 0, allowed_result.stderr)
+
+    def test_protected_branches_are_blocked_in_both_worktrees(self):
+        self.run_git(self.main_worktree, "branch", "main")
+        self.run_git(self.main_worktree, "branch", "develop")
+        cases = (
+            (
+                "main",
+                self.main_worktree,
+                "chore/14-main-worktree",
+                "主工作目录",
+            ),
+            (
+                "linked",
+                self.linked_worktree,
+                "chore/13-hooks",
+                "保护分支",
+            ),
+        )
+        for label, worktree, fallback_branch, expected_error in cases:
+            self.stage_file(worktree, Path(f"{label}-protected.txt"))
+            for protected_branch in ("main", "master", "develop"):
+                with self.subTest(worktree=label, branch=protected_branch):
+                    self.run_git(worktree, "switch", protected_branch)
+                    result = self.run_git(
+                        worktree,
+                        "commit",
+                        "-m",
+                        VALID_TITLE,
+                        "-m",
+                        VALID_BODY,
+                        check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(expected_error, result.stderr)
+                    self.run_git(worktree, "switch", fallback_branch)
 
     def test_merge_state_does_not_bypass_protected_branch(self):
-        self.run_git(self.linked_worktree, "switch", "-c", "dev/0.0.1")
+        self.run_git(self.linked_worktree, "switch", "master")
         merge_head = self.run_git(
             self.linked_worktree, "rev-parse", "--git-path", "MERGE_HEAD"
         ).stdout.strip()
@@ -158,20 +284,6 @@ class GitHookTests(unittest.TestCase):
         release_result = self.run_pre_commit(self.linked_worktree)
         self.assertEqual(release_result.returncode, 0, release_result.stderr)
         self.assertNotIn("警告", release_result.stderr)
-
-    def test_untracked_local_files_do_not_block_but_forced_tracking_does(self):
-        local_file = self.linked_worktree / ".omp" / "session.txt"
-        local_file.parent.mkdir()
-        local_file.write_text("local only\n", encoding="utf-8")
-        allowed_result = self.run_pre_commit(self.linked_worktree)
-        self.assertEqual(allowed_result.returncode, 0, allowed_result.stderr)
-
-        self.run_git(self.linked_worktree, "add", "-f", ".omp/session.txt")
-        blocked_result = self.run_pre_commit(self.linked_worktree)
-        self.assertNotEqual(blocked_result.returncode, 0)
-        self.assertIn(".omp/", blocked_result.stderr)
-        self.run_git(self.linked_worktree, "rm", "--cached", ".omp/session.txt")
-        self.assertEqual(self.run_pre_commit(self.linked_worktree).returncode, 0)
 
     def test_installer_is_cwd_independent_idempotent_and_repository_local(self):
         fixture_hooks = self.main_worktree / ".githooks"

@@ -21,13 +21,19 @@ if ! git_dir=$(physical_dir "$git_dir") || ! common_dir=$(physical_dir "$common_
   exit 1
 fi
 
-if [[ "$git_dir" == "$common_dir" ]]; then
-  printf '%s\n' '错误：禁止在主工作目录直接提交，请为任务创建 linked worktree。' >&2
-  exit 1
-fi
+case "$branch" in
+  dev/*)
+    ;;
+  *)
+    if [[ "$git_dir" == "$common_dir" ]]; then
+      printf '%s\n' '错误：禁止在主工作目录直接提交，请为任务创建 linked worktree。' >&2
+      exit 1
+    fi
+    ;;
+esac
 
 case "$branch" in
-  main|master|develop|dev/*)
+  main|master|develop)
     printf '错误：禁止直接在保护分支 %s 上提交，请先新建工作分支。\n' "$branch" >&2
     exit 1
     ;;
@@ -37,7 +43,7 @@ hook_root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 python3 "$hook_root/scripts/check-repository-content.py" index
 
 case "$branch" in
-  release/*)
+  dev/*|release/*)
     ;;
   *)
     if [[ ! "$branch" =~ ^(feature|fix|hotfix|chore)/[0-9]+-[a-z0-9-]+$ ]]; then
