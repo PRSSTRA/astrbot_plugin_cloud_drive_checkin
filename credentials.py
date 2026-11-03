@@ -388,9 +388,6 @@ async def save_binding(
 
     owner_key = user_key(identity)
     target_binding_key = binding_key(identity, task.task_id)
-    field_ids = [
-        field.field_id for field in task.user_fields if field.field_id in values
-    ]
 
     guard()
     ciphertext = cipher.encrypt(
@@ -427,7 +424,6 @@ async def save_binding(
         snapshot["credentials"][target_binding_key] = {
             "ciphertext": ciphertext,
             "task_version": task.version,
-            "field_ids": field_ids,
         }
 
     await store.mutate(mutate)

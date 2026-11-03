@@ -124,7 +124,7 @@ git clone --branch dev/0.0.1 https://github.com/PRSSTRA/astrbot_plugin_cloud_dri
 
 ## 验证范围
 
-离线测试、原生框架 smoke 和真实 Neo 假凭据验收的范围与结果见[测试与验证](CONTRIBUTING.md#测试与验证)、[真实 Neo 假凭据验收](CONTRIBUTING.md#真实-neo-假凭据验收)和[通用依赖包验收](CONTRIBUTING.md#通用依赖包真实-neo-假凭据验收)。
+离线测试、原生框架 smoke 和真实 Neo 假凭据验收的范围与结果见[测试与验证](CONTRIBUTING.md#测试与验证)、[真实 Neo 假凭据验收](CONTRIBUTING.md#真实-neo-假凭据验收)和[通用依赖包验收](CONTRIBUTING.md#通用依赖包)。
 
 真实 Neo 验收只运行测试脚本、固定测试依赖和假凭据，不发起真实云盘签到；原生框架 smoke 使用受控 loopback OneBot 与 FakeBay，不是真实 QQ，也不是完整 Neo 部署。当前没有真实 QQ + 真实 Neo 的完整链路验收，也没有真实云盘账号签到验收；新部署仍需按配置说明单独验证 Neo 清理条件和实际任务网络访问。
 

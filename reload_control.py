@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from typing import Any
 
 _RELOAD_ERROR_TEXT = "插件重载失败。"
-_STATE_REGISTRY_ATTRIBUTE = "_cloud_drive_checkin_state_registry"
 
 
 class ReloadError(RuntimeError):

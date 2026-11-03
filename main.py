@@ -912,20 +912,7 @@ class CloudDriveCheckin(Star):
                 )
                 await self.scheduler.initialize()
                 self._ensure_initializing()
-            except asyncio.CancelledError:
-                if self.task_control is not None:
-                    await self.task_control.close()
-                if self.scheduler is not None:
-                    await self.scheduler.close()
-                if self.queue is not None:
-                    await self.queue.close()
-                if self.notifications is not None:
-                    await self.notifications.close()
-                if self.executor is not None:
-                    await self.executor.close()
-                store.stop_accepting()
-                raise
-            except Exception:
+            except (asyncio.CancelledError, Exception):
                 if self.task_control is not None:
                     await self.task_control.close()
                 if self.scheduler is not None:

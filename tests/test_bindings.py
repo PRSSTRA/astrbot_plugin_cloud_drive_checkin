@@ -102,7 +102,6 @@ class BindingControlTests(unittest.IsolatedAsyncioTestCase):
             credential = {
                 "ciphertext": f"ciphertext:{identity.platform_id}:{identity.qq_id}",
                 "task_version": "task-version-1",
-                "field_ids": ["account"],
             }
 
         def mutate(snapshot):
@@ -295,7 +294,6 @@ class BindingControlTests(unittest.IsolatedAsyncioTestCase):
             snapshot["credentials"][target_key] = {
                 "ciphertext": "orphan-ciphertext",
                 "task_version": "task-version-1",
-                "field_ids": ["account"],
             }
 
         await self.store.mutate(add_orphan_ciphertext)
@@ -409,10 +407,7 @@ class BindingControlTests(unittest.IsolatedAsyncioTestCase):
         )
 
         def enroll(snapshot):
-            snapshot["users"][owner_key]["enrollment"] = {
-                "task_id": self.task_id,
-                "started_at": "2026-11-02T00:01:00+00:00",
-            }
+            snapshot["users"][owner_key]["enrollment"] = {}
 
         await self.store.mutate(enroll)
         baseline = self.store.snapshot()
@@ -503,6 +498,15 @@ class BindingControlTests(unittest.IsolatedAsyncioTestCase):
             task_id=self.task_id,
         )
         self.assertNotEqual(replaced, first)
+        with self.assertRaises(bindings.BindingChanged):
+            await bindings.delete_binding(
+                self.store,
+                identity=self.identity,
+                task_id=self.task_id,
+                expected_version=first,
+                guard=lambda: None,
+            )
+        self.assertIn(target_key, self.store.snapshot()["credentials"])
 
         await self.store.mutate(
             lambda snapshot: snapshot["credentials"].pop(target_key)
@@ -535,7 +539,6 @@ class BindingControlTests(unittest.IsolatedAsyncioTestCase):
             snapshot["credentials"][target_key] = {
                 "ciphertext": "replacement-ciphertext",
                 "task_version": "task-version-2",
-                "field_ids": ["new_account"],
             }
 
         await self.store.mutate(replace_credential)
@@ -610,7 +613,6 @@ class BindingControlTests(unittest.IsolatedAsyncioTestCase):
             snapshot["credentials"][target_key] = {
                 "ciphertext": "replacement-while-waiting",
                 "task_version": "task-version-2",
-                "field_ids": ["account"],
             }
 
         replacement = asyncio.create_task(self.store.mutate(replace_credential))

@@ -343,7 +343,7 @@ class ExecutionQueue:
         settings = self._settings()
         snapshot = self.store.snapshot()
         self._validate_snapshot(snapshot)
-        await self._complete_pending_cooldowns(settings)
+        await self._complete_pending_cooldowns(snapshot, settings)
         await self._repair_indexes_and_prune(settings, _utc_now())
         await self._recover_before_start()
         if self._closing or self._closed:
@@ -482,7 +482,9 @@ class ExecutionQueue:
             async with self._admission_lock:
                 if not self._accepting or self._closed or not self.store.ready:
                     raise ExecutionBlocked("manual execution queue is unavailable")
-                await self._complete_pending_cooldowns(settings)
+                snapshot = self.store.snapshot()
+                self._validate_snapshot(snapshot)
+                await self._complete_pending_cooldowns(snapshot, settings)
                 confirmed = await self.store.mutate(admit)
         except _DuplicateAdmission as duplicate:
             return duplicate.run_id
@@ -730,7 +732,9 @@ class ExecutionQueue:
             async with self._admission_lock:
                 if not self._accepting or self._closed or not self.store.ready:
                     raise ExecutionBlocked("automatic execution queue is unavailable")
-                await self._complete_pending_cooldowns(settings)
+                snapshot = self.store.snapshot()
+                self._validate_snapshot(snapshot)
+                await self._complete_pending_cooldowns(snapshot, settings)
                 confirmed = await self.store.mutate(admit)
         except _DuplicateOccurrence as duplicate:
             return {"status": "duplicate", "run_ids": duplicate.run_ids}
@@ -913,7 +917,9 @@ class ExecutionQueue:
         if not self._closed or not self.store.ready:
             raise ExecutionBlocked("manual execution shutdown state is unavailable")
         settings = self._settings()
-        await self._complete_pending_cooldowns(settings)
+        snapshot = self.store.snapshot()
+        self._validate_snapshot(snapshot)
+        await self._complete_pending_cooldowns(snapshot, settings)
         while self.store.ready:
             snapshot = self.store.snapshot()
             self._validate_snapshot(snapshot)
@@ -1219,9 +1225,9 @@ class ExecutionQueue:
             changed = True
         return changed
 
-    async def _complete_pending_cooldowns(self, settings: ExecutionConfig) -> bool:
-        snapshot = self.store.snapshot()
-        self._validate_snapshot(snapshot)
+    async def _complete_pending_cooldowns(
+        self, snapshot: dict, settings: ExecutionConfig
+    ) -> bool:
         ready = any(
             type(item) is dict
             and item.get("kind") == _KIND
@@ -1506,10 +1512,10 @@ class ExecutionQueue:
 
     async def _step(self) -> float:
         settings = self._settings()
-        if await self._complete_pending_cooldowns(settings):
-            return 0.0
         snapshot = self.store.snapshot()
         self._validate_snapshot(snapshot)
+        if await self._complete_pending_cooldowns(snapshot, settings):
+            return 0.0
         running = sorted(
             (
                 item

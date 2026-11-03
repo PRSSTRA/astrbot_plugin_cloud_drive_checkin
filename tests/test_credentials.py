@@ -393,13 +393,6 @@ class SaveBindingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(timestamp.tzinfo)
         credential_record = snapshot["credentials"][target_key]
         self.assertEqual(
-            set(credential_record), {"ciphertext", "task_version", "field_ids"}
-        )
-        self.assertEqual(
-            credential_record["field_ids"],
-            ["account", "attempts", "enabled", "note"],
-        )
-        self.assertEqual(
             self.cipher.decrypt(
                 credential_record["ciphertext"],
                 identity=self.identity,
@@ -471,10 +464,7 @@ class SaveBindingTests(unittest.IsolatedAsyncioTestCase):
         def set_preferences(snapshot):
             snapshot["bindings"][target_key]["paused"] = True
             snapshot["bindings"][target_key]["notify_all"] = True
-            snapshot["users"][credentials.user_key(self.identity)]["enrollment"] = {
-                "task_id": self.task.task_id,
-                "started_at": "2026-11-02T00:00:00+00:00",
-            }
+            snapshot["users"][credentials.user_key(self.identity)]["enrollment"] = {}
 
         await self.store.mutate(set_preferences)
         updated_task = _task(version="task-version-2")
@@ -498,7 +488,6 @@ class SaveBindingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(user["unified_msg_origin"], "new-origin")
         self.assertNotIn("enrollment", user)
         self.assertEqual(record["task_version"], "task-version-2")
-        self.assertEqual(record["field_ids"], ["account", "note"])
         self.assertEqual(
             self.cipher.decrypt(
                 record["ciphertext"],
@@ -595,10 +584,6 @@ class SaveBindingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.snapshot()["credentials"], {})
         pending = self.kv.write_values[-1]
         target_key = credentials.binding_key(self.identity, self.task.task_id)
-        self.assertEqual(
-            set(pending["credentials"][target_key]),
-            {"ciphertext", "task_version", "field_ids"},
-        )
         pending_text = json.dumps(pending, ensure_ascii=False)
         for value in secret_values.values():
             self.assertNotIn(value, pending_text)

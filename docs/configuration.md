@@ -473,7 +473,7 @@ Cron 表达式固定为五段：分钟、小时、日、月、星期。支持：
 
 天翼脚本已引入本仓库的 [third_party/tianyi](../third_party/tianyi)，源自 [BlueSkyXN/189Cloud-Checkin 固定提交](https://github.com/BlueSkyXN/189Cloud-Checkin/tree/43d2e7054dba7c5c2152e9c8c88fd23e6073a45b)，保留 Apache-2.0 许可，由本仓库维护结构化结果改动。脚本专用依赖锁与宿主依赖分开；管理员可以用[准备指令](#管理员准备)生成并缓存制品。移动模板仍引用 [smallfawn/QLScriptPublic 固定提交](https://github.com/smallfawn/QLScriptPublic/tree/2d4c26fdc72c3206bb9cf9afc1fb4991d337f888)，未引入其脚本。
 
-天翼模板固定使用本仓库提交 `fcc3857d3fe801a5181c2c8e0472d7bb67faaa99` 的 `third_party/tianyi/index.py`，SHA256 为 `3c9d4a41f2f4dd718e80352fcf417e324a728df3406c0a333ab4c09f80fb48ec`。插件不会改写或启用已保存的 `tasks`；需要更新模板时由管理员手动修改。制品摘要与源码摘要分别记录，不能混用。
+天翼模板固定使用本仓库提交 `03ee362cb6c7e228d13c7f7d5924b31fb244219e` 的 `third_party/tianyi/index.py`，SHA256 为 `33e6b16bce7e71af75b71f77cbeceda8d08594014c7d2478a7b484d7f43a211b`。插件不会改写或启用已保存的 `tasks`；需要更新时由管理员同步修改固定源码声明并重新准备，现有不匹配的声明会被拒绝，不会自动迁移。制品摘要与源码摘要分别记录，不能混用。
 
 移动任务必须保持禁用和实验状态。
 
