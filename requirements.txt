@@ -1,0 +1,4 @@
+croniter>=6.0,<7
+cryptography>=43
+httpx>=0.27,<1
+packaging>=24

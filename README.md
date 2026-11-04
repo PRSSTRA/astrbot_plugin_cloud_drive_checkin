@@ -1,22 +1,90 @@
-# astrbot-plugin-helloworld
+<h1 align="center">云盘签到</h1>
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+<p align="center">AstrBot 云盘签到插件：通过 QQ 好友私聊配置脚本，并在独立 Neo 沙箱中串行执行。</p>
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+## 核心亮点
 
-# Supports
+- **私聊管理**：授权的 QQ 好友可设置本人脚本参数、查询运行状态和日志。
+- **手动与定时**：支持手动入队、全局 Cron 和个人定时覆盖；错过的计划不补跑。
+- **独立执行**：每次运行在独立 Neo 沙箱中安装依赖并执行 Python 或 Node.js 单文件脚本。
+- **凭据保护**：参数加密保存；依赖安装成功且文件复核后才向执行环境提供凭据。
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+## 架构
 
-## 提交和 PR 标题
+```text
+┌──────────────┐    私聊命令    ┌──────────────────────┐
+│ QQ 好友私聊  │───────────────▶│ AstrBot 插件         │
+└──────────────┘                │ 参数、定时、串行队列 │
+                                └──────────┬───────────┘
+                                           │ 创建及清理
+                                           ↓
+                                ┌──────────────────────┐
+                                │ 独立 Neo 沙箱        │
+                                │ 安装依赖 → 执行脚本  │
+                                └──────────────────────┘
+```
 
-提交标题和 PR 标题使用 `类型(scope): 描述`，例如 `构建(ci): 添加 PR 检测工作流`。括号和冒号须为半角；scope 使用小写英文字母或数字开头，后续可包含小写英文字母、数字及 `.`、`_`、`/`、`-`；描述须至少包含一个中文汉字，可以夹带英文和数字。校验需要 Python 3：如果 `PATH` 中没有 `python3`，钩子会提示安装并阻止提交。
+插件从管理员配置的 HTTPS 地址下载脚本，在沙箱中安装声明的依赖。脚本和依赖的来源必须可信。
 
-新克隆仓库后执行 `git config core.hooksPath .githooks` 启用本地钩子。此设置仅保存在当前仓库的本地 Git 配置中，不会随仓库共享。钩子禁止直接在 `main`、`master`、`develop` 和 `dev/*` 上提交；其他分支命名不符合规范时只发出警告。本地合并提交不受分支限制。
+## 快速安装
 
-PR 检查流程验证：标题与提交信息均通过校验后再合并。
+前置条件：
+
+- AstrBot 版本符合 `>=4.29.3,<5`，并已配置 `aiocqhttp` 平台。
+- 可访问的 Neo 服务；沙箱需要 `python3`。Python 脚本还需要 `venv` 和 `pip`；Node.js 脚本需要 `node` 和 `npm`。
+- 已独立验证 Neo Docker Cargo 的物理清理，包括版本、bind 路径映射及宿主资源删除。仅 API 返回 404 不足以确认清理，也不能用于 Kubernetes PVC 验收。
+
+在 AstrBot 插件管理中通过仓库地址安装：
+
+```text
+https://github.com/PRSSTRA/astrbot_plugin_cloud_drive_checkin
+```
+
+## 快速开始
+
+1. 为 AstrBot 进程设置 `CLOUD_DRIVE_CHECKIN_MASTER_KEY`：使用安全随机生成的 32 字节密钥，编码为带填充的 URL-safe Base64。妥善保管并保持密钥稳定；丢失或更换后，已有凭据无法用新密钥解密。
+2. 在插件配置中启用 `neo_connection.enabled`，完成上述 Docker 清理验证后设置 `docker_cleanup_confirmed`。优先使用框架中明确配置的完整 Neo 连接；否则填写插件的 `endpoint`、`profile` 和 `access_key_env`，并在 AstrBot 进程环境中设置该变量对应的 Neo 密钥。配置项只填写环境变量名，不填写密钥值。
+3. 在 `scripts` 中添加并启用可信脚本，填写稳定 ID、名称、公开 HTTPS 单文件直链、解释器、按顺序排列的环境变量名和依赖。URL 不得包含凭据；脚本地址不跟随重定向。
+4. 将 QQ 号加入 `whitelist_qqs`，开启插件配置的 `enabled`。AstrBot 管理员也可使用，但只能操作自己的配置；仅支持普通 QQ 好友私聊。
+5. 在好友私聊中发送 `云盘签到 设置`，选择“脚本参数”和脚本，按提示输入参数。多个值按字段顺序用 `#` 分隔；值中的 `#` 写作 `\#`，反斜杠写作 `\\`。保存后不会立即运行。
+6. 发送 `云盘签到 运行`，选择已配置的脚本入队；再用 `云盘签到 详情` 或 `云盘签到 日志` 查看结果。命令须遵循 AstrBot 实例的唤醒前缀设置。
+
+进程退出码为 0 只表示进程正常结束，不证明云盘业务签到成功。
+
+## 命令
+
+以下命令均在授权的 QQ 好友私聊中使用；根据 AstrBot 配置添加唤醒前缀。
+
+| 命令 | 作用 |
+|---|---|
+| `云盘签到` | 显示帮助 |
+| `云盘签到 列表` | 查看可用脚本、本人配置和最新状态 |
+| `云盘签到 设置` | 设置脚本参数、个人定时、自动开关或删除配置 |
+| `云盘签到 运行` | 将本人已配置的脚本入队 |
+| `云盘签到 详情` | 查看最新执行、清理和通知状态 |
+| `云盘签到 日志` | 查看最新已结束任务的脱敏日志 |
+
+设置交互每次等待 60 秒。超时后不要直接发送凭据，应重新进入设置；QQ 和框架的入站记录不由插件控制。
+
+## 配置说明
+
+| 配置项 | 说明 |
+|---|---|
+| `enabled` | 总开关，默认关闭 |
+| `whitelist_qqs` | 允许使用的 QQ 号列表 |
+| `timezone` | IANA 时区，默认 `Asia/Shanghai`（上海时间，UTC+8）；用于定时调度和详情时间展示 |
+| `cron` | 全局五段 Cron，默认 `0 7 * * *`，按 `timezone` 指定时区执行；个人设置可覆盖本人全部脚本的计划 |
+| `timeout_seconds` | 脚本运行超时，默认 180 秒，范围 1–240 秒 |
+| `install_timeout_seconds` | 依赖安装超时，默认 240 秒，范围 1–240 秒 |
+| `neo_connection` | Neo 连接、清理确认和沙箱 TTL；TTL 范围 900–3600 秒 |
+| `scripts` | 脚本声明列表，默认空列表 |
+
+默认每天上海时间 07:00 执行，与服务器或容器本地时区无关。修改 `timezone` 后只重新计算未来计划，不补跑历史任务。
+
+脚本 ID 使用小写字母开头，后接小写字母、数字或下划线，最长 64 字符。环境变量名或顺序改变后，用户需要重新设置参数；没有环境变量字段的脚本，选中即可建立绑定。依赖项只接受配置规则允许的包声明，不接受 URL、Git 地址、路径或安装器选项。
+
+个人自动开关关闭时，可继续手动运行；它只取消尚未开始的纯自动请求，不停止远端任务。删除配置会删除本人该脚本的参数和最新结果及日志，不会删除 QQ、框架或备份中的记录；活动任务、清理或通知未结算时不能删除。
+
+## 许可证
+
+[GNU Affero General Public License v3.0](./LICENSE)。

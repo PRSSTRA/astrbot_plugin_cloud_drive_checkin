@@ -1,0 +1,39 @@
+{
+  "enabled": {"description": "签到服务开关", "type": "bool", "default": false, "hint": "开启后接受手动签到与未来定时；脚本及依赖每次下载最新内容，管理员必须信任上游。"},
+  "whitelist_qqs": {"description": "QQ 好友私聊白名单", "type": "list", "items": {"type": "string"}, "default": [], "hint": "框架管理员也只能操作本人配置；不接受群聊、临时私聊及其它平台。"},
+  "timezone": {"description": "计划与显示时区", "type": "string", "default": "Asia/Shanghai", "hint": "IANA 时区名称；默认上海时间（UTC+8），同时用于 Cron 调度和执行详情。"},
+  "cron": {"description": "全局五段 Cron", "type": "string", "default": "0 7 * * *", "hint": "按 timezone 设置执行；分 时 日 月 周；用户可为本人全部脚本设置一条覆盖计划，不补漏跑。"},
+  "timeout_seconds": {"description": "脚本运行超时秒数", "type": "int", "default": 180, "hint": "允许 1–240 秒。"},
+  "install_timeout_seconds": {"description": "依赖安装超时秒数", "type": "int", "default": 240, "hint": "允许 1–240 秒；安装成功之前不上传用户凭据。"},
+  "neo_connection": {
+    "description": "独立 Neo 执行连接", "type": "object",
+    "hint": "优先使用框架已明确配置的完整 Neo 连接；不借用聊天沙箱，不读取自动部署凭据文件。",
+    "items": {
+      "enabled": {"description": "启用 Neo 连接及启动清理", "type": "bool", "default": false},
+      "docker_cleanup_confirmed": {"description": "已独立验证 Docker Cargo 物理清理", "type": "bool", "default": false, "hint": "需验证版本、bind 路径映射及宿主资源删除；仅 API 404 不足以确认，不用于 Kubernetes PVC 验收。"},
+      "endpoint": {"description": "备用 Bay API 地址", "type": "string", "default": ""},
+      "profile": {"description": "备用 Neo profile", "type": "string", "default": "python-default"},
+      "access_key_env": {"description": "备用 Bay 密钥环境变量名", "type": "string", "default": "CLOUD_DRIVE_CHECKIN_NEO_KEY", "hint": "仅填写变量名，不填写密钥值。"},
+      "ttl": {"description": "独立沙箱 TTL 秒数", "type": "int", "default": 900, "hint": "允许 900–3600 秒；TTL 不替代资源清理确认。"}
+    }
+  },
+  "scripts": {
+    "description": "签到脚本", "type": "template_list", "default": [],
+    "hint": "只声明最新 HTTPS 单文件脚本、依赖和环境变量名；所有用户字段必填且视为秘密。不要在 URL 或本页填写凭据。",
+    "templates": {
+      "script": {
+        "name": "脚本", "display_item": "name", "hide_hint_in_list": true,
+        "hint": "第三方源码及依赖未锁定版本，每次在独立 Neo 中下载、安装和运行；两阶段安装不是恶意代码保密沙箱。",
+        "items": {
+          "id": {"description": "稳定脚本 ID", "type": "string", "default": "", "hint": "[a-z][a-z0-9_]{0,63}，不可重复；用户无需输入。"},
+          "name": {"description": "脚本名称", "type": "string", "default": ""},
+          "enabled": {"description": "启用此脚本", "type": "bool", "default": false},
+          "url": {"description": "最新脚本 HTTPS 直链", "type": "string", "default": "", "hint": "仅公开地址及 443 端口，不接受认证信息、fragment、重定向或压缩包；查询参数不得包含秘密。"},
+          "runtime": {"description": "解释器", "type": "string", "default": "python", "options": ["python", "node"]},
+          "env_names": {"description": "按输入顺序排列的环境变量名", "type": "list", "items": {"type": "string"}, "default": [], "hint": "最多 64 个 ASCII 名称，每名最多 128 字节；名称或顺序改变后用户需重新配置。没有字段时选中即建立绑定。"},
+          "dependencies": {"description": "依赖声明", "type": "list", "items": {"type": "string"}, "default": [], "hint": "Python：包名[extras]及版本；Node：普通或 scoped 包名及可选 @版本/范围/tag。最多 128 项及 32 KiB，不接受 URL、Git、路径、marker 或安装器选项；空列表有效。"}
+        }
+      }
+    }
+  }
+}
